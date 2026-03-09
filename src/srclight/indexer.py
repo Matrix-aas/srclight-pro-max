@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import logging
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -619,6 +621,20 @@ class Indexer:
             stats.files_indexed, stats.symbols_extracted, stats.edges_created,
             stats.elapsed_seconds, stats.files_unchanged, stats.files_removed, stats.errors,
         )
+
+        # Signal index completion via timestamp file
+        try:
+            signal_file = root / ".srclight" / "last-indexed"
+            signal_file.parent.mkdir(parents=True, exist_ok=True)
+            signal_file.write_text(json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "files": stats.files_scanned,
+                "symbols": stats.symbols_extracted,
+                "commit": git_head,
+                "elapsed_seconds": round(stats.elapsed_seconds, 2),
+            }))
+        except Exception:
+            logger.debug("Failed to write index signal file", exc_info=True)
 
         return stats
 

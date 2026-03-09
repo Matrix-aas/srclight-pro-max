@@ -118,6 +118,19 @@ def _is_workspace_mode() -> bool:
     return _workspace_name is not None
 
 
+def _read_index_signal(root: Path | None) -> dict | None:
+    """Read the last-indexed signal file for a project root."""
+    if root is None:
+        return None
+    signal_file = root / ".srclight" / "last-indexed"
+    try:
+        if signal_file.exists():
+            return json.loads(signal_file.read_text())
+    except Exception:
+        pass
+    return None
+
+
 def _get_workspace_db():
     """Get or create the WorkspaceDB connection.
 
@@ -333,6 +346,10 @@ def codebase_map(project: str | None = None) -> str:
     if state:
         result["index"]["last_commit"] = state.get("last_commit")
         result["index"]["indexed_at"] = state.get("indexed_at")
+
+    signal = _read_index_signal(_repo_root)
+    if signal:
+        result["index"]["last_indexed_at"] = signal.get("timestamp")
 
     return json.dumps(result, indent=2)
 
@@ -952,6 +969,10 @@ def index_status() -> str:
         result["last_commit"] = state.get("last_commit")
         result["indexed_at"] = state.get("indexed_at")
 
+    signal = _read_index_signal(_repo_root)
+    if signal:
+        result["last_indexed_at"] = signal.get("timestamp")
+
     return json.dumps(result, indent=2)
 
 
@@ -975,7 +996,7 @@ def list_projects() -> str:
 
 
 @mcp.tool()
-def reindex(path: str | None = None) -> str:
+async def reindex(path: str | None = None) -> str:
     """Trigger re-indexing of the codebase or a specific path.
 
     Incrementally updates the index — only re-parses files whose content
@@ -998,14 +1019,26 @@ def reindex(path: str | None = None) -> str:
     # Invalidate vector cache so next query reloads from fresh sidecar
     _vector_cache = None
 
-    return json.dumps({
+    result = {
         "files_indexed": stats.files_indexed,
         "files_unchanged": stats.files_unchanged,
         "files_removed": stats.files_removed,
         "symbols_extracted": stats.symbols_extracted,
         "errors": stats.errors,
         "elapsed_seconds": round(stats.elapsed_seconds, 2),
-    }, indent=2)
+    }
+
+    # Send notification to connected clients (MCP logging)
+    try:
+        ctx = mcp.get_context()
+        await ctx.info(
+            f"Reindex complete: {stats.files_indexed} files, "
+            f"{stats.symbols_extracted} symbols indexed in {stats.elapsed_seconds:.1f}s"
+        )
+    except Exception:
+        pass  # Best effort — client may not support notifications
+
+    return json.dumps(result, indent=2)
 
 
 # --- Tier 4: Git Change Intelligence ---
