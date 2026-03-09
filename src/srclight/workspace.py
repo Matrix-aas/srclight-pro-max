@@ -138,7 +138,7 @@ class WorkspaceDB:
         self._caches: dict[str, Any] = {}  # project_name -> VectorCache
 
     def open(self) -> None:
-        self.conn = sqlite3.connect(":memory:")
+        self.conn = sqlite3.connect(":memory:", check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         # Discover all indexable projects
         self._all_indexable = [
