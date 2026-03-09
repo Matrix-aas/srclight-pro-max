@@ -2071,6 +2071,7 @@ async def setup_guide() -> str:
             },
         ],
         "for_agents": "Call codebase_map() at session start. Use list_projects() to see repos. Use setup_guide() to get these steps for the user.",
+        "after_upgrade": "After upgrading srclight (pip install -U srclight), restart the server and then restart your editor/CLI to pick up new tools. Existing MCP sessions only discover tools at connect time.",
     }, indent=2)
 
 
