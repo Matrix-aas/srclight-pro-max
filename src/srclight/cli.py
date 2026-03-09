@@ -746,6 +746,137 @@ def hook_uninstall(ws_name: str | None):
         click.echo(_uninstall_hooks_in_repo(root))
 
 
+@hook.command("install-agent")
+@click.option("--port", "-p", default=8742, help="Srclight server port (default: 8742)")
+@click.option("--settings-path", type=click.Path(),
+              default="~/.claude/settings.json",
+              help="Path to Claude Code settings.json")
+def hook_install_agent(port: int, settings_path: str):
+    """Install Claude Code hooks to redirect Grep/Glob to srclight.
+
+    Writes a hook script to ~/.srclight/hooks/agent-redirect.sh and
+    registers it as a PreToolUse hook in Claude Code settings.json.
+
+    When srclight is running, Grep/Glob calls are denied with a message
+    suggesting srclight tools instead. When srclight is not running,
+    calls are allowed (graceful fallback).
+    """
+    hook_dir = Path.home() / ".srclight" / "hooks"
+    hook_dir.mkdir(parents=True, exist_ok=True)
+    hook_script = hook_dir / "agent-redirect.sh"
+
+    # Write the hook script
+    script_content = f"""#!/usr/bin/env bash
+# Srclight agent redirect hook for Claude Code.
+# Denies Grep/Glob when srclight is running, allows otherwise.
+# Installed by: srclight hook install-agent
+
+if curl -sf --max-time 1 http://127.0.0.1:{port}/sse >/dev/null 2>&1; then
+    cat <<'DENY_EOF'
+{{"decision": "deny", "reason": "srclight is running. Use hybrid_search(query) for search, symbols_in_file(path) for file contents, or search_symbols(query) for exact names. These give structured, ranked results with relationship data instead of raw text."}}
+DENY_EOF
+else
+    cat <<'ALLOW_EOF'
+{{"decision": "approve"}}
+ALLOW_EOF
+fi
+"""
+    hook_script.write_text(script_content)
+    hook_script.chmod(0o755)
+    click.echo(f"Wrote hook script: {hook_script}")
+
+    # Update Claude Code settings.json
+    settings_file = Path(settings_path).expanduser()
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+
+    settings: dict = {}
+    if settings_file.exists():
+        try:
+            settings = json.loads(settings_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            click.echo(f"Error reading {settings_file}: {e}", err=True)
+            sys.exit(1)
+
+    hook_entry = {
+        "matcher": "Grep|Glob",
+        "hooks": [
+            {
+                "type": "command",
+                "command": str(hook_script),
+            }
+        ],
+    }
+
+    # Ensure hooks.PreToolUse exists
+    hooks = settings.setdefault("hooks", {})
+    pre_tool_use = hooks.setdefault("PreToolUse", [])
+
+    # Idempotent: replace existing srclight hook or add new one
+    replaced = False
+    for i, entry in enumerate(pre_tool_use):
+        hook_cmds = entry.get("hooks", [])
+        if any("agent-redirect.sh" in h.get("command", "") for h in hook_cmds):
+            pre_tool_use[i] = hook_entry
+            replaced = True
+            break
+
+    if not replaced:
+        pre_tool_use.append(hook_entry)
+
+    settings_file.write_text(json.dumps(settings, indent=2) + "\n")
+    click.echo(f"Updated {settings_file}")
+    click.echo("Claude Code will now prefer srclight tools over Grep/Glob when srclight is running.")
+
+
+@hook.command("uninstall-agent")
+@click.option("--settings-path", type=click.Path(),
+              default="~/.claude/settings.json",
+              help="Path to Claude Code settings.json")
+def hook_uninstall_agent(settings_path: str):
+    """Remove Claude Code agent redirect hooks.
+
+    Removes the PreToolUse hook from Claude Code settings.json and
+    deletes the hook script from ~/.srclight/hooks/.
+    """
+    # Remove from settings.json
+    settings_file = Path(settings_path).expanduser()
+    if settings_file.exists():
+        try:
+            settings = json.loads(settings_file.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            click.echo(f"Error reading {settings_file}: {e}", err=True)
+            sys.exit(1)
+
+        pre_tool_use = settings.get("hooks", {}).get("PreToolUse", [])
+        original_len = len(pre_tool_use)
+        pre_tool_use[:] = [
+            entry for entry in pre_tool_use
+            if not any("agent-redirect.sh" in h.get("command", "")
+                       for h in entry.get("hooks", []))
+        ]
+
+        if len(pre_tool_use) < original_len:
+            # Clean up empty structures
+            if not pre_tool_use:
+                settings.get("hooks", {}).pop("PreToolUse", None)
+            if not settings.get("hooks"):
+                settings.pop("hooks", None)
+            settings_file.write_text(json.dumps(settings, indent=2) + "\n")
+            click.echo(f"Removed hook from {settings_file}")
+        else:
+            click.echo(f"No srclight hook found in {settings_file}")
+    else:
+        click.echo(f"Settings file not found: {settings_file}")
+
+    # Remove hook script
+    hook_script = Path.home() / ".srclight" / "hooks" / "agent-redirect.sh"
+    if hook_script.exists():
+        hook_script.unlink()
+        click.echo(f"Removed {hook_script}")
+    else:
+        click.echo(f"Hook script not found: {hook_script}")
+
+
 @hook.command("status")
 @click.option("--workspace", "-w", "ws_name", help="Check all repos in a workspace")
 def hook_status(ws_name: str | None):
@@ -775,6 +906,65 @@ def hook_status(ws_name: str | None):
             click.echo(f"  {name:<20} {', '.join(statuses)}")
         else:
             click.echo(f"  {name:<20} no hooks")
+
+
+# --- Config commands ---
+
+
+@main.group()
+def config():
+    """Generate IDE MCP configuration snippets."""
+    pass
+
+
+@config.command("claude-code")
+@click.option("--port", "-p", default=8742, help="Srclight server port (default: 8742)")
+@click.option("--workspace", "-w", "workspace_name", help="Workspace name (for display only)")
+def config_claude_code(port: int, workspace_name: str | None):
+    """Print MCP config for Claude Code (~/.claude/settings.json under mcpServers)."""
+    snippet = {
+        "srclight": {
+            "type": "sse",
+            "url": f"http://127.0.0.1:{port}/sse",
+        }
+    }
+    click.echo("Add this to ~/.claude/settings.json under \"mcpServers\":\n")
+    click.echo(json.dumps(snippet, indent=2))
+
+
+@config.command("cursor")
+@click.option("--port", "-p", default=8742, help="Srclight server port (default: 8742)")
+@click.option("--workspace", "-w", "workspace_name", help="Workspace name (for display only)")
+def config_cursor(port: int, workspace_name: str | None):
+    """Print MCP config for Cursor (.cursor/mcp.json)."""
+    snippet = {
+        "mcpServers": {
+            "srclight": {
+                "url": f"http://127.0.0.1:{port}/sse",
+            }
+        }
+    }
+    click.echo("Add this to .cursor/mcp.json:\n")
+    click.echo(json.dumps(snippet, indent=2))
+
+
+@config.command("vscode")
+@click.option("--port", "-p", default=8742, help="Srclight server port (default: 8742)")
+@click.option("--workspace", "-w", "workspace_name", help="Workspace name (for display only)")
+def config_vscode(port: int, workspace_name: str | None):
+    """Print MCP config for VS Code (.vscode/settings.json)."""
+    snippet = {
+        "mcp": {
+            "servers": {
+                "srclight": {
+                    "type": "sse",
+                    "url": f"http://127.0.0.1:{port}/sse",
+                }
+            }
+        }
+    }
+    click.echo("Add this to .vscode/settings.json:\n")
+    click.echo(json.dumps(snippet, indent=2))
 
 
 if __name__ == "__main__":

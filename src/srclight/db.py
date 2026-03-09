@@ -1206,6 +1206,197 @@ class Database:
             "db_size_mb": round(db_size / (1024 * 1024), 2),
         }
 
+    def resolve_import(self, name: str, hint_path: str | None = None) -> dict | None:
+        """Try to resolve an import name to an indexed symbol or file.
+
+        Resolution strategy:
+        1. Exact symbol name match
+        2. Qualified name match (e.g., 'os.path' matches qualified_name)
+        3. File path match (convert module path to file path)
+
+        Args:
+            name: Import name (e.g., 'Database', 'os.path', './utils')
+            hint_path: Optional path hint for relative imports
+
+        Returns:
+            Dict with resolved symbol/file info, or None if unresolved.
+        """
+        assert self.conn is not None
+
+        # 1. Exact symbol name match
+        row = self.conn.execute(
+            """SELECT s.*, f.path as file_path FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.name = ?
+               ORDER BY s.kind, f.path
+               LIMIT 1""",
+            (name,),
+        ).fetchone()
+        if row:
+            sym = self._row_to_symbol(row)
+            return {
+                "name": sym.name,
+                "file": sym.file_path,
+                "line": sym.start_line,
+                "kind": sym.kind,
+                "match_type": "symbol",
+            }
+
+        # 2. Qualified name match
+        row = self.conn.execute(
+            """SELECT s.*, f.path as file_path FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.qualified_name = ?
+               ORDER BY s.kind, f.path
+               LIMIT 1""",
+            (name,),
+        ).fetchone()
+        if row:
+            sym = self._row_to_symbol(row)
+            return {
+                "name": sym.name,
+                "file": sym.file_path,
+                "line": sym.start_line,
+                "kind": sym.kind,
+                "match_type": "qualified_name",
+            }
+
+        # 3. File path match — convert dotted module to path patterns
+        candidates = []
+        dotted = name.replace(".", "/")
+        candidates.append(f"{dotted}.py")
+        candidates.append(f"{dotted}/__init__.py")
+        candidates.append(name)
+        for ext in (".js", ".ts", ".jsx", ".tsx"):
+            candidates.append(f"{name}{ext}")
+            candidates.append(f"{dotted}{ext}")
+
+        for candidate in candidates:
+            row = self.conn.execute(
+                "SELECT * FROM files WHERE path = ? OR path LIKE ?",
+                (candidate, f"%/{candidate}"),
+            ).fetchone()
+            if row:
+                return {
+                    "name": name,
+                    "file": row["path"],
+                    "line": 1,
+                    "kind": "module",
+                    "match_type": "file_path",
+                }
+
+        return None
+
+    def get_dead_symbols(self, kind: str | None = None) -> list[SymbolRecord]:
+        """Find symbols with no incoming edges — potential dead code.
+
+        Returns symbols that are never referenced as a target in symbol_edges.
+        Excludes entry points, test code, vendored paths, and non-code kinds.
+        """
+        assert self.conn is not None
+
+        allowed_kinds = ("function", "method", "class", "struct", "enum", "interface")
+        sql = """
+            SELECT s.*, f.path as file_path
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            LEFT JOIN symbol_edges e ON e.target_id = s.id
+            WHERE e.id IS NULL
+              AND s.kind IN ({kinds})
+              AND s.name NOT LIKE 'test\\_%' ESCAPE '\\'
+              AND s.name NOT LIKE 'Test%'
+              AND s.name NOT IN ('main', '__init__', '__main__', '__new__', '__del__')
+              AND f.path NOT LIKE '%test%'
+              AND f.path NOT LIKE '%vendor%'
+              AND f.path NOT LIKE '%third_party%'
+              AND f.path NOT LIKE '%third-party%'
+        """.format(kinds=",".join("?" for _ in allowed_kinds))
+
+        params: list[Any] = list(allowed_kinds)
+
+        if kind:
+            sql += "  AND s.kind = ?\n"
+            params.append(kind)
+
+        sql += "ORDER BY f.path, s.start_line"
+
+        rows = self.conn.execute(sql, params).fetchall()
+        return [self._row_to_symbol(r) for r in rows]
+
+    def search_pattern(
+        self,
+        pattern: str,
+        language: str | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Search for a regex pattern within symbol source code.
+
+        Fetches candidate symbols from the database (filtered by language/kind),
+        then applies the regex in Python against each symbol's content field.
+        Returns matching symbols with match context.
+        """
+        assert self.conn is not None
+
+        sql = """
+            SELECT s.*, f.path as file_path, f.language
+            FROM symbols s
+            JOIN files f ON s.file_id = f.id
+            WHERE s.content IS NOT NULL AND s.content != ''
+        """
+        params: list[Any] = []
+
+        if language:
+            sql += " AND f.language = ?"
+            params.append(language)
+
+        if kind:
+            sql += " AND s.kind = ?"
+            params.append(kind)
+
+        # Exclude non-code symbol kinds
+        sql += " AND s.kind NOT IN ('namespace', 'module', 'macro', 'section', 'document')"
+        sql += " ORDER BY f.path, s.start_line"
+
+        compiled = re.compile(pattern)
+        results: list[dict[str, Any]] = []
+
+        for row in self.conn.execute(sql, params):
+            content = row["content"]
+            if not content:
+                continue
+
+            matches = []
+            lines = content.split("\n")
+            for i, line in enumerate(lines):
+                if compiled.search(line):
+                    # Build snippet: matching line + 1 line context each side
+                    start = max(0, i - 1)
+                    end = min(len(lines), i + 2)
+                    snippet = "\n".join(lines[start:end])
+                    matches.append({
+                        "line_offset": i + 1,  # 1-based within symbol
+                        "absolute_line": row["start_line"] + i,
+                        "snippet": snippet,
+                    })
+
+            if matches:
+                sym = self._row_to_symbol(row)
+                results.append({
+                    "name": sym.name,
+                    "qualified_name": sym.qualified_name,
+                    "kind": sym.kind,
+                    "file": sym.file_path,
+                    "start_line": sym.start_line,
+                    "end_line": sym.end_line,
+                    "language": row["language"],
+                    "matches": matches,
+                })
+                if len(results) >= limit:
+                    break
+
+        return results
+
     def commit(self) -> None:
         assert self.conn is not None
         self.conn.commit()
