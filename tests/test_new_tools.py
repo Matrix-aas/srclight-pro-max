@@ -59,8 +59,8 @@ class TestFindDeadCode:
         ))
         db.commit()
 
-        dead = db.find_dead_symbols()
-        dead_names = [d["name"] for d in dead]
+        dead = db.get_dead_symbols()
+        dead_names = [d.name for d in dead]
         # unused_fn has no callers, caller also has no callers
         assert "unused_fn" in dead_names
         assert "caller" in dead_names
@@ -77,8 +77,8 @@ class TestFindDeadCode:
         _insert_symbol(db, fid, "real_function", start_line=22, end_line=25)
         db.commit()
 
-        dead = db.find_dead_symbols()
-        dead_names = [d["name"] for d in dead]
+        dead = db.get_dead_symbols()
+        dead_names = [d.name for d in dead]
         assert "main" not in dead_names
         assert "__init__" not in dead_names
         assert "test_something" not in dead_names
@@ -97,8 +97,8 @@ class TestFindDeadCode:
                        visibility="private")
         db.commit()
 
-        dead = db.find_dead_symbols()
-        dead_names = [d["name"] for d in dead]
+        dead = db.get_dead_symbols()
+        dead_names = [d.name for d in dead]
         assert "public_fn" not in dead_names
         assert "exported_fn" not in dead_names
         assert "private_fn" in dead_names
@@ -111,19 +111,19 @@ class TestFindDeadCode:
         _insert_symbol(db, fid, "my_func", kind="function", start_line=7, end_line=10)
         db.commit()
 
-        dead = db.find_dead_symbols()
-        dead_names = [d["name"] for d in dead]
+        dead = db.get_dead_symbols()
+        dead_names = [d.name for d in dead]
         assert "MyEnum" not in dead_names  # enum not in checked kinds
         assert "my_func" in dead_names
 
     def test_limit_respected(self, db):
-        """find_dead_symbols respects the limit parameter."""
+        """get_dead_symbols respects the limit parameter."""
         fid = _insert_file(db)
         for i in range(10):
             _insert_symbol(db, fid, f"fn_{i}", start_line=i * 5, end_line=i * 5 + 3)
         db.commit()
 
-        dead = db.find_dead_symbols(limit=3)
+        dead = db.get_dead_symbols(limit=3)
         assert len(dead) == 3
 
 
