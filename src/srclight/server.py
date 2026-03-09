@@ -23,18 +23,16 @@ from .indexer import IndexConfig, Indexer
 
 logger = logging.getLogger("srclight.server")
 
-mcp = FastMCP(
-    "srclight",
-    instructions="""\
-Deep code indexing for AI agents. Search symbols, navigate relationships, understand codebases instantly.
+_INSTRUCTIONS_TEMPLATE = """Welcome to Srclight — deep code indexing for AI agents.
 
-## Session Protocol
+{dynamic_section}## Getting Started
 1. Call `codebase_map()` at the START of every session to orient yourself — it shows project stats, languages, symbol counts, and directory structure.
 2. Use `list_projects()` to see all repos in the workspace with file/symbol counts.
+3. Use `hybrid_search(query)` to find any code by name, concept, or natural language description.
 
 ## Which Search Tool to Use
-- **`hybrid_search(query)`** — BEST for most queries. Combines keyword + semantic (embedding) search via RRF fusion. Use for natural language ("find dictionary lookup code") or keywords.
-- **`search_symbols(query)`** — keyword-only FTS5 search. Faster, good for exact symbol names or code fragments.
+- **`hybrid_search(query)`** — BEST for most queries. Combines keyword + semantic search via RRF fusion. Use for natural language ("find dictionary lookup code") or keywords.
+- **`search_symbols(query)`** — keyword-only search. Faster, good for exact symbol names or code fragments.
 - **`semantic_search(query)`** — embedding-only search. Good when you know the concept but not the terminology.
 
 ## The `project` Parameter
@@ -66,7 +64,7 @@ In workspace mode (multi-repo), many tools accept an optional `project` paramete
 | Search for code patterns (regex) | `find_pattern(pattern, project)` |
 
 ## Document Indexing
-Srclight indexes non-code files (PDF, DOCX, XLSX, HTML, CSV, email, images, text/RST) alongside source code. Documents become searchable symbols (sections, pages, tables) in the same FTS5 indexes.
+Srclight indexes non-code files (PDF, DOCX, XLSX, HTML, CSV, email, images, text/RST) alongside source code. Documents become searchable symbols (sections, pages, tables) in the same search indexes.
 
 - **Install**: `pip install 'srclight[docs,pdf]'` for document formats.
 - **Scanned PDFs**: Install `pip install 'srclight[pdf,paddleocr]'` + system `poppler-utils` to OCR scanned/image-only PDF pages automatically. Native-text pages are unaffected. If paddleocr is not installed, scanned pages are silently skipped.
@@ -95,9 +93,73 @@ When srclight is available, ALWAYS prefer these tools over grep/find/cat:
 
 ## Setup and server control
 - `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
-- `server_stats()` — When the server started and uptime (for \"how long has srclight been up\").
+- `server_stats()` — When the server started and uptime (for "how long has srclight been up").
 - `restart_server()` — (SSE only) Exit so a process manager can restart. Allowed by default; set SRCLIGHT_ALLOW_RESTART=0 to disable.
-""",
+"""
+
+
+def _build_dynamic_instructions() -> str:
+    """Build the dynamic section of the server instructions from current workspace state."""
+    lines = []
+    try:
+        if _is_workspace_mode():
+            wdb = _get_workspace_db()
+            projects = wdb.list_projects()
+            project_count = len(projects)
+            total_files = sum(p.get("files", 0) for p in projects)
+            total_symbols = sum(p.get("symbols", 0) for p in projects)
+            total_edges = sum(p.get("edges", 0) for p in projects)
+            project_names = [p.get("name", "?") for p in projects[:10]]
+
+            lines.append(f"## Your Workspace: {_workspace_name}")
+            lines.append(f"You have access to **{project_count} indexed project{'s' if project_count != 1 else ''}** "
+                         f"containing **{total_files:,} files**, **{total_symbols:,} symbols**, "
+                         f"and **{total_edges:,} relationships**.")
+            if project_names:
+                names_str = ", ".join(project_names)
+                if project_count > 10:
+                    names_str += f", ... and {project_count - 10} more"
+                lines.append(f"Projects: {names_str}")
+            lines.append("")
+            lines.append("You can search across all projects at once, trace function calls, "
+                         "find who changed code and why, and discover relationships between symbols.")
+            lines.append("")
+        elif _db_path is not None:
+            db = _get_db()
+            stats = db.stats()
+            lines.append("## Your Codebase")
+            lines.append(f"You have access to **{stats['files']:,} files**, "
+                         f"**{stats['symbols']:,} symbols**, "
+                         f"and **{stats['edges']:,} relationships**.")
+            if stats.get("languages"):
+                lang_list = ", ".join(stats["languages"].keys())
+                lines.append(f"Languages: {lang_list}")
+            lines.append("")
+            lines.append("You can search code, trace function calls, "
+                         "find who changed code and why, and discover relationships between symbols.")
+            lines.append("")
+    except Exception:
+        # If we can't get stats (e.g. DB not yet initialized), fall back to generic text
+        lines.append("You have access to a code index with searchable symbols, call graphs, and git history.")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _refresh_instructions() -> None:
+    """Update the MCP server instructions with current workspace state."""
+    try:
+        dynamic = _build_dynamic_instructions()
+        mcp._mcp_server.instructions = _INSTRUCTIONS_TEMPLATE.format(dynamic_section=dynamic)
+    except Exception:
+        pass  # Keep existing instructions on error
+
+
+mcp = FastMCP(
+    "srclight",
+    instructions=_INSTRUCTIONS_TEMPLATE.format(
+        dynamic_section="You have access to a code index with searchable symbols, call graphs, and git history.\n\n"
+    ),
 )
 
 # Global state — initialized on first tool call or via configure()
@@ -320,6 +382,7 @@ def codebase_map(project: str | None = None) -> str:
     Args:
         project: Optional project filter (workspace mode only)
     """
+    _record_query()
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         result = wdb.codebase_map(project=project)
@@ -369,6 +432,7 @@ def search_symbols(
         project: Optional project filter (workspace mode only, e.g. 'intuition')
         limit: Max results to return (default 20)
     """
+    _record_query()
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         results = wdb.search_symbols(query, kind=kind, project=project, limit=limit)
@@ -401,6 +465,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
         name: Symbol name (e.g., 'Dictionary', 'lookup', 'main')
         project: Optional project filter (workspace mode only)
     """
+    _record_query()
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         results = wdb.get_symbol(name, project=project)
@@ -1374,6 +1439,7 @@ def semantic_search(
         project: Project name (workspace mode) or uses current repo
         limit: Max results (default 10)
     """
+    _record_query()
     from .embeddings import get_provider, vector_to_bytes
 
     # Determine which model was used for embeddings
@@ -1435,6 +1501,7 @@ def hybrid_search(
         project: Project name (workspace mode) or uses current repo
         limit: Max results (default 20)
     """
+    _record_query()
     from .embeddings import get_provider, rrf_merge, vector_to_bytes
 
     # Get FTS results
@@ -2014,6 +2081,20 @@ def find_pattern(
 # Set when run_server() or first tool runs — for server_stats
 _server_start_time: float | None = None
 
+# Query activity tracking (for Flutter app / web dashboard)
+_last_query_time: float | None = None
+_last_query_client: str | None = None
+_query_count: int = 0
+
+
+def _record_query(client: str | None = None) -> None:
+    """Record that a tool was called (timestamp + optional client identifier)."""
+    global _last_query_time, _last_query_client, _query_count
+    _last_query_time = time.time()
+    _query_count += 1
+    if client:
+        _last_query_client = client
+
 
 @mcp.tool()
 async def server_stats() -> str:
@@ -2126,6 +2207,7 @@ def configure(db_path: Path | None = None, repo_root: Path | None = None) -> Non
     _vector_cache = None
     _db_path = db_path
     _repo_root = repo_root
+    _refresh_instructions()
 
 
 def configure_workspace(workspace_name: str) -> None:
@@ -2135,6 +2217,7 @@ def configure_workspace(workspace_name: str) -> None:
     if _workspace_db is not None:
         _workspace_db.close()
         _workspace_db = None
+    _refresh_instructions()
 
 
 def run_server(transport: str = "sse", port: int = 8742):

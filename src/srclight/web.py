@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING
 
 from starlette.requests import Request
@@ -456,15 +457,39 @@ def _dashboard_html() -> str:
         </div>
         <div>
           <div class="stat-value" id="statEdges">-</div>
-          <div class="stat-label">Edges</div>
+          <div class="stat-label">Relationships</div>
         </div>
         <div>
           <div class="stat-value" id="statEmbeddings">-</div>
-          <div class="stat-label">Embeddings</div>
+          <div class="stat-label">AI search</div>
         </div>
       </div>
     </div>
   </section>
+
+  <!-- Connect Your AI -->
+  <div class="container">
+    <div class="section" id="connectSection">
+      <div class="section-title">Connect Your AI</div>
+      <p style="font-size: 0.85rem; color: var(--text-dim); margin-bottom: 16px;">
+        Add srclight to your AI assistant so it can search your code, trace relationships, and understand your codebase.
+        Copy the config snippet for your tool below.
+      </p>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;">
+        <button class="btn btn-secondary connect-tab" data-client="claude_desktop" type="button">Claude Desktop</button>
+        <button class="btn btn-secondary connect-tab" data-client="claude_code" type="button">Claude Code</button>
+        <button class="btn btn-secondary connect-tab" data-client="cursor" type="button">Cursor</button>
+        <button class="btn btn-secondary connect-tab" data-client="vscode" type="button">VS Code</button>
+        <button class="btn btn-secondary connect-tab" data-client="windsurf" type="button">Windsurf</button>
+      </div>
+      <div id="connectDetail" class="hidden" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 16px;">
+        <div style="font-size: 0.8rem; color: var(--text-dim); margin-bottom: 8px;" id="connectPath"></div>
+        <pre style="font-family: var(--mono); font-size: 0.82rem; color: var(--text); white-space: pre-wrap; word-break: break-all; margin: 0;" id="connectSnippet"></pre>
+        <button class="btn btn-primary" style="margin-top: 12px; font-size: 0.8rem; padding: 6px 14px;" id="btnCopySnippet" type="button">Copy to clipboard</button>
+        <span id="copyMsg" style="font-size: 0.8rem; color: var(--green); margin-left: 8px;"></span>
+      </div>
+    </div>
+  </div>
 
   <!-- Projects -->
   <div class="container">
@@ -499,19 +524,15 @@ def _dashboard_html() -> str:
           <div class="info-value" id="infoUptime">-</div>
         </div>
         <div class="info-card">
-          <div class="info-label">SSE endpoint</div>
-          <div class="info-value">/sse</div>
-        </div>
-        <div class="info-card">
-          <div class="info-label">Streamable HTTP</div>
+          <div class="info-label">MCP endpoint</div>
           <div class="info-value">/mcp</div>
         </div>
         <div class="info-card">
-          <div class="info-label">Embedding provider</div>
+          <div class="info-label">Search provider</div>
           <div class="info-value" id="infoEmbedModel">-</div>
         </div>
         <div class="info-card">
-          <div class="info-label">Embedding health</div>
+          <div class="info-label">Search health</div>
           <div class="info-value" id="infoEmbedHealth">-</div>
         </div>
         <div class="info-card" style="display: flex; align-items: center; justify-content: center;">
@@ -655,7 +676,7 @@ def _dashboard_html() -> str:
         const d = await api('/api/list_projects');
         const projects = d.projects || d;
         if (!projects || (Array.isArray(projects) && projects.length === 0)) {
-          grid.innerHTML = '<div style="color: var(--text-dim); font-size: 0.85rem;">No projects found. Add repos with <code>srclight workspace add</code>.</div>';
+          grid.innerHTML = '<div style="color: var(--text-dim); font-size: 0.85rem;">No projects yet. Use the desktop app or run <code>srclight workspace add /path/to/repo</code> to get started.</div>';
           return;
         }
         // Handle both array and object formats
@@ -682,7 +703,7 @@ def _dashboard_html() -> str:
             embedHtml = `
               <div class="embed-bar">
                 <div class="embed-bar-label">
-                  <span>Embeddings</span>
+                  <span>AI search</span>
                   <span>${pct}%</span>
                 </div>
                 <div class="embed-bar-track">
@@ -787,6 +808,40 @@ def _dashboard_html() -> str:
         $('restartMsg').style.color = 'var(--red)';
       }
     };
+
+    /* ---- connect your AI ---- */
+    let _connectionInfo = null;
+    async function loadConnectionInfo() {
+      try { _connectionInfo = await api('/api/connection_info'); } catch {}
+    }
+    loadConnectionInfo();
+
+    document.querySelectorAll('.connect-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const client = btn.dataset.client;
+        if (!_connectionInfo || !_connectionInfo.clients[client]) return;
+        const info = _connectionInfo.clients[client];
+        $('connectPath').textContent = 'Add to: ' + info.config_path;
+        $('connectSnippet').textContent = JSON.stringify(info.snippet, null, 2);
+        $('connectDetail').classList.remove('hidden');
+        $('copyMsg').textContent = '';
+        // highlight active tab
+        document.querySelectorAll('.connect-tab').forEach(b => {
+          b.style.borderColor = b === btn ? 'var(--amber)' : '';
+          b.style.color = b === btn ? 'var(--amber)' : '';
+        });
+      });
+    });
+
+    $('btnCopySnippet').addEventListener('click', () => {
+      const text = $('connectSnippet').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        $('copyMsg').textContent = 'Copied!';
+        setTimeout(() => { $('copyMsg').textContent = ''; }, 2000);
+      }).catch(() => {
+        $('copyMsg').textContent = 'Copy failed';
+      });
+    });
 
     /* ---- init ---- */
     loadServerStatus();
@@ -926,6 +981,103 @@ async def _api_version(_request: Request) -> Response:
     return JSONResponse({"version": __version__})
 
 
+async def _api_connection_info(request: Request) -> Response:
+    """Return MCP config snippets for each AI client."""
+    try:
+        port = int(request.query_params.get("port", 8742))
+    except (TypeError, ValueError):
+        port = 8742
+    base = f"http://127.0.0.1:{port}"
+    mcp_url = f"{base}/mcp"
+    sse_url = f"{base}/sse"
+
+    clients = {
+        "claude_desktop": {
+            "name": "Claude Desktop",
+            "config_path": "~/Library/Application Support/Claude/claude_desktop_config.json (macOS) or %APPDATA%/Claude/claude_desktop_config.json (Windows)",
+            "snippet": {
+                "mcpServers": {
+                    "srclight": {
+                        "url": mcp_url,
+                    }
+                }
+            },
+        },
+        "claude_code": {
+            "name": "Claude Code",
+            "config_path": "~/.claude/settings.json",
+            "snippet": {
+                "mcpServers": {
+                    "srclight": {
+                        "type": "sse",
+                        "url": sse_url,
+                    }
+                }
+            },
+        },
+        "cursor": {
+            "name": "Cursor",
+            "config_path": ".cursor/mcp.json",
+            "snippet": {
+                "mcpServers": {
+                    "srclight": {
+                        "url": sse_url,
+                    }
+                }
+            },
+        },
+        "vscode": {
+            "name": "VS Code",
+            "config_path": ".vscode/settings.json",
+            "snippet": {
+                "mcp": {
+                    "servers": {
+                        "srclight": {
+                            "type": "sse",
+                            "url": sse_url,
+                        }
+                    }
+                }
+            },
+        },
+        "windsurf": {
+            "name": "Windsurf",
+            "config_path": "~/.codeium/windsurf/mcp_config.json",
+            "snippet": {
+                "mcpServers": {
+                    "srclight": {
+                        "serverUrl": sse_url,
+                    }
+                }
+            },
+        },
+    }
+
+    return JSONResponse({
+        "clients": clients,
+        "server_url": mcp_url,
+        "sse_url": sse_url,
+    })
+
+
+async def _api_stats(_request: Request) -> Response:
+    """Return query activity stats for the Flutter app / dashboard."""
+    try:
+        from . import server as server_mod
+        last_time = getattr(server_mod, "_last_query_time", None)
+        last_client = getattr(server_mod, "_last_query_client", None)
+        query_count = getattr(server_mod, "_query_count", 0)
+        result: dict = {"query_count": query_count}
+        if last_time is not None:
+            result["last_query_time"] = last_time
+            result["last_query_ago_seconds"] = round(time.time() - last_time, 1)
+        if last_client is not None:
+            result["last_query_client"] = last_client
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 async def _api_search(request: Request) -> Response:
     q = request.query_params.get("q", "").strip()
     if not q:
@@ -965,6 +1117,8 @@ def add_web_routes(app: "Starlette") -> None:
         Route("/api/restart_server", _api_restart_server, methods=["POST"]),
         Route("/api/version", _api_version, methods=["GET"]),
         Route("/api/search", _api_search, methods=["GET"]),
+        Route("/api/connection_info", _api_connection_info, methods=["GET"]),
+        Route("/api/stats", _api_stats, methods=["GET"]),
     ]
     for r in routes:
         app.router.routes.append(r)
