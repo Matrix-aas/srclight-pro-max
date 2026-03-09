@@ -11,6 +11,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,9 @@ In workspace mode (multi-repo), many tools accept an optional `project` paramete
 | Recent commit activity | `recent_changes(project=project)` |
 | Bug-prone files (churn) | `git_hotspots(project=project)` |
 | Uncommitted WIP | `whats_changed(project=project)` |
+| What does this file import? | `find_imports(path, project)` |
+| Find unused/dead code | `find_dead_code(project)` |
+| Search for code patterns (regex) | `find_pattern(pattern, project)` |
 
 ## Document Indexing
 Srclight indexes non-code files (PDF, DOCX, XLSX, HTML, CSV, email, images, text/RST) alongside source code. Documents become searchable symbols (sections, pages, tables) in the same FTS5 indexes.
@@ -80,6 +84,14 @@ The server picks up new projects automatically (no restart needed).
 
 ## Troubleshooting
 - If ALL tools fail with `-32602: Invalid request parameters`, the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
+
+## Prefer Srclight Over Grep
+When srclight is available, ALWAYS prefer these tools over grep/find/cat:
+- **Instead of grep/rg**: Use `hybrid_search(query)` or `search_symbols(query)` — returns ranked, structured results with file paths, line numbers, and symbol context.
+- **Instead of find/ls**: Use `symbols_in_file(path)` — returns a structured table of contents for any file.
+- **Instead of reading entire files**: Use `get_symbol(name)` — returns just the function/class you need with full source.
+- Srclight results include relationship data (callers, callees, tests) that grep cannot provide.
+- Grep sees text. Srclight sees code structure.
 
 ## Setup and server control
 - `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
@@ -1540,6 +1552,428 @@ def embedding_health(project: str | None = None) -> str:
     except Exception as e:
         result["status"] = "error"
         result["error"] = str(e)
+
+    return json.dumps(result, indent=2)
+
+
+# --- Tier 7: Import Resolution ---
+
+
+# Import extraction patterns by language (regex-based, not tree-sitter)
+IMPORT_PATTERNS: dict[str, list[str]] = {
+    "python": [
+        r"^(?:from\s+([\w.]+)\s+)?import\s+([\w.,\s]+)",
+    ],
+    "javascript": [
+        r"import\s+.*?from\s+['\"]([^'\"]+)['\"]",
+        r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+    ],
+    "typescript": [
+        r"import\s+.*?from\s+['\"]([^'\"]+)['\"]",
+        r"require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+    ],
+    "c": [r'#include\s*[<"]([^>"]+)[>"]'],
+    "cpp": [r'#include\s*[<"]([^>"]+)[>"]'],
+    "go": [r'"([^"]+)"'],
+    "java": [r"^import\s+([\w.]+);"],
+    "kotlin": [r"^import\s+([\w.]+)"],
+    "dart": [r"import\s+['\"]([^'\"]+)['\"]"],
+    "swift": [r"^import\s+(\w+)"],
+    "csharp": [r"^using\s+([\w.]+);"],
+    "php": [
+        r"^use\s+([\w\\]+)",
+        r"(?:require|include)(?:_once)?\s*['\"]([^'\"]+)['\"]",
+    ],
+}
+
+
+def _extract_imports(content: str, language: str) -> list[dict]:
+    """Extract import statements from file content using regex patterns."""
+    patterns = IMPORT_PATTERNS.get(language, [])
+    if not patterns:
+        return []
+
+    imports = []
+    seen_statements = set()
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") and language != "c" and language != "cpp":
+            if not stripped.startswith("#include"):
+                continue
+
+        for pat in patterns:
+            for m in re.finditer(pat, stripped):
+                statement = stripped
+                if statement in seen_statements:
+                    continue
+                seen_statements.add(statement)
+
+                groups = [g for g in m.groups() if g is not None]
+                if not groups:
+                    continue
+
+                if language == "python":
+                    from_module = m.group(1)
+                    import_names = m.group(2)
+                    if from_module:
+                        names = [n.strip() for n in import_names.split(",") if n.strip()]
+                        imports.append({
+                            "statement": statement,
+                            "module": from_module,
+                            "names": names,
+                        })
+                    else:
+                        for name in import_names.split(","):
+                            name = name.strip().split(" as ")[0].strip()
+                            if name:
+                                imports.append({
+                                    "statement": statement,
+                                    "module": name,
+                                    "names": [],
+                                })
+                else:
+                    module = groups[0]
+                    imports.append({
+                        "statement": statement,
+                        "module": module,
+                        "names": [],
+                    })
+
+    return imports
+
+
+@mcp.tool()
+def find_imports(path: str, project: str | None = None) -> str:
+    """Find and resolve import statements in a source file.
+
+    Extracts all import/include/require statements and attempts to resolve
+    them to indexed symbols. Answers: "What does this file depend on?"
+
+    Supports: Python (import/from...import), JavaScript/TypeScript (import/require),
+    C/C++ (#include), Go (import), Java/Kotlin (import), Dart (import),
+    Swift (import), C# (using), PHP (use/require/include).
+
+    Args:
+        path: Relative file path (e.g., 'src/srclight/server.py')
+        project: Project name (required in workspace mode if ambiguous)
+    """
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("find_imports")
+        wdb = _get_workspace_db()
+
+        # Find the file in the workspace
+        file_info = None
+        for batch in wdb._iter_batches(project_filter=project):
+            for schema, project_name in batch:
+                try:
+                    row = wdb.conn.execute(
+                        f"SELECT * FROM [{schema}].files WHERE path = ?",
+                        (path,),
+                    ).fetchone()
+                    if row:
+                        file_info = {"language": row["language"], "schema": schema}
+                        break
+                except Exception:
+                    pass
+            if file_info:
+                break
+
+        if not file_info:
+            return json.dumps({"error": f"File '{path}' not found in project '{project}'"})
+
+        language = file_info["language"]
+        if not language or language not in IMPORT_PATTERNS:
+            return json.dumps({
+                "file": path,
+                "language": language,
+                "import_count": 0,
+                "resolved_count": 0,
+                "imports": [],
+                "note": f"Import extraction not supported for language: {language}",
+            }, indent=2)
+
+        # Read file content from disk
+        config_entries = [e for e in wdb._all_indexable if e.name == project]
+        if not config_entries:
+            return _project_not_found_error(project)
+        project_root = Path(config_entries[0].root)
+        file_path = project_root / path
+        try:
+            content = file_path.read_text(errors="replace")
+        except OSError as e:
+            return json.dumps({"error": f"Cannot read file: {e}"})
+
+        raw_imports = _extract_imports(content, language)
+
+        imports = []
+        resolved_count = 0
+        for imp in raw_imports:
+            entry: dict = {
+                "statement": imp["statement"],
+                "module": imp["module"],
+            }
+            if imp["names"]:
+                entry["names"] = imp["names"]
+
+            resolved_to = None
+            names_to_try = imp["names"] if imp["names"] else [imp["module"].split(".")[-1]]
+            for name in names_to_try:
+                for batch in wdb._iter_batches(project_filter=project):
+                    for schema, pname in batch:
+                        try:
+                            row = wdb.conn.execute(
+                                f"""SELECT s.name, s.kind, s.start_line, f.path as file_path
+                                    FROM [{schema}].symbols s
+                                    JOIN [{schema}].files f ON s.file_id = f.id
+                                    WHERE s.name = ?
+                                    LIMIT 1""",
+                                (name,),
+                            ).fetchone()
+                            if row:
+                                resolved_to = {
+                                    "name": row["name"],
+                                    "file": row["file_path"],
+                                    "line": row["start_line"],
+                                    "kind": row["kind"],
+                                }
+                                break
+                        except Exception:
+                            pass
+                    if resolved_to:
+                        break
+                if resolved_to:
+                    break
+
+            if resolved_to:
+                entry["resolved_to"] = resolved_to
+                entry["status"] = "resolved"
+                resolved_count += 1
+            else:
+                entry["resolved_to"] = None
+                entry["status"] = "external"
+
+            imports.append(entry)
+
+        return json.dumps({
+            "file": path,
+            "language": language,
+            "import_count": len(imports),
+            "resolved_count": resolved_count,
+            "imports": imports,
+        }, indent=2)
+
+    # Single-repo mode
+    db = _get_db()
+    file_rec = db.get_file(path)
+    if not file_rec:
+        return json.dumps({"error": f"File '{path}' not found in index"})
+
+    language = file_rec.language
+    if not language or language not in IMPORT_PATTERNS:
+        return json.dumps({
+            "file": path,
+            "language": language,
+            "import_count": 0,
+            "resolved_count": 0,
+            "imports": [],
+            "note": f"Import extraction not supported for language: {language}",
+        }, indent=2)
+
+    if _repo_root:
+        file_path = _repo_root / path
+    else:
+        file_path = Path(path)
+    try:
+        content = file_path.read_text(errors="replace")
+    except OSError as e:
+        return json.dumps({"error": f"Cannot read file: {e}"})
+
+    raw_imports = _extract_imports(content, language)
+
+    imports = []
+    resolved_count = 0
+    for imp in raw_imports:
+        entry: dict = {
+            "statement": imp["statement"],
+            "module": imp["module"],
+        }
+        if imp["names"]:
+            entry["names"] = imp["names"]
+
+        resolved_to = None
+        names_to_try = imp["names"] if imp["names"] else [imp["module"].split(".")[-1]]
+        for name in names_to_try:
+            result = db.resolve_import(name, hint_path=path)
+            if result:
+                resolved_to = result
+                break
+
+        if resolved_to:
+            entry["resolved_to"] = resolved_to
+            entry["status"] = "resolved"
+            resolved_count += 1
+        else:
+            entry["resolved_to"] = None
+            entry["status"] = "external"
+
+        imports.append(entry)
+
+    return json.dumps({
+        "file": path,
+        "language": language,
+        "import_count": len(imports),
+        "resolved_count": resolved_count,
+        "imports": imports,
+    }, indent=2)
+
+
+# --- Tier 8: Code Analysis ---
+
+
+@mcp.tool()
+def find_dead_code(project: str | None = None, kind: str | None = None) -> str:
+    """Find symbols that have no callers or references — potential dead code.
+
+    Returns symbols that are defined but never referenced by any other symbol
+    in the indexed codebase. Useful for cleanup and understanding which code
+    is actually used.
+
+    Excludes: main/entry points, __init__/__main__, test functions, and
+    symbols in vendored/third-party code.
+
+    Args:
+        project: Project name (required in workspace mode)
+        kind: Filter by symbol kind (e.g., 'function', 'class', 'method')
+    """
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("find_dead_code")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        dead = db.get_dead_symbols(kind=kind)
+        db.close()
+    else:
+        db = _get_db()
+        dead = db.get_dead_symbols(kind=kind)
+
+    # Group by file for readability
+    by_file: dict[str, list[dict]] = {}
+    for sym in dead:
+        entry = {
+            "name": sym.name,
+            "kind": sym.kind,
+            "line": sym.start_line,
+            "signature": sym.signature,
+        }
+        file_path = sym.file_path or "unknown"
+        by_file.setdefault(file_path, []).append(entry)
+
+    result: dict[str, object] = {
+        "total_unreferenced": len(dead),
+        "file_count": len(by_file),
+        "by_file": by_file,
+    }
+    if project:
+        result["project"] = project
+    if kind:
+        result["kind_filter"] = kind
+    if not dead:
+        result["hint"] = "No unreferenced symbols found. This may mean the codebase is well-connected, or edges haven't been indexed yet."
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def find_pattern(
+    pattern: str,
+    project: str | None = None,
+    language: str | None = None,
+    kind: str | None = None,
+    limit: int = 50,
+) -> str:
+    """Search for structural code patterns in symbol bodies.
+
+    Goes beyond text grep by searching within parsed symbol boundaries.
+    Patterns are matched against symbol source code with context about
+    the containing function/class/method.
+
+    Unlike grep, results include:
+    - The symbol name and kind containing the match
+    - File path and line numbers of the symbol
+    - The match context within the symbol
+
+    Pattern supports regex. Common patterns:
+    - "Color\\\\(0x" — find raw color literals
+    - "requests\\\\.get\\\\(" — find HTTP calls
+    - "TODO|FIXME|HACK" — find code annotations
+    - "except.*Exception" — find broad exception handlers
+    - "sleep\\\\(" — find sleep calls
+    - "eval\\\\(|exec\\\\(" — find dynamic code execution
+
+    Args:
+        pattern: Regex pattern to search for in symbol source code
+        project: Optional project filter (workspace mode: filters to one project)
+        language: Filter by language (e.g., 'python', 'javascript')
+        kind: Filter by symbol kind (e.g., 'function', 'method')
+        limit: Maximum results (default 50)
+    """
+    import re as _re
+
+    # Validate regex
+    try:
+        _re.compile(pattern)
+    except _re.error as e:
+        return json.dumps({"error": f"Invalid regex pattern: {e}"}, indent=2)
+
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("find_pattern")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        matches = db.search_pattern(pattern, language=language, kind=kind, limit=limit)
+        db.close()
+    else:
+        db = _get_db()
+        matches = db.search_pattern(pattern, language=language, kind=kind, limit=limit)
+
+    # Group by file for readability
+    by_file: dict[str, list[dict]] = {}
+    for m in matches:
+        file_path = m.pop("file", "unknown")
+        by_file.setdefault(file_path, []).append(m)
+
+    result: dict[str, object] = {
+        "pattern": pattern,
+        "match_count": len(matches),
+        "file_count": len(by_file),
+        "by_file": by_file,
+    }
+    if project:
+        result["project"] = project
+    if language:
+        result["language_filter"] = language
+    if kind:
+        result["kind_filter"] = kind
+    if not matches:
+        result["hint"] = "No matches found. Try a broader pattern or check that symbols have been indexed."
 
     return json.dumps(result, indent=2)
 
