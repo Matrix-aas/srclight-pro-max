@@ -195,10 +195,10 @@ def _community_cohesion(members: set[int], G) -> float:
 def trace_execution_flows(
     db: Database,
     sym_to_community: dict[int, int],
-    max_entry_points: int = 50,
-    max_depth: int = 10,
-    max_branching: int = 4,
-    max_flows: int = 75,
+    max_entry_points: int = 20,
+    max_depth: int = 8,
+    max_branching: int = 3,
+    max_flows: int = 50,
 ) -> list[dict[str, Any]]:
     """Trace execution flows via BFS from entry points along call edges.
 
@@ -207,6 +207,9 @@ def trace_execution_flows(
         communities_crossed, steps
     """
     assert db.conn is not None
+
+    # Container kinds are not behavioral — skip as entry points and targets
+    CONTAINER_KINDS = {"class", "mixin", "enum", "struct", "extension", "section"}
 
     # Build adjacency list from call edges
     adjacency: dict[int, list[int]] = {}
@@ -217,8 +220,32 @@ def trace_execution_flows(
         "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
     ).fetchall()
 
+    # Load symbol info (kind, name, file_id) for all nodes in edges
+    edge_node_ids: set[int] = set()
+    for row in rows:
+        edge_node_ids.add(row["source_id"])
+        edge_node_ids.add(row["target_id"])
+
+    if not edge_node_ids:
+        return []
+
+    placeholders = ",".join("?" * len(edge_node_ids))
+    id_to_info: dict[int, dict] = {}
+    for row in db.conn.execute(
+        f"SELECT id, name, kind, file_id FROM symbols WHERE id IN ({placeholders})",
+        list(edge_node_ids),
+    ):
+        id_to_info[row["id"]] = {
+            "name": row["name"], "kind": row["kind"], "file_id": row["file_id"],
+        }
+
+    # Filter edges: skip edges where source or target is a container kind
     for row in rows:
         src, tgt = row["source_id"], row["target_id"]
+        src_kind = id_to_info.get(src, {}).get("kind", "")
+        tgt_kind = id_to_info.get(tgt, {}).get("kind", "")
+        if src_kind in CONTAINER_KINDS or tgt_kind in CONTAINER_KINDS:
+            continue
         adjacency.setdefault(src, []).append(tgt)
         out_degree[src] = out_degree.get(src, 0) + 1
         in_degree[tgt] = in_degree.get(tgt, 0) + 1
@@ -227,17 +254,8 @@ def trace_execution_flows(
     if not all_nodes:
         return []
 
-    # Load symbol names for labeling and entry point heuristics
-    placeholders = ",".join("?" * len(all_nodes))
-    id_to_info: dict[int, dict] = {}
-    for row in db.conn.execute(
-        f"SELECT id, name, file_id FROM symbols WHERE id IN ({placeholders})",
-        list(all_nodes),
-    ):
-        id_to_info[row["id"]] = {"name": row["name"], "file_id": row["file_id"]}
-
     # Detect test files
-    file_ids = {info["file_id"] for info in id_to_info.values()}
+    file_ids = {info["file_id"] for info in id_to_info.values() if info.get("file_id")}
     test_file_ids: set[int] = set()
     if file_ids:
         fp = ",".join("?" * len(file_ids))
@@ -247,7 +265,7 @@ def trace_execution_flows(
             if "test" in row["path"].lower():
                 test_file_ids.add(row["id"])
 
-    # Score entry points
+    # Score entry points (functions/methods only, not containers)
     ENTRY_HEURISTICS = {"main", "run", "start", "init", "setup", "execute", "handle", "serve"}
     entry_scores: list[tuple[int, float]] = []
 
@@ -255,7 +273,9 @@ def trace_execution_flows(
         info = id_to_info.get(node_id)
         if not info:
             continue
-        if info["file_id"] in test_file_ids:
+        if info.get("kind") in CONTAINER_KINDS:
+            continue
+        if info.get("file_id") in test_file_ids:
             continue
 
         out_d = out_degree.get(node_id, 0)
@@ -279,11 +299,19 @@ def trace_execution_flows(
     entry_scores.sort(key=lambda x: x[1], reverse=True)
     entry_points = [ep[0] for ep in entry_scores[:max_entry_points]]
 
-    # BFS from each entry point
+    # BFS from each entry point (with global iteration cap)
     raw_flows: list[list[int]] = []
+    max_total_iterations = 5000
+    total_iterations = 0
     for entry_id in entry_points:
-        flows_from_entry = _bfs_flows(entry_id, adjacency, max_depth, max_branching)
+        flows_from_entry, iters = _bfs_flows(
+            entry_id, adjacency, max_depth, max_branching,
+            iteration_budget=max_total_iterations - total_iterations,
+        )
+        total_iterations += iters
         raw_flows.extend(flows_from_entry)
+        if total_iterations >= max_total_iterations:
+            break
 
     # Deduplicate: remove subset flows
     raw_flows.sort(key=len, reverse=True)
@@ -346,12 +374,18 @@ def _bfs_flows(
     adjacency: dict[int, list[int]],
     max_depth: int,
     max_branching: int,
-) -> list[list[int]]:
-    """BFS from a single entry point. Returns list of paths."""
+    iteration_budget: int = 5000,
+) -> tuple[list[list[int]], int]:
+    """BFS from a single entry point. Returns (list of paths, iteration count)."""
     flows: list[list[int]] = []
     stack = [([start], 0)]
+    iterations = 0
 
     while stack:
+        iterations += 1
+        if iterations > iteration_budget:
+            break
+
         path, depth = stack.pop()
         current = path[-1]
 
@@ -375,7 +409,7 @@ def _bfs_flows(
         if not extended and len(path) >= 2:
             flows.append(path)
 
-    return flows
+    return flows, iterations
 
 
 def compute_impact(
