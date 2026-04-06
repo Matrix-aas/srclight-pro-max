@@ -376,3 +376,70 @@ def _bfs_flows(
             flows.append(path)
 
     return flows
+
+
+def compute_impact(
+    db: Database,
+    symbol_id: int,
+    sym_to_community: dict[int, int],
+    flows: list[dict[str, Any]],
+    max_depth: int = 3,
+) -> dict[str, Any]:
+    """Compute blast radius and risk for modifying a symbol.
+
+    Returns dict with keys:
+        risk (LOW/MEDIUM/HIGH/CRITICAL),
+        direct_dependents, transitive_dependents,
+        affected_communities, affected_flows,
+        is_entry_point, details
+    """
+    # Get direct callers (returns list of {"symbol": SymbolRecord, "edge_type": ...})
+    direct = db.get_callers(symbol_id)
+    direct_ids = {d["symbol"].id for d in direct}
+
+    # Get transitive dependents (same format)
+    transitive = db.get_dependents(symbol_id, transitive=True, max_depth=max_depth)
+    transitive_ids = {d["symbol"].id for d in transitive}
+
+    # Affected communities
+    my_comm = sym_to_community.get(symbol_id)
+    affected_comms = set()
+    for dep_id in transitive_ids:
+        comm = sym_to_community.get(dep_id)
+        if comm is not None and comm != my_comm:
+            affected_comms.add(comm)
+
+    # Affected flows
+    affected_flow_labels = []
+    is_entry_point = False
+    for flow in flows:
+        step_ids = {s["symbol_id"] for s in flow["steps"]}
+        if symbol_id in step_ids:
+            affected_flow_labels.append(flow["label"])
+            if flow["entry_symbol_id"] == symbol_id:
+                is_entry_point = True
+
+    # Risk scoring
+    n_direct = len(direct_ids)
+    n_comm_crossings = len(affected_comms)
+
+    if n_direct > 25 or is_entry_point:
+        risk = "CRITICAL"
+    elif n_direct > 10 or n_comm_crossings >= 2:
+        risk = "HIGH"
+    elif n_direct > 3 or n_comm_crossings >= 1:
+        risk = "MEDIUM"
+    else:
+        risk = "LOW"
+
+    return {
+        "risk": risk,
+        "direct_dependents": n_direct,
+        "transitive_dependents": len(transitive_ids),
+        "affected_communities": list(affected_comms),
+        "affected_flows": affected_flow_labels,
+        "is_entry_point": is_entry_point,
+        "details": f"{n_direct} direct callers, {len(transitive_ids)} transitive, "
+                   f"{n_comm_crossings} community boundaries crossed, "
+                   f"{len(affected_flow_labels)} flows affected",
+    }

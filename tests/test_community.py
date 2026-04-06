@@ -216,3 +216,41 @@ def test_flow_communities_crossed(db):
     # The flow login -> query_users crosses a community boundary
     cross_flows = [f for f in flows if f["communities_crossed"] > 0]
     assert len(cross_flows) >= 1
+
+
+def test_compute_impact_low_risk(db):
+    """Leaf node with few dependents should be LOW risk."""
+    from srclight.community import detect_communities, trace_execution_flows, compute_impact
+
+    syms = _build_test_graph(db)
+    communities = detect_communities(db)
+    sym_to_comm = {}
+    for c in communities:
+        for m in c["members"]:
+            sym_to_comm[m["id"]] = c["id"]
+
+    flows = trace_execution_flows(db, sym_to_comm)
+
+    # hash_password is a leaf with 1 caller, same community
+    result = compute_impact(db, syms["hash_password"], sym_to_comm, flows)
+    assert result["risk"] == "LOW"
+    assert result["direct_dependents"] >= 1
+
+
+def test_compute_impact_higher_risk_for_bridge(db):
+    """Symbol that bridges communities should have higher risk."""
+    from srclight.community import detect_communities, trace_execution_flows, compute_impact
+
+    syms = _build_test_graph(db)
+    communities = detect_communities(db)
+    sym_to_comm = {}
+    for c in communities:
+        for m in c["members"]:
+            sym_to_comm[m["id"]] = c["id"]
+
+    flows = trace_execution_flows(db, sym_to_comm)
+
+    # login is an entry point that bridges communities
+    result = compute_impact(db, syms["login"], sym_to_comm, flows)
+    assert result["risk"] in ("MEDIUM", "HIGH", "CRITICAL")
+    assert len(result["affected_flows"]) >= 1
