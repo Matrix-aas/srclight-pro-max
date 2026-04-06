@@ -254,3 +254,67 @@ def test_compute_impact_higher_risk_for_bridge(db):
     result = compute_impact(db, syms["login"], sym_to_comm, flows)
     assert result["risk"] in ("MEDIUM", "HIGH", "CRITICAL")
     assert len(result["affected_flows"]) >= 1
+
+
+def test_schema_v5_migration(tmp_path):
+    """DB should migrate from v4 to v5, adding community/flow tables."""
+    db_path = tmp_path / "migrate.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+
+    tables = {row[0] for row in db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+
+    assert "communities" in tables
+    assert "symbol_communities" in tables
+    assert "execution_flows" in tables
+    assert "flow_steps" in tables
+
+    version = db.conn.execute(
+        "SELECT value FROM schema_info WHERE key = 'schema_version'"
+    ).fetchone()["value"]
+    assert version == "5"
+
+    db.close()
+
+
+def test_store_and_retrieve_communities(db):
+    """Can store and retrieve community data."""
+    syms = _build_test_graph(db)
+
+    from srclight.community import detect_communities
+    communities = detect_communities(db)
+
+    db.store_communities(communities)
+    db.commit()
+
+    stored = db.get_communities()
+    assert len(stored) >= 2
+
+    comm_id = db.get_community_for_symbol(syms["login"])
+    assert comm_id is not None
+
+
+def test_store_and_retrieve_flows(db):
+    """Can store and retrieve execution flow data."""
+    from srclight.community import detect_communities, trace_execution_flows
+
+    syms = _build_test_graph(db)
+    communities = detect_communities(db)
+    sym_to_comm = {}
+    for c in communities:
+        for m in c["members"]:
+            sym_to_comm[m["id"]] = c["id"]
+
+    flows = trace_execution_flows(db, sym_to_comm)
+    db.store_communities(communities)
+    db.store_execution_flows(flows)
+    db.commit()
+
+    stored = db.get_execution_flows()
+    assert len(stored) >= 1
+
+    login_flows = db.get_flows_for_symbol(syms["login"])
+    assert len(login_flows) >= 1
