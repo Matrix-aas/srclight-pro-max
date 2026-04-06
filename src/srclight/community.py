@@ -190,3 +190,189 @@ def _community_cohesion(members: set[int], G) -> float:
     internal //= 2
     possible = len(members) * (len(members) - 1) // 2
     return round(internal / possible, 4) if possible > 0 else 0.0
+
+
+def trace_execution_flows(
+    db: Database,
+    sym_to_community: dict[int, int],
+    max_entry_points: int = 50,
+    max_depth: int = 10,
+    max_branching: int = 4,
+    max_flows: int = 75,
+) -> list[dict[str, Any]]:
+    """Trace execution flows via BFS from entry points along call edges.
+
+    Returns list of flow dicts with keys:
+        entry_symbol_id, terminal_symbol_id, label, step_count,
+        communities_crossed, steps
+    """
+    assert db.conn is not None
+
+    # Build adjacency list from call edges
+    adjacency: dict[int, list[int]] = {}
+    in_degree: dict[int, int] = {}
+    out_degree: dict[int, int] = {}
+
+    rows = db.conn.execute(
+        "SELECT source_id, target_id FROM symbol_edges WHERE edge_type = 'calls'"
+    ).fetchall()
+
+    for row in rows:
+        src, tgt = row["source_id"], row["target_id"]
+        adjacency.setdefault(src, []).append(tgt)
+        out_degree[src] = out_degree.get(src, 0) + 1
+        in_degree[tgt] = in_degree.get(tgt, 0) + 1
+
+    all_nodes = set(out_degree.keys()) | set(in_degree.keys())
+    if not all_nodes:
+        return []
+
+    # Load symbol names for labeling and entry point heuristics
+    placeholders = ",".join("?" * len(all_nodes))
+    id_to_info: dict[int, dict] = {}
+    for row in db.conn.execute(
+        f"SELECT id, name, file_id FROM symbols WHERE id IN ({placeholders})",
+        list(all_nodes),
+    ):
+        id_to_info[row["id"]] = {"name": row["name"], "file_id": row["file_id"]}
+
+    # Detect test files
+    file_ids = {info["file_id"] for info in id_to_info.values()}
+    test_file_ids: set[int] = set()
+    if file_ids:
+        fp = ",".join("?" * len(file_ids))
+        for row in db.conn.execute(
+            f"SELECT id, path FROM files WHERE id IN ({fp})", list(file_ids)
+        ):
+            if "test" in row["path"].lower():
+                test_file_ids.add(row["id"])
+
+    # Score entry points
+    ENTRY_HEURISTICS = {"main", "run", "start", "init", "setup", "execute", "handle", "serve"}
+    entry_scores: list[tuple[int, float]] = []
+
+    for node_id in all_nodes:
+        info = id_to_info.get(node_id)
+        if not info:
+            continue
+        if info["file_id"] in test_file_ids:
+            continue
+
+        out_d = out_degree.get(node_id, 0)
+        in_d = in_degree.get(node_id, 0)
+
+        if out_d == 0:
+            continue  # leaf nodes aren't entry points
+
+        # Score: high out-degree, low in-degree
+        score = out_d / max(in_d, 0.5)
+
+        # Bonus for heuristic names
+        name = (info["name"] or "").lower()
+        for h in ENTRY_HEURISTICS:
+            if name.startswith(h) or name == h:
+                score *= 2.0
+                break
+
+        entry_scores.append((node_id, score))
+
+    entry_scores.sort(key=lambda x: x[1], reverse=True)
+    entry_points = [ep[0] for ep in entry_scores[:max_entry_points]]
+
+    # BFS from each entry point
+    raw_flows: list[list[int]] = []
+    for entry_id in entry_points:
+        flows_from_entry = _bfs_flows(entry_id, adjacency, max_depth, max_branching)
+        raw_flows.extend(flows_from_entry)
+
+    # Deduplicate: remove subset flows
+    raw_flows.sort(key=len, reverse=True)
+    unique_flows: list[list[int]] = []
+    seen_step_sets: list[set[int]] = []
+    for flow in raw_flows:
+        flow_set = set(flow)
+        is_subset = any(flow_set.issubset(existing) for existing in seen_step_sets)
+        if not is_subset:
+            unique_flows.append(flow)
+            seen_step_sets.append(flow_set)
+
+    # Deduplicate by entry+terminal pair: keep longest
+    pair_best: dict[tuple[int, int], list[int]] = {}
+    for flow in unique_flows:
+        pair = (flow[0], flow[-1])
+        if pair not in pair_best or len(flow) > len(pair_best[pair]):
+            pair_best[pair] = flow
+    unique_flows = list(pair_best.values())
+
+    # Sort by length and take top N
+    unique_flows.sort(key=len, reverse=True)
+    unique_flows = unique_flows[:max_flows]
+
+    # Build result dicts
+    results = []
+    for flow in unique_flows:
+        steps = []
+        prev_comm = None
+        crossings = 0
+        for order, sym_id in enumerate(flow):
+            comm_id = sym_to_community.get(sym_id)
+            steps.append({
+                "symbol_id": sym_id,
+                "community_id": comm_id,
+                "order": order,
+            })
+            if prev_comm is not None and comm_id is not None and comm_id != prev_comm:
+                crossings += 1
+            prev_comm = comm_id
+
+        entry_name = id_to_info.get(flow[0], {}).get("name", "?")
+        terminal_name = id_to_info.get(flow[-1], {}).get("name", "?")
+        label = f"{entry_name} -> {terminal_name}"
+
+        results.append({
+            "entry_symbol_id": flow[0],
+            "terminal_symbol_id": flow[-1],
+            "label": label,
+            "step_count": len(flow),
+            "communities_crossed": crossings,
+            "steps": steps,
+        })
+
+    return results
+
+
+def _bfs_flows(
+    start: int,
+    adjacency: dict[int, list[int]],
+    max_depth: int,
+    max_branching: int,
+) -> list[list[int]]:
+    """BFS from a single entry point. Returns list of paths."""
+    flows: list[list[int]] = []
+    stack = [([start], 0)]
+
+    while stack:
+        path, depth = stack.pop()
+        current = path[-1]
+
+        if depth >= max_depth:
+            flows.append(path)
+            continue
+
+        callees = adjacency.get(current, [])
+        if not callees:
+            if len(path) >= 2:
+                flows.append(path)
+            continue
+
+        extended = False
+        for callee in callees[:max_branching]:
+            if callee in path:
+                continue  # avoid cycles
+            stack.append((path + [callee], depth + 1))
+            extended = True
+
+        if not extended and len(path) >= 2:
+            flows.append(path)
+
+    return flows

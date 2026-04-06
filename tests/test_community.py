@@ -172,3 +172,47 @@ def test_tokenize_name():
     assert _tokenize_name("HTTPClient") == ["http", "client"]
     assert _tokenize_name("auth::validate") == ["auth", "validate"]
     assert _tokenize_name("") == []
+
+
+def test_trace_execution_flows(db):
+    """BFS should find flows from entry points through the call graph."""
+    from srclight.community import detect_communities, trace_execution_flows
+
+    syms = _build_test_graph(db)
+    communities = detect_communities(db)
+
+    sym_to_comm = {}
+    for c in communities:
+        for m in c["members"]:
+            sym_to_comm[m["id"]] = c["id"]
+
+    flows = trace_execution_flows(db, sym_to_comm)
+
+    # login has highest out-degree and zero in-degree — should be entry point
+    assert len(flows) >= 1
+
+    entry_ids = {f["entry_symbol_id"] for f in flows}
+    assert syms["login"] in entry_ids
+
+    for f in flows:
+        assert f["step_count"] >= 2
+        assert len(f["steps"]) == f["step_count"]
+
+
+def test_flow_communities_crossed(db):
+    """Flows crossing community boundaries should be counted."""
+    from srclight.community import detect_communities, trace_execution_flows
+
+    syms = _build_test_graph(db)
+    communities = detect_communities(db)
+
+    sym_to_comm = {}
+    for c in communities:
+        for m in c["members"]:
+            sym_to_comm[m["id"]] = c["id"]
+
+    flows = trace_execution_flows(db, sym_to_comm)
+
+    # The flow login -> query_users crosses a community boundary
+    cross_flows = [f for f in flows if f["communities_crossed"] > 0]
+    assert len(cross_flows) >= 1
