@@ -46,6 +46,7 @@ dependencies = [
     "tree-sitter-sql>=0.3.0",
     "tree-sitter-groovy>=0.1.0",
     "numpy>=1.26.0",
+    "networkx>=3.0",
 ]
 
 [project.optional-dependencies]
