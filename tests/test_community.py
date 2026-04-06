@@ -105,3 +105,70 @@ def test_detect_communities_two_clusters(db):
     assert login_comm is not None
     assert query_comm is not None
     assert login_comm["id"] != query_comm["id"]
+
+
+def test_community_labels_are_meaningful(db):
+    """Community labels should reflect member symbol names."""
+    from srclight.community import detect_communities
+
+    _build_test_graph(db)
+    communities = detect_communities(db)
+
+    all_labels = [c["label"] for c in communities]
+    assert any(label != "unnamed" for label in all_labels)
+    for c in communities:
+        assert isinstance(c["keywords"], list)
+
+
+def test_community_cohesion_range(db):
+    """Cohesion should be between 0 and 1."""
+    from srclight.community import detect_communities
+
+    _build_test_graph(db)
+    communities = detect_communities(db)
+
+    for c in communities:
+        assert 0.0 <= c["cohesion"] <= 1.0
+
+
+def test_detect_communities_empty_graph(db):
+    """No edges -> no communities."""
+    from srclight.community import detect_communities
+
+    communities = detect_communities(db)
+    assert communities == []
+
+
+def test_detect_communities_single_edge(db):
+    """Single edge -> one community with 2 members."""
+    from srclight.community import detect_communities
+
+    f1 = db.upsert_file(FileRecord(
+        path="a.py", content_hash="x", mtime=1.0,
+        language="python", size=10, line_count=5,
+    ))
+    s1 = db.insert_symbol(SymbolRecord(
+        file_id=f1, kind="function", name="foo",
+        qualified_name="foo", start_line=1, end_line=5, content="def foo(): bar()",
+    ), file_path="a.py")
+    s2 = db.insert_symbol(SymbolRecord(
+        file_id=f1, kind="function", name="bar",
+        qualified_name="bar", start_line=6, end_line=10, content="def bar(): pass",
+    ), file_path="a.py")
+    db.insert_edge(EdgeRecord(source_id=s1, target_id=s2, edge_type="calls"))
+    db.commit()
+
+    communities = detect_communities(db)
+    assert len(communities) == 1
+    assert communities[0]["symbol_count"] == 2
+
+
+def test_tokenize_name():
+    """Identifier tokenization handles CamelCase, snake_case, qualifiers."""
+    from srclight.community import _tokenize_name
+
+    assert _tokenize_name("getUserName") == ["get", "user", "name"]
+    assert _tokenize_name("get_user_name") == ["get", "user", "name"]
+    assert _tokenize_name("HTTPClient") == ["http", "client"]
+    assert _tokenize_name("auth::validate") == ["auth", "validate"]
+    assert _tokenize_name("") == []
