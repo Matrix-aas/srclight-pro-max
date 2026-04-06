@@ -64,13 +64,15 @@ def _build_test_graph(db):
         content="def execute_sql(): pass",
     ), file_path="src/database.py")
 
-    # Cluster A internal
+    # Cluster A internal (triangle for strong internal connectivity)
     db.insert_edge(EdgeRecord(source_id=sym_login, target_id=sym_validate, edge_type="calls"))
     db.insert_edge(EdgeRecord(source_id=sym_validate, target_id=sym_hash, edge_type="calls"))
-    # Cluster B internal
+    db.insert_edge(EdgeRecord(source_id=sym_login, target_id=sym_hash, edge_type="calls"))
+    # Cluster B internal (triangle)
     db.insert_edge(EdgeRecord(source_id=sym_query, target_id=sym_connect, edge_type="calls"))
     db.insert_edge(EdgeRecord(source_id=sym_connect, target_id=sym_exec, edge_type="calls"))
-    # Bridge
+    db.insert_edge(EdgeRecord(source_id=sym_query, target_id=sym_exec, edge_type="calls"))
+    # Bridge (single weak link)
     db.insert_edge(EdgeRecord(source_id=sym_login, target_id=sym_query, edge_type="calls"))
 
     db.commit()
