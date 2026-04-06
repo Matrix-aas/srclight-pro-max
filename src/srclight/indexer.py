@@ -603,7 +603,18 @@ class Indexer:
             stats.edges_created += self._build_inheritance_edges()
 
         # Community detection and execution flow tracing (post-edge phase)
-        if stats.edges_created > 0:
+        # Run if new edges were created OR if communities table is empty (first run after v5 migration)
+        needs_communities = stats.edges_created > 0
+        if not needs_communities:
+            try:
+                count = self.db.conn.execute("SELECT COUNT(*) FROM communities").fetchone()[0]
+                has_edges = self.db.conn.execute(
+                    "SELECT 1 FROM symbol_edges WHERE edge_type = 'calls' LIMIT 1"
+                ).fetchone()
+                needs_communities = count == 0 and has_edges is not None
+            except Exception:
+                pass
+        if needs_communities:
             try:
                 from .community import detect_communities, trace_execution_flows
                 communities = detect_communities(self.db)

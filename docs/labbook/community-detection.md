@@ -102,7 +102,7 @@ BFS from top entry points, max depth 10, max branching 4. Deduplicate subset flo
 - The auto-labeling picks up domain terms (musig2, chacha20, secp256k1) from function names.
 - Low cohesion in large clusters suggests resolution parameter could be tuned higher.
 
-### Summary & Next Steps
+### Summary & Next Steps (Session 1)
 
 1. **Community detection: VALIDATED.** Louvain produces meaningful, recognizable clusters.
    Labels are surprisingly accurate. Performance is acceptable at index time.
@@ -119,3 +119,69 @@ BFS from top entry points, max depth 10, max branching 4. Deduplicate subset flo
 
 4. **Next experiment:** Run on nomad-builder (C++ heavy, 77K edges) to test
    language-specific quality.
+
+---
+
+## 2026-04-06 — Session 2: Optimization, MCP Tools, detect_changes
+
+### Experiment 4: Flow Tracing Optimization
+
+**Problem:** Flow tracing took 12.6s on srclight (1,008 symbols, 4,044 edges). Root cause:
+container kinds (class, enum, struct) have high out-degree (e.g., Database class → 30+ callees),
+causing combinatorial explosion in BFS.
+
+**Method:** Three changes:
+1. Filter CONTAINER_KINDS = {class, mixin, enum, struct, extension, section} from edges and entry points
+2. Reduce defaults: max_entry_points=20, max_depth=8, max_branching=3, max_flows=50
+3. Add global iteration budget of 5,000 across all entry points
+
+**Results:**
+- 12.632s → **0.007s** (1,800x speedup)
+- Flow quality improved: paths now trace behavioral code (functions/methods), not data structures
+- 50 flows produced (capped by max_flows), all meaningful
+
+**Observation:** Filtering container kinds was the biggest win. Classes like `Database` with 30+
+callees were generating millions of paths. Behavioral filtering alone would have been sufficient.
+
+### Experiment 5: MCP Tools End-to-End
+
+**Method:** Added 5 MCP tools to server.py:
+- `get_communities(project)` — list all detected communities
+- `get_community(symbol, project)` — which community a symbol belongs to
+- `get_execution_flows(project)` — BFS-traced execution paths
+- `get_impact(symbol, project)` — blast radius + risk level
+- `detect_changes(project, ref?)` — git diff → symbol mapping → aggregate impact
+
+Tested on srclight itself (19 communities, 50 flows), bitcoin (58 communities, 50 flows),
+and ice (18 communities, 50 flows).
+
+**Results:**
+- All tools work in both single-repo and workspace (per-project DB) mode
+- `detect_changes()` on our own uncommitted changes: 33 symbols changed, 295 dependents,
+  12 communities affected, overall CRITICAL — correct, since we touched core modules
+- Schema v5 backfill works: on first reindex after migration, community detection runs
+  even if no files changed (checks for empty communities table + existing call edges)
+
+### Experiment 6: detect_changes Accuracy
+
+**Method:** Called `detect_changes()` against our own uncommitted work (5 files changed:
+server.py, indexer.py, git.py, community.py, db.py). Parsed `git diff -U0` to extract
+hunk line ranges, mapped to symbols via start_line/end_line overlap, ran `compute_impact()`
+on each.
+
+**Results:**
+- Correctly identified `Indexer` (73 deps), `WorkspaceConfig` (64 deps), `_get_db` (55 deps)
+  as highest-risk changes
+- Overall risk: CRITICAL — accurate, since touching the indexer and server affects most of the codebase
+- A leaf function like `_tokenize_name` shows LOW risk with 1-2 dependents — correct
+- Line number drift (index built before edits) causes some duplicate symbols with slightly
+  different line ranges. Acceptable: the tool still catches the right symbols.
+
+### Summary (Session 2)
+
+1. **Flow tracing: FIXED.** 1,800x speedup via container filtering. Production-ready.
+2. **MCP tools: SHIPPED.** 5 new tools (42 total). All tested end-to-end.
+3. **detect_changes: VALIDATED.** The reactive guardrail works — maps diffs to blast radius.
+   This is the feature that actually prevents agents from shipping breaking changes.
+4. **Schema v5 backfill: FIXED.** Community detection now runs on first reindex after migration,
+   not just when new edges are created.
