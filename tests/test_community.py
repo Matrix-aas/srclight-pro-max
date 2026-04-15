@@ -493,3 +493,141 @@ def test_get_execution_flows_recomputes_metadata_for_filtered_steps(db):
     assert filtered[0]["label"] == "bootstrap -> handoff"
     assert filtered[0]["step_count"] == 2
     assert filtered[0]["communities_crossed"] == 0
+
+
+def test_get_execution_flows_summary_uses_full_filtered_metadata_beyond_preview(db):
+    server_file = db.upsert_file(FileRecord(
+        path="server/app.py", content_hash="server-preview", mtime=1.0,
+        language="python", size=120, line_count=30,
+    ))
+    worker_file = db.upsert_file(FileRecord(
+        path="worker/jobs.py", content_hash="worker-preview", mtime=1.0,
+        language="python", size=120, line_count=10,
+    ))
+
+    bootstrap = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="bootstrap",
+        qualified_name="server.bootstrap", start_line=1, end_line=5,
+        content="def bootstrap(): auth_gate()",
+    ), file_path="server/app.py")
+    auth_gate = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="auth_gate",
+        qualified_name="server.auth_gate", start_line=6, end_line=10,
+        content="def auth_gate(): load_user()",
+    ), file_path="server/app.py")
+    load_user = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="load_user",
+        qualified_name="server.load_user", start_line=11, end_line=15,
+        content="def load_user(): serialize_user()",
+    ), file_path="server/app.py")
+    serialize_user = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="serialize_user",
+        qualified_name="server.serialize_user", start_line=16, end_line=20,
+        content="def serialize_user(): run_jobs()",
+    ), file_path="server/app.py")
+    run_jobs = db.insert_symbol(SymbolRecord(
+        file_id=worker_file, kind="function", name="run_jobs",
+        qualified_name="worker.run_jobs", start_line=1, end_line=5,
+        content="def run_jobs(): pass",
+    ), file_path="worker/jobs.py")
+
+    db.insert_edge(EdgeRecord(source_id=bootstrap, target_id=auth_gate, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=auth_gate, target_id=load_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=load_user, target_id=serialize_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=serialize_user, target_id=run_jobs, edge_type="calls"))
+    db.commit()
+
+    from srclight.community import detect_communities, trace_execution_flows
+
+    communities = detect_communities(db)
+    sym_to_comm = {
+        member["id"]: community["id"]
+        for community in communities
+        for member in community["members"]
+    }
+    flows = trace_execution_flows(db, sym_to_comm)
+    db.store_communities(communities)
+    db.store_execution_flows(flows)
+    db.commit()
+
+    filtered = db.get_execution_flows(path_prefix="server/", layer="server")
+
+    assert filtered
+    assert filtered[0]["step_count"] == 4
+    assert len(filtered[0]["key_steps"]) == 3
+    assert filtered[0]["truncated"] is True
+    assert filtered[0]["entry"] == "bootstrap"
+    assert filtered[0]["terminal"] == "serialize_user"
+    assert filtered[0]["label"] == "bootstrap -> serialize_user"
+
+
+def test_get_execution_flows_verbose_max_depth_keeps_full_filtered_metadata(db):
+    server_file = db.upsert_file(FileRecord(
+        path="server/app.py", content_hash="server-verbose-preview", mtime=1.0,
+        language="python", size=120, line_count=30,
+    ))
+    worker_file = db.upsert_file(FileRecord(
+        path="worker/jobs.py", content_hash="worker-verbose-preview", mtime=1.0,
+        language="python", size=120, line_count=10,
+    ))
+
+    bootstrap = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="bootstrap",
+        qualified_name="server.bootstrap", start_line=1, end_line=5,
+        content="def bootstrap(): auth_gate()",
+    ), file_path="server/app.py")
+    auth_gate = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="auth_gate",
+        qualified_name="server.auth_gate", start_line=6, end_line=10,
+        content="def auth_gate(): load_user()",
+    ), file_path="server/app.py")
+    load_user = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="load_user",
+        qualified_name="server.load_user", start_line=11, end_line=15,
+        content="def load_user(): serialize_user()",
+    ), file_path="server/app.py")
+    serialize_user = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="serialize_user",
+        qualified_name="server.serialize_user", start_line=16, end_line=20,
+        content="def serialize_user(): run_jobs()",
+    ), file_path="server/app.py")
+    run_jobs = db.insert_symbol(SymbolRecord(
+        file_id=worker_file, kind="function", name="run_jobs",
+        qualified_name="worker.run_jobs", start_line=1, end_line=5,
+        content="def run_jobs(): pass",
+    ), file_path="worker/jobs.py")
+
+    db.insert_edge(EdgeRecord(source_id=bootstrap, target_id=auth_gate, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=auth_gate, target_id=load_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=load_user, target_id=serialize_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=serialize_user, target_id=run_jobs, edge_type="calls"))
+    db.commit()
+
+    from srclight.community import detect_communities, trace_execution_flows
+
+    communities = detect_communities(db)
+    sym_to_comm = {
+        member["id"]: community["id"]
+        for community in communities
+        for member in community["members"]
+    }
+    flows = trace_execution_flows(db, sym_to_comm)
+    db.store_communities(communities)
+    db.store_execution_flows(flows)
+    db.commit()
+
+    filtered = db.get_execution_flows(
+        verbose=True,
+        max_depth=3,
+        path_prefix="server/",
+        layer="server",
+    )
+
+    assert filtered
+    assert filtered[0]["step_count"] == 4
+    assert len(filtered[0]["steps"]) == 3
+    assert filtered[0]["truncated"] is True
+    assert filtered[0]["max_depth_applied"] == 3
+    assert filtered[0]["entry"] == "bootstrap"
+    assert filtered[0]["terminal"] == "serialize_user"
+    assert filtered[0]["label"] == "bootstrap -> serialize_user"

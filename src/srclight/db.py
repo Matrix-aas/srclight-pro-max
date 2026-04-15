@@ -2236,11 +2236,13 @@ class Database:
         results: list[dict] = []
         step_limit = max_depth if max_depth is not None else (None if verbose else 3)
         for flow in flows:
-            total_steps = self._count_flow_steps(
+            full_steps = self.get_flow_steps(
                 flow["id"],
                 path_prefix=path_prefix,
                 layer=layer,
+                verbose=False,
             )
+            total_steps = len(full_steps)
             steps = self.get_flow_steps(
                 flow["id"],
                 limit=step_limit,
@@ -2248,15 +2250,19 @@ class Database:
                 layer=layer,
                 verbose=verbose,
             )
-            entry_name = steps[0]["name"] if steps else flow["entry_name"]
-            terminal_name = steps[-1]["name"] if steps else flow["terminal_name"]
+            entry_name = full_steps[0]["name"] if full_steps else flow["entry_name"]
+            terminal_name = full_steps[-1]["name"] if full_steps else flow["terminal_name"]
             item = {
                 "id": flow["id"],
                 "label": f"{entry_name} -> {terminal_name}" if entry_name and terminal_name else flow["label"],
                 "entry": entry_name,
                 "terminal": terminal_name,
                 "step_count": total_steps,
-                "communities_crossed": self._communities_crossed_for_steps(steps) if steps else flow["communities_crossed"],
+                "communities_crossed": (
+                    self._communities_crossed_for_steps(full_steps)
+                    if full_steps
+                    else flow["communities_crossed"]
+                ),
                 "truncated": total_steps > len(steps),
             }
             if max_depth is not None:
