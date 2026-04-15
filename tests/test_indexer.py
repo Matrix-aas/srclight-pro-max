@@ -234,6 +234,102 @@ export function CachedRpcRequest(pattern: string): MethodDecorator {
     assert call_count == 1
 
 
+def test_imported_microservice_decorator_wrappers_reuse_file_scope_scan(monkeypatch, tmp_path):
+    """Imported wrapper discovery should not re-resolve the same file on repeated lookups."""
+    from srclight import indexer as indexer_module
+
+    root = tmp_path / "project"
+    (root / "server/decorators").mkdir(parents=True)
+    (root / "server/messaging").mkdir(parents=True)
+    (root / "server/decorators/rpc-request.decorator.ts").write_text(
+        """import { MessagePattern } from '@nestjs/microservices';
+
+export function RpcRequest(path: string): MethodDecorator {
+  return MessagePattern(path);
+}
+"""
+    )
+    source_text = """import { RpcRequest } from '../decorators/rpc-request.decorator';
+
+export class ImportedController {
+  @RpcRequest('diary.note.push')
+  handleImportedDiaryPush() {}
+}
+"""
+
+    call_count = 0
+    original = indexer_module._resolve_typescript_import_path
+
+    def counting_resolve(root_path, source_file_path, module_specifier):
+        nonlocal call_count
+        call_count += 1
+        return original(root_path, source_file_path, module_specifier)
+
+    monkeypatch.setattr(indexer_module, "_resolve_typescript_import_path", counting_resolve)
+
+    first = indexer_module._imported_microservice_decorator_wrappers(
+        root,
+        "server/messaging/imported.controller.ts",
+        source_text,
+    )
+    second = indexer_module._imported_microservice_decorator_wrappers(
+        root,
+        "server/messaging/imported.controller.ts",
+        source_text,
+    )
+
+    assert first == second
+    assert call_count == 1
+
+
+def test_imported_microservice_decorator_wrappers_only_resolve_used_decorator_imports(
+    monkeypatch, tmp_path
+):
+    """Imported wrapper discovery should ignore unrelated imports instead of resolving all of them."""
+    from srclight import indexer as indexer_module
+
+    root = tmp_path / "project"
+    root.mkdir()
+    source_text = """import { RpcRequest } from '@/decorators/rpc-request.decorator';
+import { createFoo } from '@/services/foo';
+import { StorageKeys } from '@/config/storage';
+
+export class ImportedController {
+  @RpcRequest('diary.note.push')
+  handleImportedDiaryPush() {}
+}
+"""
+
+    resolved_specifiers: list[str] = []
+
+    def fake_resolve(root_path, source_file_path, module_specifier):
+        resolved_specifiers.append(module_specifier)
+        if module_specifier == "@/decorators/rpc-request.decorator":
+            return "server/decorators/rpc-request.decorator.ts"
+        return None
+
+    monkeypatch.setattr(indexer_module, "_resolve_typescript_import_path", fake_resolve)
+    monkeypatch.setattr(
+        indexer_module,
+        "_read_project_text",
+        lambda root_path_str, rel_path: """import { MessagePattern } from '@nestjs/microservices';
+
+export function RpcRequest(path: string): MethodDecorator {
+  return MessagePattern(path);
+}
+""",
+    )
+
+    resolved = indexer_module._imported_microservice_decorator_wrappers(
+        root,
+        "server/messaging/imported.controller.ts",
+        source_text,
+    )
+
+    assert resolved_specifiers == ["@/decorators/rpc-request.decorator"]
+    assert resolved["RpcRequest"]["canonical_decorator"] == "MessagePattern"
+
+
 def test_search_after_index(db, sample_project):
     """Search works after indexing."""
     config = IndexConfig(root=sample_project)

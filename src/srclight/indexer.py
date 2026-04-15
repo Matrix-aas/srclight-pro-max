@@ -1668,8 +1668,33 @@ def _imported_microservice_decorator_wrappers(
     if root_path is None:
         return {}
 
+    cached = _cached_imported_microservice_decorator_wrappers(
+        root_path.as_posix(),
+        source_file_path,
+        source_text,
+    )
+    return {
+        wrapper_name: dict(metadata_items)
+        for wrapper_name, metadata_items in cached
+    }
+
+
+@lru_cache(maxsize=512)
+def _cached_imported_microservice_decorator_wrappers(
+    root_path_str: str,
+    source_file_path: str,
+    source_text: str,
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    """Cache imported wrapper discovery per file and skip unrelated imports."""
+    root_path = Path(root_path_str)
+    used_decorator_names = set(re.findall(r"@([A-Za-z_$][\w$]*)", source_text))
+    if not used_decorator_names:
+        return ()
+
     resolved: dict[str, dict[str, str]] = {}
     for local_name, (imported_name, module_specifier, import_kind) in _typescript_import_bindings(source_text).items():
+        if local_name not in used_decorator_names:
+            continue
         import_path = _resolve_typescript_import_path(root_path, source_file_path, module_specifier)
         if import_path is None:
             continue
@@ -1697,7 +1722,10 @@ def _imported_microservice_decorator_wrappers(
             wrapper_metadata = imported_wrappers.get(default_export_name)
             if isinstance(wrapper_metadata, dict):
                 resolved[local_name] = dict(wrapper_metadata)
-    return resolved
+    return tuple(
+        (wrapper_name, tuple(sorted(metadata.items())))
+        for wrapper_name, metadata in sorted(resolved.items())
+    )
 
 
 def _scheduler_metadata_from_decorator(
