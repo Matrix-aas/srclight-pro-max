@@ -68,7 +68,7 @@ Both PyPI and MCP registry publishing are **fully automated**. No manual `mcp-pu
 ### PyPI publish fails
 - Check the GitHub Actions run: `gh run view --log`
 - Verify the `pypi` environment exists in repo settings
-- Verify Trusted Publisher is configured on PyPI for `Matrix-aas/srclight`
+- Verify Trusted Publisher is configured on PyPI for `Matrix-aas/srclight-pro-max`
 
 ### MCP registry publish fails
 - Check the `mcp-registry` job in the GitHub Actions run

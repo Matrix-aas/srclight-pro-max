@@ -2,74 +2,146 @@
 
 # Srclight
 
-AI-first code intelligence for fullstack repos.
+**AI-first code intelligence for fullstack repos.**
 
-This repository is a heavily upgraded fork of `srclight`, tuned for the kind of codebases AI agents actually suffer in: Vue, Nuxt, Nitro, NestJS, Drizzle, MikroORM, Mongoose, GraphQL, BullMQ, RabbitMQ, Redis, and the usual TypeScript/JavaScript backend mess that sends normal grep workflows straight to hell.
+Srclight is a heavily upgraded fork of the original `srclight`, rebuilt for the codebases AI agents actually struggle with: Vue, Nuxt, Nitro, NestJS, Drizzle, MikroORM, Mongoose, GraphQL, BullMQ, RabbitMQ, Redis, and large TypeScript/JavaScript monorepos where plain grep starts to feel medieval.
 
-Srclight builds a local code index with symbols, call graphs, semantic search, impact analysis, framework-aware extraction, and MCP tools that let Claude, Codex, Cursor, and other agents understand a repo without burning half the session budget on blind file hunting.
+This fork focuses on one thing: helping AI agents and human developers understand a repo faster, with fewer blind file reads, fewer wasted tool calls, and a much better mental model of how the system fits together.
+
+[Русская версия](README.ru.md)
 
 ## Why this fork exists
 
-The old public `srclight` release line is fine if you want the original project.
+The original project had a strong foundation.
 
-This fork exists because fullstack repos need better AI-oriented orientation:
+This fork pushes it much further in the places that matter for modern fullstack work:
 
-- stronger Vue / Nuxt / Nitro understanding
-- better NestJS, routes, services, modules, resolvers, queues, cron jobs
-- better data-layer extraction for Drizzle, Mongoose, MikroORM
-- cleaner stdio-first MCP behavior
-- better index / embedding UX
-- better project topology and "where the hell does this feature live?" answers
+- better Vue / Nuxt / Nitro understanding
+- stronger NestJS extraction for routes, modules, services, resolvers, queues, cron jobs, and transports
+- better Drizzle, Mongoose, and MikroORM awareness
+- more useful project topology for AI agents
+- better stdio-first MCP ergonomics
+- a cleaner install and upgrade story
+- better indexing UX and fewer dumb failure modes
 
-Short version: less grep, less token waste, less psychic damage.
+Short version: less grep, less token burn, less “where the hell is this feature actually wired?”
 
-## What you get
+## What makes this fork better
 
-- local-first code indexing with SQLite FTS5 and tree-sitter
-- MCP server for Claude Code, Cursor, and other MCP clients
-- keyword, semantic, and hybrid search
-- symbol graph: callers, callees, dependents, impact, communities, execution flows
-- fullstack-aware extraction for:
-  - Vue SFCs
-  - Nuxt / Nitro server routes and middleware
-  - NestJS modules, controllers, services, resolvers, guards, pipes, filters, interceptors
-  - Drizzle, Mongoose, MikroORM entities / schemas / tables / repositories
-  - BullMQ, RabbitMQ, Redis, message patterns, async handlers
-- workspace mode for multi-repo search
-- local Ollama embeddings by default with `ollama:qwen3-embedding:4b`
+| Area | Original srclight | This fork |
+|---|---|---|
+| TS / JS fullstack understanding | Good base extraction | Deep framework-aware extraction for modern web stacks |
+| Vue / Nuxt / Nitro | Limited | Purpose-built support for SFCs, server routes, middleware, plugin surfaces |
+| NestJS | Partial | Rich support for controllers, modules, services, resolvers, microservices, schedulers, queues |
+| Data layer | Generic indexing | Better Drizzle, Mongoose, MikroORM symbols and metadata |
+| AI workflow | Good generic MCP server | Tuned for orientation, ownership, flow tracing, and lower token waste |
+| MCP transport | Traditional SSE emphasis | Stdio-first local workflow, SSE still available when you need it |
+| Install UX | Standard package install | Upgrade path for this fork, old broken installs called out directly |
+| README / onboarding | Generic | Product-style docs aimed at real-world agent usage |
+
+## What it actually does
+
+Srclight builds a local code intelligence layer on top of your repository:
+
+- parses source files with tree-sitter
+- extracts symbols and framework-aware metadata
+- builds SQLite FTS5 indexes for fast local search
+- tracks callers, callees, dependents, and impact
+- builds semantic and hybrid search on top of embeddings
+- exposes the result over MCP so agents can ask better questions
+
+Instead of doing twenty random `rg` calls and reading half the repo just to find a feature entrypoint, agents can use structured tools like:
+
+- `codebase_map()`
+- `search_symbols()`
+- `hybrid_search()`
+- `get_symbol()`
+- `get_callers()`
+- `get_callees()`
+- `get_dependents()`
+- `detect_changes()`
+- `recent_changes()`
+- `git_hotspots()`
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Repo / Workspace] --> B[Indexing]
+    B --> C[Symbols + Metadata]
+    B --> D[Call Graph + Inheritance]
+    B --> E[Communities + Execution Flows]
+    B --> F[Embeddings + Hybrid Search]
+    C --> G[MCP Tools]
+    D --> G
+    E --> G
+    F --> G
+    G --> H[Claude / Codex / Cursor / Other MCP Clients]
+```
+
+## Fullstack coverage
+
+| Stack surface | Coverage in this fork |
+|---|---|
+| Vue | SFC signals, script/template/style-aware indexing, component-level orientation |
+| Nuxt / Nitro | route files, server handlers, middleware, plugins, app surfaces |
+| NestJS | controllers, routes, modules, services, resolvers, guards, pipes, filters, interceptors |
+| Async systems | message patterns, event patterns, queues, workers, cron/interval/timeout jobs |
+| ORM / DB | Drizzle tables and DB clients, Mongoose schemas/entities, MikroORM entities/repos/config |
+| Search | keyword, semantic, hybrid, graph-based traversal |
+| Orientation | repo topology, routes, ownership hints, execution flow context |
+
+## Why AI agents like it
+
+Without srclight, agents waste time on:
+
+- repeated search loops to find entrypoints
+- reading files just to infer ownership
+- missing hidden async edges
+- guessing how routes, services, stores, queues, and DB layers connect
+
+With srclight, they get faster orientation and much better queries:
+
+- fewer random file reads
+- fewer wasted tokens
+- better first-hit search results
+- clearer feature ownership
+- better confidence before edits
+
+That matters on every repo, but it matters a lot more on big fullstack projects.
 
 ## Install
 
-### The easy way
+### Fastest path
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Matrix-aas/srclight/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Matrix-aas/srclight-pro-max/main/scripts/install.sh | bash
 ```
 
 That installer:
 
 - installs with `pipx`
 - upgrades cleanly
-- refuses to quietly sit on top of the old broken `0.15.x` pipx install
-- tells you exactly what to delete if you've still got that fossil lying around
+- detects the old broken `0.15.x` pipx install
+- tells you exactly what to remove if you are still haunted by that timeline
 
 ### Manual install
 
 Recommended:
 
 ```bash
-pipx install --force 'git+https://github.com/Matrix-aas/srclight.git@main'
+pipx install --force 'git+https://github.com/Matrix-aas/srclight-pro-max.git@main'
 ```
 
 From source:
 
 ```bash
-git clone https://github.com/Matrix-aas/srclight.git
-cd srclight
+git clone https://github.com/Matrix-aas/srclight-pro-max.git
+cd srclight-pro-max
 python3 -m pip install -e '.[dev]'
 ```
 
-If you want docs / PDF / OCR extras:
+Extras:
 
 ```bash
 python3 -m pip install -e '.[docs,pdf]'
@@ -77,22 +149,22 @@ python3 -m pip install -e '.[docs,pdf,ocr]'
 python3 -m pip install -e '.[all]'
 ```
 
-## Upgrade from the old pipx install
+## Upgrade from old srclight
 
-If you previously did this:
+If you previously installed the old line with:
 
 ```bash
 pipx install srclight
 ```
 
-and got the old `0.15.x` line, uninstall that thing first:
+and ended up with `0.15.x`, remove it first:
 
 ```bash
 pipx uninstall srclight
-pipx install --force 'git+https://github.com/Matrix-aas/srclight.git@main'
+pipx install --force 'git+https://github.com/Matrix-aas/srclight-pro-max.git@main'
 ```
 
-Do not install the old PyPI build and expect this repo. That is the wrong timeline.
+Do not mix the old package line with this fork and expect a good time.
 
 ## Quick start
 
@@ -104,7 +176,7 @@ srclight index
 # index with embeddings (default: ollama:qwen3-embedding:4b)
 srclight index --embed
 
-# basic CLI search
+# search from the CLI
 srclight search "auth"
 srclight symbols app/stores/auth.store.ts
 
@@ -112,7 +184,7 @@ srclight symbols app/stores/auth.store.ts
 srclight serve --transport stdio
 ```
 
-If you use a workspace:
+Workspace example:
 
 ```bash
 srclight workspace init fullstack
@@ -122,23 +194,23 @@ srclight workspace index -w fullstack --embed
 srclight serve --workspace fullstack --transport stdio
 ```
 
-## Ollama embeddings
+## Embeddings
 
-Recommended local model:
+Recommended default:
 
 ```bash
 ollama pull qwen3-embedding:4b
 srclight index --embed
 ```
 
-`--embed` uses `ollama:qwen3-embedding:4b` by default in this fork.
-
-If you want a multilingual alternative:
+Alternative:
 
 ```bash
 ollama pull nomic-embed-text-v2-moe
 srclight index --embed ollama:nomic-embed-text-v2-moe
 ```
+
+This fork uses `ollama:qwen3-embedding:4b` as the default bare `--embed` model.
 
 ## MCP setup
 
@@ -154,8 +226,6 @@ claude mcp add srclight -- srclight serve --workspace fullstack --transport stdi
 
 ### Cursor
 
-`stdio` config:
-
 ```json
 {
   "mcpServers": {
@@ -167,30 +237,11 @@ claude mcp add srclight -- srclight serve --workspace fullstack --transport stdi
 }
 ```
 
-`SSE` is still available if you want a long-lived server, but this fork treats stdio as the default local-agent path.
-
-## Why agents like it
-
-Without srclight, AI agents waste time on:
-
-- repeated `rg` passes just to find entrypoints
-- reading random files to infer ownership
-- missing callers and hidden async edges
-- guessing how routes, modules, stores, queues, and DB pieces fit together
-
-With srclight, they can ask for:
-
-- `codebase_map()` for topology
-- `search_symbols()` or `hybrid_search()` for targeted lookup
-- `get_callers()` / `get_callees()` / `get_dependents()` for flow
-- `detect_changes()` for blast radius
-- `recent_changes()` / `git_hotspots()` for churn and risk
-
-That saves tokens, saves time, and makes the toolchain feel less dumb.
+`stdio` is the default local-agent path in this fork. SSE is still there if you want a persistent shared server.
 
 ## Current focus
 
-This fork is intentionally opinionated toward modern fullstack work:
+This fork is intentionally optimized for the kind of repos where AI tooling usually wastes the most time:
 
 - TypeScript / JavaScript
 - Vue / Nuxt / Nitro
@@ -199,11 +250,12 @@ This fork is intentionally opinionated toward modern fullstack work:
 - Drizzle / MikroORM / Mongoose
 - BullMQ / RabbitMQ / Redis
 
-It still supports the broader upstream language set, but the main upgrade energy goes into helping AI agents understand real web app repos end-to-end.
+It still supports the broader upstream language set, but the main optimization work goes into helping agents understand modern fullstack systems end-to-end.
 
 ## Docs
 
 - [Usage guide](docs/usage-guide.md)
+- [Russian README](README.ru.md)
 - [Cursor MCP example](docs/cursor-mcp-example.json)
 - [Releasing notes](docs/releasing.md)
 

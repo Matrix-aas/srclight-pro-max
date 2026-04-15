@@ -27,10 +27,10 @@ Each repo has its own `.srclight/` directory with:
 
 ```bash
 # Recommended: installer script
-curl -fsSL https://raw.githubusercontent.com/Matrix-aas/srclight/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Matrix-aas/srclight-pro-max/main/scripts/install.sh | bash
 
 # Or from source
-git clone https://github.com/Matrix-aas/srclight.git
+git clone https://github.com/Matrix-aas/srclight-pro-max.git
 cd srclight
 pip install -e .
 ```

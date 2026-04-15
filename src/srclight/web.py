@@ -547,9 +547,9 @@ def _dashboard_html() -> str:
   <footer>
     <div class="container">
       <div class="footer-links">
-        <a href="https://github.com/Matrix-aas/srclight">GitHub</a>
-        <a href="https://github.com/Matrix-aas/srclight/issues">Issues</a>
-        <a href="https://github.com/Matrix-aas/srclight/blob/main/docs/usage-guide.md">Docs</a>
+        <a href="https://github.com/Matrix-aas/srclight-pro-max">GitHub</a>
+        <a href="https://github.com/Matrix-aas/srclight-pro-max/issues">Issues</a>
+        <a href="https://github.com/Matrix-aas/srclight-pro-max/blob/main/docs/usage-guide.md">Docs</a>
       </div>
       <p class="footer-copy">Local only. Server listens on 127.0.0.1.</p>
     </div>

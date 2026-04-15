@@ -67,9 +67,9 @@ dev = [
 srclight = "srclight.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/Matrix-aas/srclight"
-Repository = "https://github.com/Matrix-aas/srclight"
-Issues = "https://github.com/Matrix-aas/srclight/issues"
+Homepage = "https://github.com/Matrix-aas/srclight-pro-max"
+Repository = "https://github.com/Matrix-aas/srclight-pro-max"
+Issues = "https://github.com/Matrix-aas/srclight-pro-max/issues"
 
 [tool.ruff]
 line-length = 100

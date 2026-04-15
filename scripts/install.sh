@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO_SLUG="${SRCLIGHT_REPO_SLUG:-Matrix-aas/srclight}"
+REPO_SLUG="${SRCLIGHT_REPO_SLUG:-Matrix-aas/srclight-pro-max}"
 REF="${SRCLIGHT_REF:-main}"
 PACKAGE_SPEC="git+https://github.com/${REPO_SLUG}.git@${REF}"
 
