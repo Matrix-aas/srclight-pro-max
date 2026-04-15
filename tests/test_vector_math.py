@@ -3,8 +3,6 @@
 import math
 import struct
 
-import pytest
-
 from srclight.vector_math import cosine_top_k, decode_matrix, get_backend
 
 

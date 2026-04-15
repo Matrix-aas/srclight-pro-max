@@ -1,6 +1,5 @@
 """Tests for build system intelligence layer."""
 
-from pathlib import Path
 
 import pytest
 

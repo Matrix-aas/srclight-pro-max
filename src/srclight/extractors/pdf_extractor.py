@@ -269,8 +269,8 @@ class PdfExtractor:
         if not self._init_paddle():
             return None
         try:
-            from pdf2image import convert_from_bytes
             import numpy as np
+            from pdf2image import convert_from_bytes
 
             images = convert_from_bytes(
                 source, dpi=200,

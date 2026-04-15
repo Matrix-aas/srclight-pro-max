@@ -5,7 +5,7 @@
 Srclight runs as a single MCP server process. It indexes repos on local filesystems and serves them to any MCP client (Claude Code, Cursor, etc.).
 
 ```
-MCP Client ──stdio/sse──→ srclight serve --workspace myworkspace
+MCP Client ──stdio/sse──→ srclight serve --workspace myworkspace --transport ...
                                 │
                 ┌───────────────┼───────────────┐
                 ▼               ▼               ▼
@@ -26,11 +26,11 @@ Each repo has its own `.srclight/` directory with:
 ### 1. Install Srclight
 
 ```bash
-# From PyPI
-pip install srclight
+# Recommended: installer script
+curl -fsSL https://raw.githubusercontent.com/Matrix-aas/srclight/main/scripts/install.sh | bash
 
-# From source
-git clone https://github.com/srclight/srclight.git
+# Or from source
+git clone https://github.com/Matrix-aas/srclight.git
 cd srclight
 pip install -e .
 ```
@@ -39,8 +39,8 @@ pip install -e .
 
 Srclight supports two transport modes:
 
-- **stdio** — one server process per client session (simple, no setup)
-- **SSE** — one persistent server, many clients (recommended for workspaces)
+- **stdio** — one server process per client session (default, simplest, recommended for most local agent setups)
+- **SSE** — one persistent server, many clients (advanced option when you specifically want a shared long-lived server)
 
 #### Option A: Stdio (simplest)
 
@@ -48,15 +48,15 @@ Each Claude Code session spawns its own srclight process:
 
 ```bash
 # Add for current project
-claude mcp add srclight -- srclight serve --workspace myworkspace
+claude mcp add srclight -- srclight serve --workspace myworkspace --transport stdio
 
 # Add globally (available in all projects)
-claude mcp add --scope user srclight -- srclight serve --workspace myworkspace
+claude mcp add --scope user srclight -- srclight serve --workspace myworkspace --transport stdio
 ```
 
-#### Option B: SSE with systemd (recommended)
+#### Option B: SSE with systemd (advanced / persistent)
 
-Run srclight as a persistent background service. This is faster (no cold start per session), supports multiple concurrent clients, and survives restarts.
+Run srclight as a persistent background service if you explicitly want one shared server for multiple clients or long-lived workspace sessions.
 
 **Create the service file** (`~/.config/systemd/user/srclight.service`):
 ```ini
@@ -66,7 +66,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/path/to/srclight-venv/bin/srclight serve --workspace myworkspace
+ExecStart=/path/to/srclight-venv/bin/srclight serve --workspace myworkspace --transport sse
 Restart=on-failure
 RestartSec=3
 Environment=PATH=/path/to/srclight-venv/bin:/usr/local/bin:/usr/bin:/bin
@@ -99,16 +99,15 @@ claude mcp add --transport sse srclight http://127.0.0.1:8742/sse
 
 #### Option C: Cursor
 
-**Recommended: SSE (streamable HTTP).** Run srclight as a long-lived server (Option B above or `srclight serve -p 8742` in a terminal), then point Cursor at it. Config lives in project `.cursor/mcp.json` or user `~/.cursor/mcp.json`. Example: [cursor-mcp-example.json](cursor-mcp-example.json).
+**Recommended: stdio.** Use one srclight process per Cursor session unless you specifically want a shared persistent server. Config lives in project `.cursor/mcp.json` or user `~/.cursor/mcp.json`. Example: [cursor-mcp-example.json](cursor-mcp-example.json).
 
-- **UI:** Settings → Tools & MCP → Add new MCP server → Type **streamableHttp**, URL: `http://127.0.0.1:8742/sse`. Name it e.g. `srclight`.
-- Ensure srclight is running first (e.g. `srclight serve --workspace myworkspace` or your systemd service).
+- **UI:** Settings → Tools & MCP → Add new MCP server → Type **command**, Command: `srclight`, Args: `serve --workspace myworkspace --transport stdio`.
 - Restart Cursor completely after adding the server.
+- **If tools feel stuck:** Cursor applies a short timeout to MCP tool calls (~60–120s). Srclight uses a 20s timeout for embedding API calls so search returns quickly or falls back to keyword-only.
 
-Alternatively you can use **stdio** (Type **command**, Command: `srclight`, Args: `serve --workspace myworkspace`); SSE is preferred so the server is already warm and tools don’t pay cold-start.
-- **If tools feel stuck:** Cursor applies a short timeout to MCP tool calls (~60–120s). Srclight uses a 20s timeout for embedding API calls so search returns quickly or falls back to keyword-only. Prefer SSE so the first request doesn’t pay cold-start cost.
+If you prefer **SSE / streamable HTTP**, run srclight as a long-lived server first (Option B above or `srclight serve --transport sse -p 8742` in a terminal), then point Cursor at `http://127.0.0.1:8742/mcp`.
 
-**WSL + Windows Cursor:** If Cursor runs on Windows and srclight runs in WSL, `http://127.0.0.1:8742/sse` works the same way — WSL2 forwards localhost to Windows.
+**WSL + Windows Cursor:** If Cursor runs on Windows and srclight runs in WSL, `http://127.0.0.1:8742/mcp` works the same way — WSL2 forwards localhost to Windows.
 
 #### Option D: Claude Desktop (`claude_desktop_config.json`)
 
@@ -117,7 +116,7 @@ Alternatively you can use **stdio** (Type **command**, Command: `srclight`, Args
   "mcpServers": {
     "srclight": {
       "command": "srclight",
-      "args": ["serve", "--workspace", "myworkspace"]
+      "args": ["serve", "--workspace", "myworkspace", "--transport", "stdio"]
     }
   }
 }
@@ -138,7 +137,7 @@ This gives you all MCP tools plus skills that teach Claude when and how to use t
 
 [OpenClaw](https://openclaw.ai) connects to srclight via its built-in [mcporter](https://mcporter.dev) MCP tool server.
 
-**Prerequisite:** Srclight must be running as an SSE server (Option B above).
+**Prerequisite:** Srclight must be running as an SSE server (Option B above). OpenClaw is one of the cases where the persistent transport still makes sense.
 
 ```bash
 # 1. Add srclight to mcporter config
@@ -161,7 +160,7 @@ mcporter call srclight.get_callers symbol_name="lookup" project="my-repo"
 mcporter call srclight.hybrid_search query="authentication logic"
 ```
 
-All 29 srclight tools are available as `srclight.<tool_name>` through mcporter.
+All available srclight tools are exposed as `srclight.<tool_name>` through mcporter.
 
 ### 4. Verify
 
@@ -211,13 +210,13 @@ After major refactors, new branches with many new files, or initial setup:
 ```bash
 # Re-embed a single project
 cd /path/to/repo
-srclight index --embed qwen3-embedding
+srclight index --embed
 
 # Re-embed all projects in workspace
-srclight workspace index -w myworkspace --embed qwen3-embedding
+srclight workspace index -w myworkspace --embed
 
 # Re-embed just one project via workspace command
-srclight workspace index -w myworkspace -p project-name --embed qwen3-embedding
+srclight workspace index -w myworkspace -p project-name --embed
 ```
 
 Embedding is incremental — only symbols whose `body_hash` changed get re-embedded. The `.npy` sidecar is rebuilt automatically after embedding.
@@ -229,7 +228,7 @@ Git hooks keep the FTS5 index fresh on every commit, but they do **not** re-embe
 ```bash
 # Add to crontab (crontab -e)
 # Nightly at 2:13am — reindex + embed all projects, then install hooks for any new repos
-13 2 * * * /path/to/srclight-venv/bin/srclight workspace index -w myworkspace --embed qwen3-embedding >> /tmp/srclight-embed-cron.log 2>&1 && /path/to/srclight-venv/bin/srclight hook install --workspace myworkspace >> /tmp/srclight-embed-cron.log 2>&1
+13 2 * * * /path/to/srclight-venv/bin/srclight workspace index -w myworkspace --embed >> /tmp/srclight-embed-cron.log 2>&1 && /path/to/srclight-venv/bin/srclight hook install --workspace myworkspace >> /tmp/srclight-embed-cron.log 2>&1
 ```
 
 **Why this is fast most nights:** Both indexing and embedding are incremental. Files are skipped if their git hash hasn't changed; symbols are skipped if their `body_hash` hasn't changed. A workspace with 40 projects and 170K symbols typically finishes in under a minute on nights with little activity.
@@ -335,7 +334,7 @@ python -c "import pdf2image; print('pdf2image OK')"
 # 4. Re-index the project to pick up scanned PDFs
 srclight index
 # Or with embeddings:
-srclight index --embed qwen3-embedding
+srclight index --embed
 ```
 
 #### GPU Acceleration for PaddleOCR
@@ -378,7 +377,7 @@ srclight workspace add /path/to/new-repo -w myworkspace
 srclight workspace add /path/to/new-repo -w myworkspace -n custom-name  # optional custom name
 
 # 2. Index with embeddings
-srclight workspace index -w myworkspace -p new-repo --embed qwen3-embedding
+srclight workspace index -w myworkspace -p new-repo --embed
 
 # 3. Install git hooks
 cd /path/to/new-repo
@@ -406,7 +405,7 @@ git clone git@github.com:your-org/some-lib.git /path/to/some-lib
 
 # Add and index it
 srclight workspace add /path/to/some-lib -w myworkspace
-srclight workspace index -w myworkspace -p some-lib --embed qwen3-embedding
+srclight workspace index -w myworkspace -p some-lib --embed
 srclight hook install --workspace myworkspace
 ```
 
@@ -452,7 +451,7 @@ srclight hook status --workspace myworkspace
 | Cold start (first query after server start) | ~300ms | Loads .npy to GPU VRAM |
 | FTS5 search | <10ms | SQLite, always fast |
 | Incremental re-index (post-commit) | 1-5s | Background, non-blocking |
-| Full re-embed (27K symbols) | ~15 min | Ollama qwen3-embedding, one-time |
+| Full re-embed (27K symbols) | ~15 min | Ollama `qwen3-embedding:4b` via bare `--embed`, one-time |
 
 ## Troubleshooting
 
@@ -463,14 +462,14 @@ srclight workspace status -w myworkspace
 
 # Restart by removing and re-adding
 claude mcp remove srclight
-claude mcp add --scope user srclight -- srclight serve --workspace myworkspace
+claude mcp add --scope user srclight -- srclight serve --workspace myworkspace --transport stdio
 ```
 
 ### Tools get stuck or timeout in Cursor
 Cursor applies a short timeout to MCP tool calls. Srclight avoids long blocks by:
 
 - Using a **20s timeout** for embedding API requests (Ollama, OpenAI, etc.). If the embed service is slow or unreachable, the tool returns within 20s: `hybrid_search` falls back to keyword-only; `semantic_search` returns an error with a hint.
-- Prefer **SSE** (streamable HTTP) with a long-running server so the first request doesn’t pay cold-start (workspace load, vector cache load). In Cursor MCP config, use Type **streamableHttp** and URL `http://127.0.0.1:8742/sse` with srclight started separately (e.g. systemd or a terminal).
+- Prefer **SSE** (streamable HTTP) with a long-running server so the first request doesn’t pay cold-start (workspace load, vector cache load). In Cursor MCP config, use Type **streamableHttp** and URL `http://127.0.0.1:8742/mcp` with srclight started separately (e.g. systemd or a terminal).
 
 If you need a longer embed timeout (e.g. for slow Ollama on first load), set:
 
@@ -484,7 +483,7 @@ Then start Cursor (or start srclight with that env in its process).
 ```bash
 # Check embedding status via CLI
 cd /path/to/repo
-srclight index --embed qwen3-embedding
+srclight index --embed
 
 # Or ask the agent: "What's the embedding status?"
 # → calls embedding_status() tool
@@ -511,22 +510,16 @@ If a repo changes location on disk, update the workspace:
 ```bash
 srclight workspace remove old-name -w myworkspace
 srclight workspace add /new/path/to/repo -w myworkspace
-srclight workspace index -w myworkspace -p new-name --embed qwen3-embedding
+srclight workspace index -w myworkspace -p new-name --embed
 ```
 
 ## Claude Code Custom Agents (Subagents)
 
 Claude Code supports [custom agents](https://docs.anthropic.com/en/docs/claude-code/agents) defined in `.claude/agents/*.md`. These agents run as subprocesses with their own tool access, controlled by the `tools:` frontmatter field.
 
-### The Problem: MCP Tools in Subagents
+### MCP Tools In Subagents
 
-Custom agents defined in `.claude/agents/` **cannot access MCP tools**. This is a [known bug](https://github.com/anthropics/claude-code/issues/13605) ([#25200](https://github.com/anthropics/claude-code/issues/25200)) as of Claude Code v2.1.52 (Feb 2026).
-
-The tool injection code has two paths: built-in agents receive MCP tools, custom agents do not. None of these workarounds help:
-- Adding MCP tool names to `tools:` frontmatter
-- Adding `ToolSearch` to `tools:` frontmatter
-- Adding `mcpServers:` to frontmatter
-- Omitting `tools:` entirely (should inherit all — doesn't)
+Some Claude Code builds still fail to expose MCP tools to custom agents defined in `.claude/agents/`. If you hit that limitation, prefer built-in agent types first and use the fallbacks below.
 
 | Agent Type | Tools | MCP Access |
 |---|---|---|
@@ -535,9 +528,17 @@ The tool injection code has two paths: built-in agents receive MCP tools, custom
 | `Plan` | All except Task/Edit/Write | **Yes** |
 | Custom agents (`.claude/agents/`) | Core tools only | **No** — bug [#13605](https://github.com/anthropics/claude-code/issues/13605) |
 
-### Solution: Use `general-purpose` Agent Type
+### Preferred Flow
 
-Until the bug is fixed, the only way to give a subagent access to srclight is to use `general-purpose` as the `subagent_type`. It has `(Tools: *)` which includes ToolSearch and all MCP tools:
+1. Use a built-in agent type that already has MCP access.
+2. Run `ToolSearch("srclight")` before the first `mcp__srclight__*` call.
+3. For raw literal or regex-style checks, prefer `find_pattern(...)` before falling back to Grep.
+4. Install `srclight hook install-agent` if you want Claude Code to deny Grep/Glob and push agents toward srclight-first workflows.
+5. If your client build still blocks MCP in custom agents, use `general-purpose` as the fallback `subagent_type`.
+
+### Fallback: `general-purpose`
+
+If the MCP bug is still present in your client, `general-purpose` remains the safest fallback because it has `(Tools: *)`, which includes ToolSearch and all MCP tools:
 
 ```
 Task(
@@ -546,13 +547,13 @@ Task(
 )
 ```
 
-The agent must call `ToolSearch("srclight")` before using any `mcp__srclight__*` tool. Include this instruction in the prompt.
+The agent should call `ToolSearch("srclight")` before using any `mcp__srclight__*` tool. Include this instruction in the prompt.
 
 **Tradeoff:** `general-purpose` agents also have write access (Edit, Write), which is more permissive than a read-only reviewer needs. The agent's system prompt can instruct it not to modify files.
 
 ### Example: UI Design Reviewer with Srclight
 
-Since custom agents can't access MCP ([#13605](https://github.com/anthropics/claude-code/issues/13605)), invoke via `general-purpose` and include your review instructions in the prompt:
+If custom agents in your Claude Code build still can't access MCP, invoke via `general-purpose` and include your review instructions in the prompt:
 
 ```
 Task(
@@ -570,8 +571,9 @@ Task(
   | mcp__srclight__search_symbols(query, project)  | Find exact names |
 
   Workflow: Use symbols_in_file to get outlines, then Read sections.
-  Use get_callers to verify token usage consistency. Use Grep for pattern
-  violations (raw Color literals, bare EdgeInsets) that srclight can't catch.
+  Use get_callers to verify token usage consistency. Use find_pattern for
+  raw Color literals, bare EdgeInsets, and other literal pattern violations
+  before falling back to Grep.
 
   DO NOT modify any files. This is a read-only review."
 )

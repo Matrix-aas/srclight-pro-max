@@ -36,3 +36,11 @@ CLAUDE.md
 # Plans and roadmaps stay in Vault; do not commit
 PLAN.md
 .claude/
+
+# Rollback payloads stay local by design; durable migration notes live under docs/superpowers/.
+artifacts/
+!artifacts/
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/README.md
+!artifacts/srclight-cutover-checklist.md

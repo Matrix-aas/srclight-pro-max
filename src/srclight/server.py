@@ -12,105 +12,65 @@ import json
 import logging
 import os
 import re
+import shlex
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .db import Database
+from .db import Database, tokenized_query_hint
+from .embeddings import DEFAULT_OLLAMA_EMBED_MODEL
 from .indexer import IndexConfig, Indexer
 
 logger = logging.getLogger("srclight.server")
 
 _INSTRUCTIONS_TEMPLATE = """Welcome to Srclight — deep code indexing for AI agents.
 
-{dynamic_section}## Getting Started
-1. Call `codebase_map()` at the START of every session to orient yourself — it shows project stats, languages, symbol counts, and directory structure.
-2. Use `list_projects()` to see all repos in the workspace with file/symbol counts.
-3. Use `hybrid_search(query)` to find any code by name, concept, or natural language description.
+{dynamic_section}## Default Routing
+1. Start every new session with `codebase_map()` to get orientation.
+2. In workspace mode, call `list_projects()` if you do not already know which repo matters.
+3. Use `hybrid_search(query)` first for most code discovery.
+4. Use `get_symbol(name)` or `symbols_in_file(path)` to drill into exact code once you have a hit.
 
-## Which Search Tool to Use
-- **`hybrid_search(query)`** — BEST for most queries. Combines keyword + semantic search via RRF fusion. Use for natural language ("find dictionary lookup code") or keywords.
-- **`search_symbols(query)`** — keyword-only search. Faster, good for exact symbol names or code fragments.
-- **`semantic_search(query)`** — embedding-only search. Good when you know the concept but not the terminology.
+## Search Decision Tree
+- `hybrid_search(query)` — default choice. Best for feature flow, natural language, mixed keyword/concept searches, and new contexts.
+- `search_symbols(query)` — prefer for exact names, code fragments, or when you want fast keyword-only results.
+- `semantic_search(query)` — prefer only when terminology is unclear and embeddings are available.
+- `get_symbol(name)` — prefer when you already know the symbol and want the full source + metadata.
+- `get_signature(name)` — prefer when you only need the API shape, not the full body.
 
-## The `project` Parameter
-In workspace mode (multi-repo), many tools accept an optional `project` parameter:
-- **Omit it** to search across ALL projects simultaneously.
-- **Pass it** to filter results to one specific repo (e.g., `project="nomad-builder"`).
-- Graph tools (`get_callers`, `get_callees`, `get_dependents`, `get_implementors`, `get_tests_for`, `get_type_hierarchy`) and git tools (`blame_symbol`, `recent_changes`, `git_hotspots`, `whats_changed`, `changes_to`) REQUIRE `project` in workspace mode.
+## Structure And Impact
+- `symbols_in_file(path, project)` — table of contents for one file.
+- `get_callers(symbol_name, project)` / `get_callees(symbol_name, project)` — local dependency tracing.
+- `get_dependents(symbol_name, project)` / `get_impact(symbol_name, project)` — blast radius before changing code.
+- `detect_changes(ref, project)` — map git changes to changed symbols and impact after edits.
 
-## Tool Selection Guide
-| Need | Tool |
-|------|------|
-| Overview / orientation | `codebase_map()` |
-| Find code by name or concept | `hybrid_search(query)` |
-| Full source code of a symbol | `get_symbol(name)` |
-| Quick function signature check | `get_signature(name)` |
-| List all functions in a file | `symbols_in_file(path, project)` |
-| Who calls this function? | `get_callers(symbol, project)` |
-| What does this function call? | `get_callees(symbol, project)` |
-| What breaks if I change this? | `get_dependents(symbol, project)` |
-| What implements this interface? | `get_implementors(interface, project)` |
-| Test coverage for a symbol | `get_tests_for(symbol, project)` |
-| Class inheritance tree | `get_type_hierarchy(name, project)` |
-| Functional module clusters | `get_communities(project)` |
-| Which module does this belong to? | `get_community(symbol, project)` |
-| Execution paths through code | `get_execution_flows(project)` |
-| Risk of changing a symbol | `get_impact(symbol, project)` |
-| What did my edits just break? | `detect_changes(project=project)` |
-| Who last changed this & why | `blame_symbol(symbol, project)` |
-| Recent commit activity | `recent_changes(project=project)` |
-| Bug-prone files (churn) | `git_hotspots(project=project)` |
-| Uncommitted WIP | `whats_changed(project=project)` |
-| What does this file import? | `find_imports(path, project)` |
-| Find unused/dead code | `find_dead_code(project)` |
-| Search for code patterns (regex) | `find_pattern(pattern, project)` |
-| Past decisions/learnings relevant to current work | `relevant_learnings(query)` |
-| Record a decision, correction, or discovery | `record_learning(kind, content, reasoning)` |
-| Log what this session accomplished | `conversation_summary(session_id, task_summary)` |
-| Learning counts and trends | `learning_stats()` |
+## Repo And Server Health
+- `index_status()` — check whether srclight is indexed and how fresh the index is.
+- `embedding_status(project)` / `embedding_health(project)` — confirm embedding coverage and provider health.
+- `reindex(path)` — refresh the index after meaningful file changes.
+- `setup_guide()` — structured setup + recovery instructions for agents and users.
+- `show_status(message)` / `server_stats()` — lightweight liveness and status checks.
 
-## Learnings (Conversation Intelligence)
-Srclight maintains a workspace-level learnings database — decisions, corrections, discoveries, patterns, and conventions captured across sessions. Use these to build institutional memory:
+## Workspace Rules
+- Omit `project` to search across all projects.
+- Pass `project` to narrow results to one repo.
+- In workspace mode, graph + git + impact tools require `project`.
+- If a tool says `project` is required, call `list_projects()` and retry with one of the returned names.
 
-- **At session start**: Call `relevant_learnings(query)` with the task description to check if prior decisions apply.
-- **During work**: Call `record_learning(kind, content, reasoning)` when making important decisions or receiving corrections. Valid kinds: `decision`, `correction`, `discovery`, `pattern`, `blocker`, `convention`.
-- **At session end**: Call `conversation_summary(session_id, task_summary)` to log what was accomplished.
+## AI Query Recipes
+- Exact symbol: `search_symbols("AuthStore")`
+- Feature flow: `hybrid_search("refresh token auth session apollo logout")`
+- Vue/Nuxt frontend: `hybrid_search("locale path i18n css module template ref")`
+- GraphQL frontend: `hybrid_search("query mutation subscription auth store gql")`
+- Dependency question: `get_dependents("configureApolloClients", project="repo")`
 
-## Document Indexing
-Srclight indexes non-code files (PDF, DOCX, XLSX, HTML, CSV, email, images, text/RST) alongside source code. Documents become searchable symbols (sections, pages, tables) in the same search indexes.
-
-- **Install**: `pip install 'srclight[docs,pdf]'` for document formats.
-- **Scanned PDFs**: Install `pip install 'srclight[pdf,paddleocr]'` + system `poppler-utils` to OCR scanned/image-only PDF pages automatically. Native-text pages are unaffected. If paddleocr is not installed, scanned pages are silently skipped.
-- **Image OCR**: Install `pip install 'srclight[docs,ocr]'` + system `tesseract-ocr` for OCR on standalone image files.
-- After installing new extras, re-run `srclight index` (or `srclight workspace index`) to pick up documents.
-
-## Adding a New Repo to the Workspace
-To index a new repo and add it to the workspace, run these shell commands:
-```
-srclight workspace add /path/to/repo -w WORKSPACE_NAME
-srclight workspace index -w WORKSPACE_NAME -p PROJECT_NAME --embed qwen3-embedding
-srclight hook install --workspace WORKSPACE_NAME
-```
-The server picks up new projects automatically (no restart needed).
-
-## Troubleshooting
-- If ALL tools fail with `-32602: Invalid request parameters`, the MCP session is stale (e.g. the srclight service was restarted while this client was connected). Tell the user to **restart their editor/CLI** so the MCP client reconnects. Retrying the same calls will not help.
-
-## Prefer Srclight Over Grep
-When srclight is available, ALWAYS prefer these tools over grep/find/cat:
-- **Instead of grep/rg**: Use `hybrid_search(query)` or `search_symbols(query)` — returns ranked, structured results with file paths, line numbers, and symbol context.
-- **Instead of find/ls**: Use `symbols_in_file(path)` — returns a structured table of contents for any file.
-- **Instead of reading entire files**: Use `get_symbol(name)` — returns just the function/class you need with full source.
-- Srclight results include relationship data (callers, callees, tests) that grep cannot provide.
-- Grep sees text. Srclight sees code structure.
-
-## Setup and server control
-- `setup_guide()` — Structured instructions for agents: how to add a workspace, connect Cursor, where config lives, how to index with embeddings, hook install. Call when the user or agent needs setup steps.
-- `server_stats()` — When the server started and uptime (for "how long has srclight been up").
-- `restart_server()` — (SSE only) Exit so a process manager can restart. Allowed by default; set SRCLIGHT_ALLOW_RESTART=0 to disable.
+## Recovery Hints
+- If symbol lookup fails, try `hybrid_search(...)` first, then `search_symbols(...)`.
+- If all tools fail with stale-parameter errors after a restart, tell the user to restart the editor/CLI so the MCP client reconnects.
+- Prefer Srclight over grep/find/cat when indexed data is available: search first, then open symbols or file TOCs only as needed.
 """
 
 
@@ -125,7 +85,7 @@ def _build_dynamic_instructions() -> str:
             total_files = sum(p.get("files", 0) for p in projects)
             total_symbols = sum(p.get("symbols", 0) for p in projects)
             total_edges = sum(p.get("edges", 0) for p in projects)
-            project_names = [p.get("name", "?") for p in projects[:10]]
+            project_names = [p.get("project", p.get("name", "?")) for p in projects[:10]]
 
             lines.append(f"## Your Workspace: {_workspace_name}")
             lines.append(f"You have access to **{project_count} indexed project{'s' if project_count != 1 else ''}** "
@@ -140,20 +100,36 @@ def _build_dynamic_instructions() -> str:
             lines.append("You can search across all projects at once, trace function calls, "
                          "find who changed code and why, and discover relationships between symbols.")
             lines.append("")
-        elif _db_path is not None:
-            db = _get_db()
-            stats = db.stats()
-            lines.append("## Your Codebase")
-            lines.append(f"You have access to **{stats['files']:,} files**, "
-                         f"**{stats['symbols']:,} symbols**, "
-                         f"and **{stats['edges']:,} relationships**.")
-            if stats.get("languages"):
-                lang_list = ", ".join(stats["languages"].keys())
-                lines.append(f"Languages: {lang_list}")
-            lines.append("")
-            lines.append("You can search code, trace function calls, "
-                         "find who changed code and why, and discover relationships between symbols.")
-            lines.append("")
+        elif _db_path is not None or _repo_root is not None:
+            repo_root, db_path = _resolve_single_repo_context()
+            if repo_root is not None and db_path is not None:
+                if db_path.exists() and db_path.stat().st_size > 0:
+                    db = _get_db()
+                    stats = db.stats()
+                    lines.append("## Your Codebase")
+                    lines.append(f"You have access to **{stats['files']:,} files**, "
+                                 f"**{stats['symbols']:,} symbols**, "
+                                 f"and **{stats['edges']:,} relationships**.")
+                    if stats.get("languages"):
+                        lang_list = ", ".join(stats["languages"].keys())
+                        lines.append(f"Languages: {lang_list}")
+                    lines.append("")
+                    lines.append("You can search code, trace function calls, "
+                                 "find who changed code and why, and discover relationships between symbols.")
+                    lines.append("")
+                else:
+                    representative_files = _find_representative_files(repo_root)
+                    framework_hints = _detect_framework_hints(repo_root, representative_files)
+                    start_here = _build_start_here(representative_files, framework_hints)
+                    lines.append("## Your Codebase")
+                    lines.append(f"Repo root: {repo_root}")
+                    lines.append("Index status: not indexed yet.")
+                    if start_here:
+                        start_paths = ", ".join(item["path"] for item in start_here[:4])
+                        lines.append(f"Start here: {start_paths}")
+                    lines.append("")
+                    lines.append("Call `codebase_map()` for a filesystem-only brief or run `srclight index --embed`.")
+                    lines.append("")
     except Exception:
         # If we can't get stats (e.g. DB not yet initialized), fall back to generic text
         lines.append("You have access to a code index with searchable symbols, call graphs, and git history.")
@@ -212,6 +188,756 @@ def _read_index_signal(root: Path | None) -> dict | None:
     return None
 
 
+def _discover_repo_root_and_db_path(start: Path | None = None) -> tuple[Path, Path]:
+    """Discover the repo root and expected DB path without opening SQLite."""
+    check = (start or Path.cwd()).resolve()
+    while check != check.parent:
+        if (check / ".srclight" / "index.db").exists():
+            return check, check / ".srclight" / "index.db"
+        if (check / ".codelight" / "index.db").exists():
+            return check, check / ".codelight" / "index.db"
+        if (check / ".srclight.db").exists():
+            return check, check / ".srclight.db"
+        if (check / ".git").exists():
+            return check, check / ".srclight" / "index.db"
+        check = check.parent
+    root = (start or Path.cwd()).resolve()
+    return root, root / ".srclight" / "index.db"
+
+
+def _resolve_single_repo_context() -> tuple[Path | None, Path | None]:
+    """Resolve repo root and DB path for single-repo mode."""
+    global _db_path, _repo_root
+
+    if _repo_root is not None:
+        root = _repo_root.resolve()
+        db_path = _db_path or root / ".srclight" / "index.db"
+        _db_path = db_path
+        return root, db_path
+
+    if _db_path is not None:
+        db_path = _db_path.resolve()
+        root = db_path.parent.parent if db_path.name == "index.db" else db_path.parent
+        _repo_root = root
+        return root, db_path
+
+    root, db_path = _discover_repo_root_and_db_path()
+    _repo_root = root
+    _db_path = db_path
+    return root, db_path
+
+
+def _load_package_manifest(root: Path) -> dict:
+    """Best-effort package.json loader for repo fingerprinting."""
+    manifest_path = root / "package.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text())
+    except Exception:
+        return {}
+
+
+def _package_dependency_names(manifest: dict) -> set[str]:
+    """Collect dependency names across common package.json sections."""
+    names: set[str] = set()
+    for field in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+        values = manifest.get(field)
+        if isinstance(values, dict):
+            names.update(values.keys())
+    return names
+
+
+def _collect_repo_files(
+    root: Path,
+    relative_dirs: tuple[str, ...],
+    *,
+    limit: int,
+    allowed_suffixes: tuple[str, ...] | None = None,
+) -> list[str]:
+    """Collect a few representative files under the given directories."""
+    results: list[str] = []
+    seen: set[str] = set()
+    suffixes = tuple(s.lower() for s in allowed_suffixes) if allowed_suffixes else None
+
+    for relative_dir in relative_dirs:
+        directory = root / relative_dir
+        if not directory.is_dir():
+            continue
+        for path in sorted(p for p in directory.rglob("*") if p.is_file()):
+            relative = path.relative_to(root).as_posix()
+            if relative in seen:
+                continue
+            if suffixes and path.suffix.lower() not in suffixes:
+                continue
+            seen.add(relative)
+            results.append(relative)
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def _collect_existing_paths(root: Path, candidates: tuple[str, ...], *, limit: int) -> list[str]:
+    """Return the existing candidate paths relative to root."""
+    results: list[str] = []
+    for candidate in candidates:
+        path = root / candidate
+        if path.is_file():
+            results.append(candidate)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _merge_representative_paths(*groups: list[str], limit: int) -> list[str]:
+    """Merge path groups while preserving order and removing duplicates."""
+    results: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for path in group:
+            if path in seen:
+                continue
+            seen.add(path)
+            results.append(path)
+            if len(results) >= limit:
+                return results
+    return results
+
+
+_DATA_SYSTEMS = ("prisma", "drizzle", "mongoose", "mikroorm")
+_ASYNC_SYSTEMS = ("bullmq", "rabbitmq", "redis")
+_ASYNC_SYSTEM_ALIASES = {"rmq": "rabbitmq"}
+_ASYNC_RESOURCES = {"processor", "consumer", "worker", "queue", "scheduler"}
+
+
+def _normalize_orientation_token(value: object) -> str:
+    """Normalize framework-ish metadata values into stable tokens."""
+    token = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    return "nest" if token == "nestjs" else token
+
+
+def _canonical_async_orientation_token(value: object) -> str:
+    """Normalize async metadata tokens and collapse transport aliases."""
+    token = _normalize_orientation_token(value)
+    return _ASYNC_SYSTEM_ALIASES.get(token, token)
+
+
+def _infer_app_type(
+    representative_files: dict[str, list[str]],
+    signals: set[str],
+    *,
+    manifest_present: bool,
+) -> str:
+    """Infer the primary app type from representative files and merged signals."""
+    has_frontend = "nuxt" in signals or "vue" in signals
+    has_backend = (
+        "nest" in signals
+        or bool(representative_files.get("data"))
+        or bool(representative_files.get("async"))
+        or any(
+            path.startswith(("src/main", "src/controllers", "src/modules", "src/http"))
+            for path in representative_files.get("backend", [])
+        )
+    )
+
+    if has_frontend and has_backend:
+        return "fullstack"
+    if "nuxt" in signals:
+        return "nuxt"
+    if "nest" in signals:
+        return "nest"
+    if "vue" in signals:
+        return "vue"
+    if manifest_present:
+        return "node"
+    return "codebase"
+
+
+def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize indexed symbol metadata into orientation hints."""
+    representative_files = {
+        "backend": [],
+        "data": [],
+        "async": [],
+        "config": [],
+    }
+    route_systems: list[str] = []
+    route_files: list[str] = []
+    data_systems: list[str] = []
+    async_systems: list[str] = []
+    runtime_files: list[str] = []
+    signals: list[str] = []
+    backend_priorities: dict[str, int] = {}
+    async_priorities: dict[str, int] = {}
+    runtime_priorities: dict[str, int] = {}
+
+    def _append(bucket: list[str], value: str) -> None:
+        if value and value not in bucket:
+            bucket.append(value)
+
+    def _ordered_systems(values: list[str], preferred: tuple[str, ...]) -> list[str]:
+        order = {name: index for index, name in enumerate(preferred)}
+        return sorted(values, key=lambda name: (order.get(name, len(order)), name))
+
+    def _priority_update(priorities: dict[str, int], path: str, priority: int) -> None:
+        if not path:
+            return
+        priorities[path] = min(priority, priorities.get(path, priority))
+
+    def _ordered_paths(values: list[str], priorities: dict[str, int]) -> list[str]:
+        return sorted(values, key=lambda path: (priorities.get(path, 10), path))
+
+    for row in symbol_rows:
+        path = str(row.get("file_path") or "")
+        kind = str(row.get("kind") or "").lower()
+        metadata = row.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        framework = _canonical_async_orientation_token(metadata.get("framework"))
+        has_framework_metadata = bool(framework)
+        transport = _canonical_async_orientation_token(metadata.get("transport"))
+        resource = str(metadata.get("resource") or "").lower()
+        has_route_metadata = any(metadata.get(key) for key in ("route_prefix", "route_path", "http_method"))
+        system_tokens = [
+            token
+            for token in (framework, transport)
+            if token
+        ]
+
+        is_route_surface = (
+            kind in {"controller", "route"}
+            or resource in {"controller", "route"}
+            or has_route_metadata
+        )
+        is_nest_controller = (
+            kind == "controller"
+            or resource == "controller"
+            or path.startswith("src/controllers/")
+            or path.endswith(".controller.ts")
+        ) and (
+            framework == "nest"
+            or (
+                not has_framework_metadata
+                and (
+                    path.startswith("src/controllers/")
+                    or path.endswith(".controller.ts")
+                )
+            )
+        )
+        is_runtime = (
+            resource in {"module", "config", "bootstrap"}
+            or kind in {"module", "config"}
+            or "/bootstrap/" in path
+        )
+        is_data = framework in _DATA_SYSTEMS
+        is_async = (
+            kind in {"queue_processor", "microservice_handler", "scheduled_job"}
+            or resource in _ASYNC_RESOURCES
+            or any(token in _ASYNC_SYSTEMS for token in system_tokens)
+        )
+
+        if path in {"src/main.ts", "src/main.js", "main.ts", "main.js", "server.ts"} or resource == "bootstrap":
+            _append(representative_files["backend"], path)
+            _priority_update(backend_priorities, path, 0)
+
+        if is_route_surface:
+            _append(representative_files["backend"], path)
+            _append(route_files, path)
+            _priority_update(backend_priorities, path, 1)
+            if is_nest_controller and "nest_controllers" not in route_systems:
+                route_systems.append("nest_controllers")
+            if framework == "nest":
+                _append(signals, framework)
+
+        if is_runtime:
+            _append(representative_files["config"], path)
+            _append(runtime_files, path)
+            _priority_update(runtime_priorities, path, 0 if resource == "module" else 1)
+            if framework == "nest":
+                _append(signals, framework)
+
+        if is_data and path:
+            _append(representative_files["data"], path)
+            _append(data_systems, framework)
+            _append(signals, framework)
+
+        if is_async and path:
+            _append(representative_files["async"], path)
+            _priority_update(async_priorities, path, 1 if resource == "config" else 0)
+            for token in system_tokens:
+                if token in _ASYNC_SYSTEMS:
+                    _append(async_systems, token)
+                    _append(signals, token)
+            if framework == "nest":
+                _append(signals, framework)
+            if resource == "config":
+                _append(representative_files["config"], path)
+                _append(runtime_files, path)
+
+    return {
+        "signals": signals,
+        "representative_files": {
+            "backend": _ordered_paths(representative_files["backend"], backend_priorities),
+            "data": representative_files["data"],
+            "async": _ordered_paths(representative_files["async"], async_priorities),
+            "config": _ordered_paths(representative_files["config"], runtime_priorities),
+        },
+        "route_systems": route_systems,
+        "route_files": route_files,
+        "data_systems": _ordered_systems(data_systems, _DATA_SYSTEMS),
+        "async_systems": _ordered_systems(async_systems, _ASYNC_SYSTEMS),
+        "runtime_files": _ordered_paths(runtime_files, runtime_priorities),
+    }
+
+
+def _merge_indexed_representative_files(
+    representative_files: dict[str, list[str]],
+    indexed_hints: dict[str, object] | None,
+) -> dict[str, list[str]]:
+    """Merge metadata-derived file hints into representative files."""
+    if not indexed_hints:
+        return {key: list(value) for key, value in representative_files.items()}
+
+    merged = {key: list(value) for key, value in representative_files.items()}
+    indexed_files = indexed_hints.get("representative_files")
+    if not isinstance(indexed_files, dict):
+        return merged
+
+    merged["backend"] = _merge_representative_paths(
+        merged.get("backend", []),
+        list(indexed_files.get("backend") or []),
+        limit=3,
+    )
+    merged["data"] = _merge_representative_paths(
+        merged.get("data", []),
+        list(indexed_files.get("data") or []),
+        limit=3,
+    )
+    merged["async"] = _merge_representative_paths(
+        merged.get("async", []),
+        list(indexed_files.get("async") or []),
+        limit=3,
+    )
+    merged["config"] = _merge_representative_paths(
+        merged.get("config", []),
+        list(indexed_files.get("config") or []),
+        limit=4,
+    )
+    return merged
+
+
+def _find_representative_files(root: Path) -> dict[str, list[str]]:
+    """Collect high-signal files that help agents orient quickly."""
+    representative_files: dict[str, list[str]] = {}
+
+    config_files = _collect_existing_paths(root, (
+        "nuxt.config.ts",
+        "nuxt.config.js",
+        "nuxt.config.mjs",
+        "vite.config.ts",
+        "vite.config.js",
+        "nest-cli.json",
+        "tsconfig.json",
+        "package.json",
+    ), limit=4)
+    if config_files:
+        representative_files["config"] = config_files
+
+    entrypoints = _collect_existing_paths(root, (
+        "app.vue",
+        "src/main.ts",
+        "src/main.js",
+        "main.ts",
+        "main.js",
+        "server.ts",
+        "src/main.tsx",
+    ), limit=3)
+    if entrypoints:
+        representative_files["entrypoints"] = entrypoints
+
+    docs = _collect_existing_paths(root, (
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "docs/README.md",
+    ), limit=4)
+    if docs:
+        representative_files["docs"] = docs
+
+    backend = _merge_representative_paths(
+        _collect_repo_files(root, ("server/api", "server/routes", "api"), limit=1, allowed_suffixes=(".ts", ".js", ".mjs")),
+        _collect_existing_paths(root, ("src/main.ts", "src/main.js", "server.ts", "main.ts", "main.js"), limit=1),
+        _collect_repo_files(root, ("src/controllers", "src/modules", "src/server"), limit=1, allowed_suffixes=(".ts", ".js")),
+        limit=3,
+    )
+    if backend:
+        representative_files["backend"] = backend
+
+    data = _merge_representative_paths(
+        _collect_existing_paths(root, ("prisma/schema.prisma",), limit=1),
+        _collect_repo_files(
+            root,
+            ("prisma", "src/db", "db", "src/database", "database", "src/entities", "src/models", "src/repositories"),
+            limit=3,
+            allowed_suffixes=(".prisma", ".sql", ".ts", ".js"),
+        ),
+        limit=3,
+    )
+    if data:
+        representative_files["data"] = data
+
+    async_files = _collect_repo_files(
+        root,
+        ("src/queues", "queues", "src/workers", "workers", "src/jobs", "jobs", "src/events", "events", "src/consumers", "consumers"),
+        limit=3,
+        allowed_suffixes=(".ts", ".js", ".mjs"),
+    )
+    if async_files:
+        representative_files["async"] = async_files
+
+    category_specs = (
+        ("routes", ("app/pages", "pages", "src/pages", "app/router", "src/router"), (".vue", ".ts", ".js"), 3),
+        ("components", ("app/components", "components", "src/components"), (".vue", ".ts", ".js"), 3),
+        ("composables", ("app/composables", "composables", "src/composables", "hooks", "src/hooks"), (".ts", ".js", ".vue"), 3),
+        ("stores", ("app/stores", "stores", "src/stores"), (".ts", ".js"), 3),
+        ("plugins", ("app/plugins", "plugins", "src/plugins"), (".ts", ".js"), 3),
+        ("server", ("server", "server/api", "api", "src/server"), (".ts", ".js", ".mjs"), 3),
+        ("graphql", ("app/graphql", "graphql", "src/graphql"), (".gql", ".graphql", ".ts", ".js"), 3),
+        ("styles", ("app/assets", "assets", "styles", "src/styles"), (".css", ".pcss", ".postcss", ".scss", ".sass", ".less"), 3),
+    )
+    for category, relative_dirs, suffixes, limit in category_specs:
+        files = _collect_repo_files(root, relative_dirs, limit=limit, allowed_suffixes=suffixes)
+        if files:
+            representative_files[category] = files
+
+    return representative_files
+
+
+def _detect_framework_hints(
+    root: Path,
+    representative_files: dict[str, list[str]],
+    *,
+    extra_signals: set[str] | None = None,
+) -> dict[str, object]:
+    """Infer the dominant framework/runtime signals from repo layout + package.json."""
+    manifest = _load_package_manifest(root)
+    dependencies = _package_dependency_names(manifest)
+    signals: set[str] = set(extra_signals or [])
+
+    if "nuxt" in dependencies or any(path.startswith("nuxt.config.") for path in representative_files.get("config", [])):
+        signals.add("nuxt")
+    if (
+        "vue" in dependencies
+        or "nuxt" in signals
+        or bool(representative_files.get("components"))
+        or bool(representative_files.get("routes"))
+        or "app.vue" in representative_files.get("entrypoints", [])
+    ):
+        signals.add("vue")
+    if (
+        "graphql" in dependencies
+        or "@apollo/client" in dependencies
+        or "@nuxtjs/apollo" in dependencies
+        or bool(representative_files.get("graphql"))
+    ):
+        signals.add("graphql")
+    if (
+        "@pinia/nuxt" in dependencies
+        or "pinia" in dependencies
+        or bool(representative_files.get("stores"))
+    ):
+        signals.add("pinia")
+    if (
+        "postcss" in dependencies
+        or any(path.endswith(".postcss") for path in representative_files.get("styles", []))
+    ):
+        signals.add("postcss")
+    if (
+        "@nestjs/core" in dependencies
+        or "nest-cli.json" in representative_files.get("config", [])
+    ):
+        signals.add("nest")
+    if representative_files.get("server") and "nuxt" in signals:
+        signals.add("nitro")
+    if (
+        "@prisma/client" in dependencies
+        or "prisma" in dependencies
+        or any(path.endswith(".prisma") for path in representative_files.get("data", []))
+    ):
+        signals.add("prisma")
+    if "bullmq" in dependencies or any("queue" in path or "processor" in path for path in representative_files.get("async", [])):
+        signals.add("bullmq")
+
+    return {
+        "app_type": _infer_app_type(representative_files, signals, manifest_present=bool(manifest)),
+        "signals": sorted(signals),
+    }
+
+
+def _build_topology(
+    root: Path,
+    representative_files: dict[str, list[str]],
+    framework_hints: dict[str, object],
+    indexed_hints: dict[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
+    """Summarize the main architectural surfaces visible from repo layout."""
+    manifest = _load_package_manifest(root)
+    dependencies = _package_dependency_names(manifest)
+    signals = set(framework_hints.get("signals") or [])
+    indexed_hints = indexed_hints or {}
+    topology: dict[str, dict[str, object]] = {}
+
+    backend_files = representative_files.get("backend") or representative_files.get("server") or []
+    if backend_files:
+        topology["backend"] = {
+            "files": backend_files,
+            "summary": "Primary backend entrypoints, HTTP surfaces, and server modules.",
+        }
+
+    route_systems = list(indexed_hints.get("route_systems") or [])
+    has_controller_surfaces = any(path.startswith("src/controllers") for path in backend_files)
+    if has_controller_surfaces and "nest_controllers" not in route_systems:
+        route_systems.append("nest_controllers")
+    if any(path.startswith(("server/api", "server/routes")) for path in backend_files + (representative_files.get("server") or [])) and "nitro_file_routes" not in route_systems:
+        route_systems.append("nitro_file_routes")
+    if route_systems:
+        route_files = _merge_representative_paths(
+            [path for path in representative_files.get("server") or [] if path.startswith(("server/api", "server/routes"))],
+            list(indexed_hints.get("route_files") or []),
+            [path for path in backend_files if path.startswith("src/controllers")],
+            [path for path in backend_files if path.startswith(("server/api", "server/routes"))],
+            limit=3,
+        )
+        topology["routes"] = {
+            "systems": route_systems,
+            "files": route_files,
+            "summary": _route_summary(route_systems),
+        }
+
+    data_files = representative_files.get("data") or []
+    if data_files:
+        data_systems = list(indexed_hints.get("data_systems") or [])
+        if not data_systems:
+            data_systems = [system for system in _DATA_SYSTEMS if system in signals]
+        if not data_systems:
+            data_systems = ["prisma"] if any(path.endswith(".prisma") for path in data_files) else ["generic"]
+        topology["data"] = {
+            "systems": data_systems,
+            "files": data_files,
+        }
+
+    async_files = representative_files.get("async") or []
+    if async_files:
+        async_systems = list(indexed_hints.get("async_systems") or [])
+        if not async_systems:
+            async_systems = [system for system in _ASYNC_SYSTEMS if system in signals]
+        if not async_systems:
+            async_systems = ["bullmq"] if "bullmq" in dependencies else ["generic"]
+        topology["async"] = {
+            "systems": async_systems,
+            "files": async_files,
+        }
+
+    runtime_files = _merge_representative_paths(
+        [path for path in representative_files.get("config", []) if path in {"nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs", "package.json", "nest-cli.json"}],
+        list(indexed_hints.get("runtime_files") or []),
+        _collect_repo_files(root, ("src/config", "config"), limit=2, allowed_suffixes=(".ts", ".js", ".json", ".yaml", ".yml")),
+        limit=3,
+    )
+    if runtime_files:
+        topology["runtime"] = {
+            "files": runtime_files,
+            "summary": "Runtime configuration, environment wiring, and framework bootstrap settings.",
+        }
+
+    return topology
+
+
+def _route_summary(route_systems: list[str]) -> str:
+    """Summarize route systems without implying surfaces we did not detect."""
+    labels = {
+        "nest_controllers": "Nest controllers",
+        "nitro_file_routes": "Nitro file routes",
+    }
+    parts = [labels[system] for system in route_systems if system in labels]
+    if not parts:
+        return "HTTP route and transport surfaces."
+    if len(parts) == 1:
+        return f"HTTP route and transport surfaces from {parts[0]}."
+    return f"HTTP route and transport surfaces from {parts[0]} and {parts[1]}."
+
+
+def _start_here_reason(category: str, app_type: str) -> str:
+    """Explain why a representative file is a good orientation entrypoint."""
+    reasons = {
+        "config": {
+            "nuxt": "Nuxt runtime and module configuration.",
+            "fullstack": "Framework and runtime configuration across frontend and backend.",
+            "default": "Framework and build configuration.",
+        },
+        "entrypoints": {
+            "nuxt": "Global Nuxt app shell.",
+            "default": "Application entrypoint.",
+        },
+        "routes": {
+            "default": "Top-level route or page surface.",
+        },
+        "components": {
+            "default": "Reusable UI building blocks.",
+        },
+        "composables": {
+            "default": "Shared frontend behavior and stateful logic.",
+        },
+        "stores": {
+            "default": "Centralized client state.",
+        },
+        "plugins": {
+            "default": "Framework plugin/bootstrap integration.",
+        },
+        "server": {
+            "nuxt": "Nitro server endpoints and server-only logic.",
+            "fullstack": "Server-only endpoints and transport surfaces.",
+            "default": "HTTP or backend entrypoints.",
+        },
+        "backend": {
+            "fullstack": "Backend bootstrap, controllers, and server entrypoints.",
+            "nest": "Backend bootstrap, controllers, and server entrypoints.",
+            "default": "Backend entrypoints and transport surfaces.",
+        },
+        "data": {
+            "default": "Persistence layer and database schema entrypoints.",
+        },
+        "async": {
+            "default": "Queue, worker, and async processing entrypoints.",
+        },
+        "graphql": {
+            "default": "GraphQL operations or schema-adjacent documents.",
+        },
+        "styles": {
+            "default": "Shared styling, tokens, or PostCSS modules.",
+        },
+    }
+    category_reasons = reasons.get(category, {})
+    return category_reasons.get(app_type) or category_reasons.get("default") or "Representative file."
+
+
+def _build_start_here(
+    representative_files: dict[str, list[str]],
+    framework_hints: dict[str, object],
+) -> list[dict[str, str]]:
+    """Build a small ordered entrypoint list for repo orientation."""
+    app_type = str(framework_hints.get("app_type") or "codebase")
+    if app_type == "fullstack":
+        priority = ("config", "backend", "routes", "data", "async", "entrypoints", "server", "stores", "composables", "plugins", "graphql", "styles", "components")
+        category_limits = {"backend": 2}
+    elif app_type == "nuxt":
+        priority = ("config", "entrypoints", "routes", "stores", "composables", "plugins", "server", "graphql", "styles", "components")
+        category_limits = {}
+    elif app_type == "nest":
+        priority = ("config", "backend", "data", "async", "entrypoints", "server", "graphql", "styles", "components")
+        category_limits = {"config": 2, "backend": 2}
+    else:
+        priority = ("config", "entrypoints", "routes", "components", "composables", "stores", "plugins", "server", "graphql", "styles")
+        category_limits = {}
+
+    start_here: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for category in priority:
+        files = representative_files.get(category) or []
+        if not files:
+            continue
+        for path in files[:category_limits.get(category, 1)]:
+            if path in seen:
+                continue
+            seen.add(path)
+            start_here.append({
+                "path": path,
+                "reason": _start_here_reason(category, app_type),
+            })
+            if len(start_here) >= 6:
+                break
+        if len(start_here) >= 6:
+            break
+
+    if not start_here:
+        for path in representative_files.get("config", []):
+            start_here.append({
+                "path": path,
+                "reason": "Top-level project manifest or framework configuration.",
+            })
+            break
+
+    if not start_here:
+        for path in representative_files.get("docs", []):
+            start_here.append({
+                "path": path,
+                "reason": "Top-level project documentation.",
+            })
+            break
+
+    if not start_here:
+        start_here.append({
+            "path": ".",
+            "reason": "Repo root. Start with top-level files and directories.",
+        })
+    return start_here
+
+
+def _build_repo_brief(
+    framework_hints: dict[str, object],
+    start_here: list[dict[str, str]],
+    *,
+    indexed: bool,
+) -> str:
+    """Build a compact AI-oriented repo summary."""
+    app_type = str(framework_hints.get("app_type") or "codebase")
+    signals = list(framework_hints.get("signals") or [])
+    label = "unindexed" if not indexed else "indexed"
+    app_label = app_type.upper() if app_type == "nuxt" else app_type
+    signal_text = f" with {', '.join(signals[:4])} signals" if signals else ""
+    start_paths = ", ".join(item["path"] for item in start_here[:4])
+    start_text = f" Start with {start_paths}." if start_paths else ""
+    return f"{label.capitalize()} {app_label} repo{signal_text}.{start_text}"
+
+
+def _bootstrap_codebase_map_result(
+    repo_root: Path,
+    db_path: Path,
+    framework_hints: dict[str, object],
+    representative_files: dict[str, list[str]],
+    start_here: list[dict[str, str]],
+    topology: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    """Build a filesystem-only codebase map for repos without a usable index."""
+    quoted_root = shlex.quote(str(repo_root))
+    return {
+        "mode": "single",
+        "repo_root": str(repo_root),
+        "bootstrap_mode": "filesystem_only",
+        "index": {
+            "status": "not_indexed",
+            "db_path": str(db_path),
+            "present": db_path.exists(),
+        },
+        "framework_hints": framework_hints,
+        "representative_files": representative_files,
+        "topology": topology,
+        "start_here": start_here,
+        "brief": _build_repo_brief(framework_hints, start_here, indexed=False),
+        "hint": (
+            "Repo is not indexed yet. "
+            f"Run `srclight index --embed` from {quoted_root} "
+            f"or `srclight index {quoted_root} --embed`."
+        ),
+        "next_actions": [
+            f"Run: srclight index {quoted_root} --embed",
+            "Call codebase_map() again after indexing.",
+            "Use setup_guide() if the user needs setup help.",
+        ],
+    }
+
+
 def _get_workspace_db():
     """Get or create the WorkspaceDB connection.
 
@@ -257,8 +983,8 @@ def _get_learnings_db():
     if _learnings_db is not None:
         return _learnings_db
 
-    from .workspace import WorkspaceConfig
     from .learnings import LearningsDB
+    from .workspace import WorkspaceConfig
 
     if _workspace_name is None:
         raise RuntimeError("Learnings require workspace mode")
@@ -277,43 +1003,22 @@ def _get_db() -> Database:
     if _db is not None:
         return _db
 
-    # Default: look for .srclight/index.db, walk up to find repo root
-    # Also checks legacy .codelight/ paths and auto-migrates them.
-    if _db_path is None:
-        cwd = Path.cwd()
-        check = cwd
-        while check != check.parent:
-            if (check / ".srclight" / "index.db").exists():
-                _db_path = check / ".srclight" / "index.db"
-                _repo_root = check
-                break
-            # Legacy: migrate .codelight/ → .srclight/ if found
-            legacy = check / ".codelight"
-            new_dir = check / ".srclight"
-            if (legacy / "index.db").exists() and not new_dir.exists():
-                try:
-                    legacy.rename(new_dir)
-                    logger.info("Migrated %s -> %s", legacy, new_dir)
-                    _db_path = new_dir / "index.db"
-                    _repo_root = check
-                    break
-                except OSError:
-                    # Fall back to reading from old location
-                    _db_path = legacy / "index.db"
-                    _repo_root = check
-                    break
-            if (check / ".srclight.db").exists():
-                _db_path = check / ".srclight.db"
-                _repo_root = check
-                break
-            if (check / ".git").exists():
-                _db_path = check / ".srclight" / "index.db"
-                _repo_root = check
-                break
-            check = check.parent
-        if _db_path is None:
-            _db_path = cwd / ".srclight" / "index.db"
-            _repo_root = cwd
+    # Default: look for .srclight/index.db, walk up to find repo root.
+    # Legacy: migrate .codelight/ → .srclight/ if found on disk.
+    root, db_path = _resolve_single_repo_context()
+    if root is not None:
+        legacy = root / ".codelight"
+        new_dir = root / ".srclight"
+        if db_path == legacy / "index.db" and legacy.exists() and not new_dir.exists():
+            try:
+                legacy.rename(new_dir)
+                logger.info("Migrated %s -> %s", legacy, new_dir)
+                db_path = new_dir / "index.db"
+            except OSError:
+                pass
+
+    _repo_root = root
+    _db_path = db_path
 
     _db = Database(_db_path)
     _db.open()
@@ -333,7 +1038,7 @@ def _get_vector_cache():
 
     from .vector_cache import VectorCache
 
-    db = _get_db()
+    _get_db()
     srclight_dir = _db_path.parent if _db_path else None
     if srclight_dir is None:
         return None
@@ -373,20 +1078,56 @@ def _project_required_error(tool_name: str) -> str:
     return json.dumps({
         "error": f"In workspace mode, 'project' parameter is required for {tool_name}.",
         "available_projects": project_names,
-        "hint": f"Try: {tool_name}(..., project=\"{project_names[0]}\")" if project_names else None,
+        "hint": (
+            f"Call list_projects() and retry with {tool_name}(..., project=\"{project_names[0]}\")"
+            if project_names else
+            "Call list_projects() to discover valid project names."
+        ),
     })
+
+
+def _symbol_name_suggestions(name: str, project: str | None = None) -> list[str]:
+    """Return nearby symbol names for miss hints."""
+    try:
+        if _is_workspace_mode():
+            wdb = _get_workspace_db()
+            suggestions = wdb.suggest_symbol_names(name, project=project)
+            return [item["name"] for item in suggestions]
+
+        db = _get_db()
+        return db.suggest_symbol_names(name)
+    except Exception:
+        return []
+
+
+def _tool_call(tool_name: str, value: str, *, project: str | None = None) -> str:
+    """Format a recovery suggestion tool call."""
+    project_part = f', project="{project}"' if project else ""
+    return f'{tool_name}("{value}"{project_part})'
 
 
 def _symbol_not_found_error(name: str, project: str | None = None) -> str:
     """Return a JSON error with recovery hints when a symbol lookup fails."""
     ctx = f" in {project}" if project else ""
-    return json.dumps({
+    payload: dict[str, object] = {
         "error": f"Symbol '{name}' not found{ctx}",
         "suggestions": [
-            f"Try search_symbols(\"{name}\") for fuzzy keyword matching",
-            f"Try hybrid_search(\"{name}\") for keyword + semantic matching",
+            f"Try {_tool_call('hybrid_search', name, project=project)} for concept + keyword search",
+            f"Try {_tool_call('search_symbols', name, project=project)} for exact/fuzzy keyword search",
         ],
-    })
+    }
+
+    tokenized = tokenized_query_hint(name)
+    if tokenized:
+        payload["suggestions"].append(
+            f"Try {_tool_call('search_symbols', tokenized, project=project)} for tokenized identifier search"
+        )
+
+    did_you_mean = _symbol_name_suggestions(name, project=project)
+    if did_you_mean:
+        payload["did_you_mean"] = did_you_mean
+
+    return json.dumps(payload)
 
 
 def _project_not_found_error(project: str) -> str:
@@ -403,6 +1144,23 @@ def _project_not_found_error(project: str) -> str:
             result["did_you_mean"] = close
         result["available_projects"] = project_names
     return json.dumps(result)
+
+
+def _workspace_project_not_found_error(project: str | None) -> str | None:
+    """Return the project-not-found payload for unknown workspace projects."""
+    if not _is_workspace_mode() or project is None:
+        return None
+
+    wdb = _get_workspace_db()
+    workspace = getattr(wdb, "workspace", None)
+    if workspace is not None and hasattr(workspace, "get_entries"):
+        entries = workspace.get_entries()
+    else:
+        entries = getattr(wdb, "_all_indexable", [])
+
+    if not any(getattr(entry, "name", None) == project for entry in entries):
+        return _project_not_found_error(project)
+    return None
 
 
 # --- Tier 1: Instant tools ---
@@ -424,21 +1182,83 @@ def codebase_map(project: str | None = None) -> str:
     _record_query()
     if _is_workspace_mode():
         wdb = _get_workspace_db()
-        result = wdb.codebase_map(project=project)
+        try:
+            result = wdb.codebase_map(project=project)
+        except LookupError:
+            if project is None:
+                raise
+            return _project_not_found_error(project)
         return json.dumps(result, indent=2)
 
-    db = _get_db()
-    stats = db.stats()
-    state = db.get_index_state(str(_repo_root)) if _repo_root else None
+    repo_root, db_path = _resolve_single_repo_context()
+    if repo_root is None or db_path is None:
+        return json.dumps({"error": "Unable to determine repo root."}, indent=2)
+
+    representative_files = _find_representative_files(repo_root)
+    framework_hints = _detect_framework_hints(repo_root, representative_files)
+    start_here = _build_start_here(representative_files, framework_hints)
+    topology = _build_topology(repo_root, representative_files, framework_hints)
+    db_exists = db_path.exists()
+    db_size = db_path.stat().st_size if db_exists else 0
+
+    if db_size == 0 and _db is None:
+        return json.dumps(
+            _bootstrap_codebase_map_result(
+                repo_root,
+                db_path,
+                framework_hints,
+                representative_files,
+                start_here,
+                topology,
+            ),
+            indent=2,
+        )
+
+    try:
+        db = _get_db()
+        stats = db.stats()
+        state = db.get_index_state(str(repo_root))
+    except (AssertionError, OSError, sqlite3.Error):
+        return json.dumps(
+            _bootstrap_codebase_map_result(
+                repo_root,
+                db_path,
+                framework_hints,
+                representative_files,
+                start_here,
+                topology,
+            ),
+            indent=2,
+        )
+
+    indexed_hints = None
+    try:
+        indexed_hints = _indexed_orientation_hints(db.orientation_symbols())
+    except (AttributeError, OSError, sqlite3.Error, json.JSONDecodeError):
+        indexed_hints = None
+
+    representative_files = _merge_indexed_representative_files(representative_files, indexed_hints)
+    extra_signals = set(indexed_hints.get("signals") or []) if indexed_hints else None
+    framework_hints = _detect_framework_hints(repo_root, representative_files, extra_signals=extra_signals)
+    start_here = _build_start_here(representative_files, framework_hints)
+    topology = _build_topology(repo_root, representative_files, framework_hints, indexed_hints=indexed_hints)
 
     result = {
+        "mode": "single",
         "repo_root": str(_repo_root),
         "index": {
+            "status": "ready" if stats["files"] > 0 else "empty",
+            "db_path": str(_db_path),
             "files": stats["files"],
             "symbols": stats["symbols"],
             "edges": stats["edges"],
             "db_size_mb": stats["db_size_mb"],
         },
+        "brief": _build_repo_brief(framework_hints, start_here, indexed=True),
+        "framework_hints": framework_hints,
+        "representative_files": representative_files,
+        "topology": topology,
+        "start_here": start_here,
         "languages": stats["languages"],
         "symbol_kinds": stats["symbol_kinds"],
         "directories": db.directory_summary(max_depth=2),
@@ -473,6 +1293,9 @@ def search_symbols(
     """
     _record_query()
     if _is_workspace_mode():
+        project_error = _workspace_project_not_found_error(project)
+        if project_error is not None:
+            return project_error
         wdb = _get_workspace_db()
         results = wdb.search_symbols(query, kind=kind, project=project, limit=limit)
     else:
@@ -480,12 +1303,27 @@ def search_symbols(
         results = db.search_symbols(query, kind=kind, limit=limit)
 
     if not results:
-        return json.dumps({
+        payload: dict[str, object] = {
             "query": query,
             "result_count": 0,
             "results": [],
-            "hint": f"No keyword matches. Try hybrid_search(\"{query}\") for semantic matching.",
-        }, indent=2)
+            "hint": f"No keyword matches. Try {_tool_call('hybrid_search', query, project=project)} for semantic matching.",
+        }
+        tokenized = tokenized_query_hint(query)
+        if tokenized:
+            payload["suggestions"] = [
+                f"Try {_tool_call('search_symbols', tokenized, project=project)} for tokenized identifier search",
+                f"Try {_tool_call('hybrid_search', tokenized, project=project)} for concept + keyword search",
+            ]
+            payload["hint"] = (
+                f"No keyword matches. Try {_tool_call('search_symbols', tokenized, project=project)} "
+                f"or {_tool_call('hybrid_search', tokenized, project=project)}."
+            )
+        else:
+            suggestions = _symbol_name_suggestions(query, project=project)
+            if suggestions:
+                payload["did_you_mean"] = suggestions
+        return json.dumps(payload, indent=2)
 
     return json.dumps(results, indent=2)
 
@@ -509,7 +1347,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
         wdb = _get_workspace_db()
         results = wdb.get_symbol(name, project=project)
         if not results:
-            return _symbol_not_found_error(name)
+            return _symbol_not_found_error(name, project)
         if len(results) == 1:
             return json.dumps(results[0], indent=2)
         return json.dumps({"match_count": len(results), "symbols": results}, indent=2)
@@ -613,7 +1451,6 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
         wdb = _get_workspace_db()
         all_results = []
         for batch in wdb._iter_batches(project_filter=project):
-            from .workspace import _sanitize_schema_name
             for schema, project_name in batch:
                 try:
                     rows = wdb.conn.execute(
@@ -695,7 +1532,7 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
     for entry in by_name.values():
         locations = entry.pop("_locations")
         if len(locations) > 1:
-            entry["locations"] = [{"file": f, "line": l} for f, l in locations]
+            entry["locations"] = [{"file": file_path, "line": line} for file_path, line in locations]
         result.append(entry)
 
     result.sort(key=lambda r: (
@@ -1054,7 +1891,53 @@ def index_status() -> str:
             "projects": projects,
         }, indent=2)
 
-    db = _get_db()
+    repo_root, db_path = _resolve_single_repo_context()
+    if repo_root is None or db_path is None or not db_path.exists() or db_path.stat().st_size == 0:
+        return json.dumps({
+            "mode": "single",
+            "repo_root": str(repo_root) if repo_root is not None else None,
+            "db_path": str(db_path) if db_path is not None else None,
+            "bootstrap_mode": "filesystem_only",
+            "index": {
+                "status": "not_indexed",
+                "db_path": str(db_path) if db_path is not None else None,
+                "present": bool(db_path and db_path.exists()),
+            },
+            "hint": (
+                "Repo is not indexed yet. Run `srclight index --embed` "
+                f"from {shlex.quote(str(repo_root))}."
+            ),
+            "next_actions": [
+                f"Run: srclight index {shlex.quote(str(repo_root))} --embed",
+                "Call index_status() again after indexing.",
+                "Use codebase_map() for a filesystem-only brief.",
+            ],
+        }, indent=2)
+
+    try:
+        db = _get_db()
+    except (AssertionError, OSError, sqlite3.Error):
+        return json.dumps({
+            "mode": "single",
+            "repo_root": str(repo_root),
+            "db_path": str(db_path),
+            "bootstrap_mode": "filesystem_only",
+            "index": {
+                "status": "not_indexed",
+                "db_path": str(db_path),
+                "present": bool(db_path.exists()),
+            },
+            "hint": (
+                "Repo is not indexed yet. Run `srclight index --embed` "
+                f"from {shlex.quote(str(repo_root))}."
+            ),
+            "next_actions": [
+                f"Run: srclight index {shlex.quote(str(repo_root))} --embed",
+                "Call index_status() again after indexing.",
+                "Use codebase_map() for a filesystem-only brief.",
+            ],
+        }, indent=2)
+
     stats = db.stats()
     state = db.get_index_state(str(_repo_root)) if _repo_root else None
 
@@ -1481,6 +2364,10 @@ def semantic_search(
     _record_query()
     from .embeddings import get_provider, vector_to_bytes
 
+    project_error = _workspace_project_not_found_error(project)
+    if project_error is not None:
+        return project_error
+
     # Determine which model was used for embeddings
     if _is_workspace_mode():
         wdb = _get_workspace_db()
@@ -1491,8 +2378,8 @@ def semantic_search(
 
     if not emb_stats.get("model"):
         return json.dumps({
-            "error": "No embeddings found. Run 'srclight index --embed <model>' first.",
-            "hint": "Try: srclight index --embed qwen3-embedding",
+            "error": "No embeddings found. Run 'srclight index --embed' first.",
+            "hint": f"Try: srclight index --embed (defaults to {DEFAULT_OLLAMA_EMBED_MODEL})",
         })
 
     model_name = emb_stats["model"]
@@ -1542,6 +2429,10 @@ def hybrid_search(
     """
     _record_query()
     from .embeddings import get_provider, rrf_merge, vector_to_bytes
+
+    project_error = _workspace_project_not_found_error(project)
+    if project_error is not None:
+        return project_error
 
     # Get FTS results
     if _is_workspace_mode():
@@ -1624,6 +2515,10 @@ def embedding_status(project: str | None = None) -> str:
     Args:
         project: Project name (workspace mode) or uses current repo
     """
+    project_error = _workspace_project_not_found_error(project)
+    if project_error is not None:
+        return project_error
+
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         stats = wdb.embedding_stats(project=project)
@@ -1632,7 +2527,10 @@ def embedding_status(project: str | None = None) -> str:
         stats = db.embedding_stats()
 
     if not stats.get("model"):
-        stats["hint"] = "Run 'srclight index --embed <model>' to generate embeddings"
+        stats["hint"] = (
+            "Run 'srclight index --embed' to generate embeddings "
+            f"(defaults to {DEFAULT_OLLAMA_EMBED_MODEL})"
+        )
 
     return json.dumps(stats, indent=2)
 
@@ -1646,6 +2544,10 @@ def embedding_health(project: str | None = None) -> str:
     Returns a JSON blob with status, model, and any error message so
     clients can surface problems instead of silently degrading.
     """
+    project_error = _workspace_project_not_found_error(project)
+    if project_error is not None:
+        return project_error
+
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         stats = wdb.embedding_stats(project=project)
@@ -1656,7 +2558,10 @@ def embedding_health(project: str | None = None) -> str:
     if not stats.get("model"):
         return json.dumps({
             "status": "no_embeddings",
-            "detail": "No embeddings found in the index. Run 'srclight index --embed <model>' first.",
+            "detail": (
+                "No embeddings found in the index. "
+                f"Run 'srclight index --embed' first (defaults to {DEFAULT_OLLAMA_EMBED_MODEL})."
+            ),
             "stats": stats,
         }, indent=2)
 
@@ -2222,9 +3127,40 @@ async def setup_guide() -> str:
 
     return json.dumps({
         "title": "Srclight setup guide for agents",
+        "quick_start": [
+            "Call codebase_map() first in every new session.",
+            "Prefer stdio for local agent clients: srclight serve --transport stdio.",
+            "Use hybrid_search(query) as the default code-discovery tool.",
+            "Bare --embed defaults to "
+            f"{DEFAULT_OLLAMA_EMBED_MODEL}.",
+            "After server upgrades, restart both the server and the MCP client/editor session.",
+        ],
+        "decision_tree": [
+            {
+                "when": "Need repo orientation",
+                "use": "codebase_map()",
+            },
+            {
+                "when": "Need to find code by concept or mixed keywords",
+                "use": "hybrid_search(query)",
+            },
+            {
+                "when": "Need exact symbol source",
+                "use": "get_symbol(name)",
+            },
+            {
+                "when": "Need setup or indexing help for the user",
+                "use": "setup_guide()",
+            },
+        ],
         "config_location": {
             "workspaces_dir": str(WORKSPACES_DIR),
             "description": "Workspace configs are JSON files: ~/.srclight/workspaces/{name}.json",
+        },
+        "client_snippets": {
+            "stdio_command": "srclight serve --transport stdio",
+            "cursor_mcp_url": "http://127.0.0.1:8742/mcp",
+            "cursor_transport_notes": "Prefer stdio for local agents. Use Streamable HTTP /mcp or SSE /sse only for HTTP clients such as Cursor.",
         },
         "steps": [
             {
@@ -2240,9 +3176,14 @@ async def setup_guide() -> str:
                 "title": "Index the workspace (optionally with embeddings)",
                 "commands": [
                     "srclight workspace index -w WORKSPACE_NAME",
-                    "srclight workspace index -w WORKSPACE_NAME --embed qwen3-embedding",
+                    "srclight workspace index -w WORKSPACE_NAME --embed",
                 ],
-                "notes": "Ollama on localhost:11434 for qwen3-embedding. Server hot-reloads; no restart needed after indexing.",
+                "notes": (
+                    "Bare --embed defaults to "
+                    f"{DEFAULT_OLLAMA_EMBED_MODEL}. Ollama runs on localhost:11434. "
+                    "The MCP reindex() tool refreshes the live server in place. "
+                    "After external CLI indexing, restart the server/client if you need fresh sidecars immediately."
+                ),
             },
             {
                 "step": 3,
@@ -2251,16 +3192,32 @@ async def setup_guide() -> str:
             },
             {
                 "step": 4,
-                "title": "Start the MCP server and connect Cursor",
+                "title": "Start stdio for local agents or SSE for HTTP clients",
                 "commands": [
-                    "srclight serve --workspace WORKSPACE_NAME",
-                    "# Or with web dashboard: srclight serve --workspace WORKSPACE_NAME --web",
+                    "srclight serve --workspace WORKSPACE_NAME --transport stdio",
+                    "# Cursor / HTTP: srclight serve --workspace WORKSPACE_NAME --transport sse",
+                    "# Or with web dashboard: srclight serve --workspace WORKSPACE_NAME --transport sse --web",
                 ],
-                "notes": "Server binds to 127.0.0.1:8742. In Cursor MCP config use URL http://127.0.0.1:8742 (Streamable HTTP /mcp or SSE /sse). Start server before opening Cursor.",
+                "notes": "Prefer stdio for Codex/Claude/local MCP clients. SSE/Streamable HTTP binds to 127.0.0.1:8742 for Cursor or the optional web dashboard.",
+            },
+        ],
+        "troubleshooting": [
+            {
+                "problem": "No embeddings found",
+                "action": f"Run srclight index --embed or srclight workspace index --embed (defaults to {DEFAULT_OLLAMA_EMBED_MODEL}).",
+            },
+            {
+                "problem": "MCP tools fail after server restart",
+                "action": "Restart the editor/CLI so the MCP client reconnects and rediscovers tools.",
+            },
+            {
+                "problem": "Workspace tool asks for project",
+                "action": "Call list_projects() and retry with one of the returned project names.",
             },
         ],
         "for_agents": "Call codebase_map() at session start. Use list_projects() to see repos. Use setup_guide() to get these steps for the user.",
         "after_upgrade": "After upgrading srclight (pip install -U srclight), restart the server and then restart your editor/CLI to pick up new tools. Existing MCP sessions only discover tools at connect time.",
+        "next_action": "If the repo is not indexed yet, run the index command from step 2. If the server is already running, call codebase_map() next.",
     }, indent=2)
 
 

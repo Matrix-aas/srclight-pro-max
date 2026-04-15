@@ -1,13 +1,10 @@
 """Tests for git hook install/uninstall."""
 
-import os
 import stat
-from pathlib import Path
 
 import pytest
 
 from srclight.cli import (
-    _HOOK_MARKER_END,
     _HOOK_MARKER_START,
     _install_hooks_in_repo,
     _uninstall_hooks_in_repo,

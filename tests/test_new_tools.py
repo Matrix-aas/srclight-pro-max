@@ -1,6 +1,5 @@
 """Tests for new analysis tools: find_dead_code, find_pattern, find_imports."""
 
-from pathlib import Path
 
 import pytest
 
@@ -48,7 +47,7 @@ class TestFindDeadCode:
         """Symbols with no incoming edges are returned as dead code."""
         fid = _insert_file(db)
         _insert_symbol(db, fid, "used_fn", start_line=1, end_line=3)
-        dead_id = _insert_symbol(db, fid, "unused_fn", start_line=5, end_line=8)
+        _insert_symbol(db, fid, "unused_fn", start_line=5, end_line=8)
         caller_id = _insert_symbol(db, fid, "caller", start_line=10, end_line=15,
                                    content="def caller(): used_fn()")
 
@@ -411,7 +410,7 @@ class TestFindImportsIntegration:
         (proj / "db.py").write_text("class Database: pass\n")
 
         # Index: register files and symbols
-        fid_main = _insert_file(db, "main.py", language="python")
+        _insert_file(db, "main.py", language="python")
         fid_db = _insert_file(db, "db.py", language="python")
         _insert_symbol(db, fid_db, "Database", file_path="db.py", kind="class",
                        start_line=1, end_line=1, content="class Database: pass")
@@ -446,7 +445,7 @@ class TestFindImportsIntegration:
             "const utils = require('./utils');\n"
         )
 
-        fid_app = _insert_file(db, "app.js", language="javascript")
+        _insert_file(db, "app.js", language="javascript")
         fid_renderer = _insert_file(db, "renderer.js", language="javascript")
         _insert_symbol(db, fid_renderer, "render", file_path="renderer.js",
                        kind="function", start_line=1, end_line=5,

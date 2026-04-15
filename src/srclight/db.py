@@ -10,18 +10,47 @@ import hashlib
 import json
 import re
 import sqlite3
-from dataclasses import dataclass, field
+import struct
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
+from .vector_math import cosine_top_k, decode_matrix
 
 # Paths that indicate vendored/third-party code
 VENDORED_PREFIXES = ("third_party/", "third-party/", "vendor/", "ext/", "depends/")
+DOC_PATH_HINTS = ("docs/",)
+DOC_FILENAMES = {"readme.md", "claude.md", "agents.md", "contributing.md"}
 
 
 def is_vendored_path(path: str) -> bool:
     """Check if a file path is in a vendored/third-party directory."""
     return any(path.startswith(p) or f"/{p}" in path for p in VENDORED_PREFIXES)
+
+
+def is_documentation_path(path: str) -> bool:
+    """Check if a file path is primarily documentation-oriented."""
+    lower = path.lower()
+    return (
+        lower.endswith(".md")
+        or any(lower.startswith(prefix) for prefix in DOC_PATH_HINTS)
+        or Path(lower).name in DOC_FILENAMES
+    )
+
+
+def is_code_like_query(query: str) -> bool:
+    """Heuristic for queries that are likely targeting code, not prose docs."""
+    query_lower = query.lower()
+    if re.search(r"\b(?:use|define)[A-Z]", query):
+        return True
+
+    keywords = {
+        "css", "emits", "fetch", "graphql", "i18n", "locale", "module", "mutation",
+        "nuxt", "props", "query", "route", "router", "store", "subscription",
+        "template", "vue",
+    }
+    matched = sum(1 for token in keywords if token in query_lower)
+    return matched >= 2
 
 
 def split_identifier(name: str) -> str:
@@ -68,6 +97,151 @@ def split_identifier(name: str) -> str:
     result_parts.extend(lower_parts)
 
     return " ".join(result_parts)
+
+
+def tokenized_query_hint(query: str) -> str | None:
+    """Return a spaced identifier variant for compact code-like queries."""
+    if not query:
+        return None
+
+    raw_tokens = [token.lower() for token in re.findall(r"[A-Za-z0-9]+", query)]
+    split_tokens = [token.lower() for token in re.findall(r"[A-Za-z0-9]+", split_identifier(query))]
+    if not split_tokens:
+        return None
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for token in split_tokens:
+        if token not in seen:
+            deduped.append(token)
+            seen.add(token)
+
+    variant = " ".join(deduped).strip()
+    if not variant:
+        return None
+
+    raw_normalized = " ".join(raw_tokens)
+    if variant == raw_normalized and not re.search(r"[^A-Za-z0-9\s]", query):
+        return None
+    return variant
+
+
+def _search_query_variants(query: str) -> list[str]:
+    """Return a small set of retrieval-friendly query variants."""
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _add(text: str | None) -> None:
+        normalized = (text or "").strip()
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        variants.append(normalized)
+
+    query_tokens = _search_query_tokens(query)
+
+    _add(query)
+    _add(split_identifier(query))
+    _add(tokenized_query_hint(query))
+
+    if "rmq" in query_tokens:
+        _add(re.sub(r"\brmq\b", "rabbitmq", query, flags=re.IGNORECASE))
+        _add("rabbitmq consumer handler")
+    if "rabbitmq" in query_tokens:
+        _add("rabbitmq consumer handler")
+    if "message_pattern" in query_tokens:
+        _add("message pattern")
+        _add("messagepattern")
+        _add("message pattern handler")
+    if "event_handler" in query_tokens or "event" in query_tokens:
+        _add("event handler")
+    if "queue" in query_tokens or "worker" in query_tokens:
+        _add("queue worker")
+    if "cron" in query_tokens or "schedule" in query_tokens:
+        _add("scheduled job")
+
+    return variants
+
+
+def _metadata_like_patterns(query: str) -> list[str]:
+    """Return narrow metadata LIKE patterns for retrieval fallbacks."""
+    patterns: list[str] = []
+    seen: set[str] = set()
+
+    def _add(value: str | None) -> None:
+        normalized = (value or "").strip().lower()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        patterns.append(f"%{normalized}%")
+
+    query_tokens = _search_query_tokens(query)
+    tokenized_hint = tokenized_query_hint(query)
+
+    _add(query)
+    _add(tokenized_hint)
+
+    if "message_pattern" in query_tokens:
+        _add("message_pattern")
+        _add("event_pattern")
+        _add("pattern")
+    if "event_handler" in query_tokens:
+        _add("event_pattern")
+    if "rmq" in query_tokens:
+        _add("rmq")
+        _add("rabbitmq")
+    if "rabbitmq" in query_tokens:
+        _add("rabbitmq")
+    if "redis" in query_tokens:
+        _add("redis")
+    if query_tokens & {"bootstrap", "config", "configuration", "module", "runtime", "setup"}:
+        _add("bootstrap")
+        _add("config")
+        _add("connection_url")
+
+    return patterns
+
+
+def _search_query_tokens(query: str) -> set[str]:
+    """Normalize query text into tokens for ranking heuristics."""
+    tokens: set[str] = set()
+    for text in (query, split_identifier(query)):
+        for token in re.findall(r"[A-Za-z0-9]+", (text or "").lower()):
+            if not token:
+                continue
+            tokens.add(token)
+            if token.endswith("ies") and len(token) > 4:
+                tokens.add(token[:-3] + "y")
+            elif token.endswith("s") and len(token) > 3:
+                tokens.add(token[:-1])
+
+    if {"mikro", "orm"} <= tokens:
+        tokens.add("mikroorm")
+    if {"type", "orm"} <= tokens:
+        tokens.add("typeorm")
+    if {"graph", "ql"} <= tokens or "graphql" in tokens:
+        tokens.add("graphql")
+    if "rmq" in tokens:
+        tokens.add("rabbitmq")
+    if {"message", "pattern"} <= tokens:
+        tokens.add("message_pattern")
+    if {"event", "handler"} <= tokens:
+        tokens.add("event_handler")
+
+    return tokens
+
+
+def _compact_identifier(text: str) -> str:
+    """Normalize an identifier-like string into a compact comparison key."""
+    return "".join(re.findall(r"[A-Za-z0-9]+", (text or "").lower()))
+
+
+def _normalized_token_phrase(text: str) -> str:
+    """Normalize arbitrary text into a comparable token phrase."""
+    return " ".join(re.findall(r"[A-Za-z0-9]+", (text or "").lower())).strip()
 
 SCHEMA_VERSION = 5
 
@@ -544,6 +718,433 @@ class Database:
 
         return [self._row_to_symbol(r) for r in rows]
 
+    def orientation_symbols(self, limit: int = 200) -> list[dict[str, Any]]:
+        """Fetch a bounded, category-aware sample of orientation-relevant symbols."""
+        assert self.conn is not None
+        chunk = max(24, limit // 5)
+        bucket_queries = (
+            (
+                """SELECT s.kind, s.name, s.signature, s.metadata, f.path AS file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE f.path IN ('src/main.ts', 'src/main.js', 'main.ts', 'main.js', 'server.ts')
+                      OR json_extract(s.metadata, '$.resource') = 'bootstrap'
+                   ORDER BY CASE
+                        WHEN json_extract(s.metadata, '$.resource') = 'bootstrap' THEN 0
+                        WHEN f.path IN ('src/main.ts', 'src/main.js', 'main.ts', 'main.js', 'server.ts') THEN 1
+                        ELSE 2
+                   END, f.path, s.start_line
+                   LIMIT ?""",
+                chunk,
+            ),
+            (
+                """SELECT s.kind, s.name, s.signature, s.metadata, f.path AS file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE s.kind IN ('controller', 'route')
+                      OR json_extract(s.metadata, '$.resource') IN ('controller', 'route')
+                      OR json_extract(s.metadata, '$.route_prefix') IS NOT NULL
+                      OR json_extract(s.metadata, '$.route_path') IS NOT NULL
+                      OR json_extract(s.metadata, '$.http_method') IS NOT NULL
+                   ORDER BY CASE
+                        WHEN s.kind = 'controller' THEN 0
+                        WHEN json_extract(s.metadata, '$.resource') = 'controller' THEN 1
+                        ELSE 2
+                   END, f.path, s.start_line
+                   LIMIT ?""",
+                chunk,
+            ),
+            (
+                """SELECT s.kind, s.name, s.signature, s.metadata, f.path AS file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE lower(COALESCE(json_extract(s.metadata, '$.framework'), '')) IN ('prisma', 'drizzle', 'mongoose', 'mikroorm')
+                      OR lower(COALESCE(json_extract(s.metadata, '$.resource'), '')) IN ('database', 'model', 'entity', 'repository')
+                   ORDER BY f.path, s.start_line
+                   LIMIT ?""",
+                chunk,
+            ),
+            (
+                """SELECT s.kind, s.name, s.signature, s.metadata, f.path AS file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE s.kind IN ('queue_processor', 'microservice_handler', 'scheduled_job')
+                      OR lower(COALESCE(json_extract(s.metadata, '$.resource'), '')) IN ('processor', 'consumer', 'worker', 'queue', 'scheduler')
+                      OR lower(COALESCE(json_extract(s.metadata, '$.framework'), '')) IN ('bullmq', 'rabbitmq', 'redis')
+                      OR lower(COALESCE(json_extract(s.metadata, '$.transport'), '')) IN ('bullmq', 'rabbitmq', 'redis')
+                   ORDER BY CASE
+                        WHEN s.kind IN ('queue_processor', 'microservice_handler', 'scheduled_job') THEN 0
+                        ELSE 1
+                   END, f.path, s.start_line
+                   LIMIT ?""",
+                chunk,
+            ),
+            (
+                """SELECT s.kind, s.name, s.signature, s.metadata, f.path AS file_path
+                   FROM symbols s
+                   JOIN files f ON s.file_id = f.id
+                   WHERE lower(COALESCE(json_extract(s.metadata, '$.resource'), '')) IN ('module', 'config', 'bootstrap')
+                      OR s.kind IN ('module', 'config')
+                      OR f.path LIKE '%/bootstrap/%'
+                   ORDER BY CASE
+                        WHEN lower(COALESCE(json_extract(s.metadata, '$.resource'), '')) = 'module' THEN 0
+                        WHEN s.kind = 'module' THEN 1
+                        WHEN lower(COALESCE(json_extract(s.metadata, '$.resource'), '')) = 'config' THEN 2
+                        ELSE 3
+                   END, f.path, s.start_line
+                   LIMIT ?""",
+                chunk,
+            ),
+        )
+
+        rows = []
+        seen: set[tuple[str, str, str]] = set()
+        for query, bucket_limit in bucket_queries:
+            for row in self.conn.execute(query, (bucket_limit,)).fetchall():
+                row_key = (row["file_path"], row["kind"], row["name"])
+                if row_key in seen:
+                    continue
+                seen.add(row_key)
+                rows.append(row)
+                if len(rows) >= limit:
+                    break
+            if len(rows) >= limit:
+                break
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = None
+            results.append({
+                "kind": row["kind"],
+                "name": row["name"],
+                "signature": row["signature"],
+                "file_path": row["file_path"],
+                "metadata": metadata or {},
+            })
+        return results
+
+    def suggest_symbol_name_matches(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Suggest nearby symbol names with ranking metadata."""
+        assert self.conn is not None
+        tokens = [token for token in re.findall(r"[A-Za-z0-9]+", split_identifier(query).lower()) if token]
+        if not tokens:
+            return []
+
+        query_tokens = _search_query_tokens(query)
+        compact_query = _compact_identifier(query)
+        compact_pattern = "%" + "%".join(dict.fromkeys(tokens[:4])) + "%"
+        clauses = ["s.name LIKE ? COLLATE NOCASE"]
+        params: list[Any] = [compact_pattern]
+
+        for token in dict.fromkeys(tokens[:4]):
+            clauses.append("s.name LIKE ? COLLATE NOCASE")
+            params.append(f"%{token}%")
+
+        rows = self.conn.execute(
+            f"""SELECT DISTINCT s.name
+               FROM symbols s
+               WHERE {" OR ".join(clauses)}
+               ORDER BY
+                   CASE WHEN s.name = ? THEN 0
+                        WHEN s.name LIKE ? COLLATE NOCASE THEN 1
+                        WHEN s.name LIKE ? COLLATE NOCASE THEN 2
+                        ELSE 3 END,
+                   length(s.name),
+                   s.name
+               LIMIT ?""",
+            params + [query, f"{query}%", compact_pattern, limit * 4],
+        ).fetchall()
+
+        matches: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            name = row["name"]
+            if name and name not in seen:
+                name_tokens = _search_query_tokens(name)
+                compact_name = _compact_identifier(name)
+                missing_tokens = len(query_tokens - name_tokens)
+                overlap = len(query_tokens & name_tokens)
+                score = (
+                    missing_tokens,
+                    0 if compact_name.startswith(compact_query) else 1 if compact_query and compact_query in compact_name else 2,
+                    -overlap,
+                    abs(len(name_tokens) - len(query_tokens)),
+                    len(name),
+                    name.lower(),
+                )
+                matches.append({"name": name, "score": score})
+                seen.add(name)
+            if len(matches) >= limit:
+                break
+
+        matches.sort(key=lambda item: item["score"])
+        return matches[:limit]
+
+    def suggest_symbol_names(self, query: str, limit: int = 5) -> list[str]:
+        """Suggest nearby symbol names for miss hints."""
+        return [item["name"] for item in self.suggest_symbol_name_matches(query, limit=limit)]
+
+    def _search_rank_context(self, symbol_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Fetch metadata needed for post-FTS ranking."""
+        assert self.conn is not None
+        if not symbol_ids:
+            return {}
+
+        placeholders = ",".join("?" for _ in symbol_ids)
+        params = symbol_ids + symbol_ids + symbol_ids
+        rows = self.conn.execute(
+            f"""WITH outgoing AS (
+                   SELECT source_id AS symbol_id, COUNT(*) AS n
+                   FROM symbol_edges
+                   WHERE source_id IN ({placeholders})
+                   GROUP BY source_id
+               ),
+               incoming AS (
+                   SELECT target_id AS symbol_id, COUNT(*) AS n
+                   FROM symbol_edges
+                   WHERE target_id IN ({placeholders})
+                   GROUP BY target_id
+               )
+               SELECT s.id AS symbol_id,
+                      s.metadata AS metadata,
+                      COALESCE(outgoing.n, 0) + COALESCE(incoming.n, 0) AS edge_count
+               FROM symbols s
+               LEFT JOIN outgoing ON outgoing.symbol_id = s.id
+               LEFT JOIN incoming ON incoming.symbol_id = s.id
+               WHERE s.id IN ({placeholders})""",
+            params,
+        ).fetchall()
+
+        context: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    metadata = None
+            context[int(row["symbol_id"])] = {
+                "metadata": metadata or {},
+                "edge_count": int(row["edge_count"] or 0),
+            }
+        return context
+
+    def _rerank_search_results(
+        self, results: list[dict[str, Any]], query: str, code_like_query: bool
+    ) -> None:
+        """Apply query-aware boosts after candidate collection."""
+        if not results:
+            return
+
+        context = self._search_rank_context([int(result["symbol_id"]) for result in results])
+        query_tokens = _search_query_tokens(query)
+        framework_terms = {
+            token
+            for token in query_tokens
+            if token in {"drizzle", "elysia", "graphql", "mikroorm", "mongoose", "nestjs", "nitro", "nuxt", "typeorm"}
+        }
+        route_intent = bool(query_tokens & {"api", "endpoint", "http", "path", "route", "router"})
+        persistence_intent = bool(
+            query_tokens
+            & {"database", "db", "drizzle", "entity", "mikroorm", "mongoose", "orm", "persistence", "repository", "schema", "table", "typeorm"}
+        )
+        async_intent_tokens = {
+            "bootstrap",
+            "config",
+            "configuration",
+            "consumer",
+            "cron",
+            "event",
+            "event_handler",
+            "handler",
+            "message_pattern",
+            "queue",
+            "rabbitmq",
+            "redis",
+            "rmq",
+            "runtime",
+            "schedule",
+            "setup",
+            "worker",
+        }
+        async_intent = bool(query_tokens & async_intent_tokens)
+        async_transport_query = bool(query_tokens & {"rabbitmq", "redis", "rmq"})
+        async_config_intent = async_transport_query and bool(
+            query_tokens & {"bootstrap", "config", "configuration", "module", "runtime", "setup"}
+        )
+        backend_intent = (
+            code_like_query or route_intent or persistence_intent or async_intent or bool(framework_terms)
+        )
+
+        route_kinds = {"route", "router", "route_handler"}
+        persistence_kinds = {"database", "entity", "repository"}
+        entrypoint_kinds = route_kinds | {"database", "mutation", "plugin", "query", "subscription"}
+        route_paths = ("api/", "controllers/", "endpoints/", "routes/", "server/api/")
+        persistence_paths = ("database/", "db/", "entities/", "models/", "persistence/", "repositories/", "schemas/")
+        async_kinds = {"microservice_handler", "queue_processor", "scheduled_job"}
+        async_support_kinds = {"queue", "transport", "worker"}
+        async_paths = (
+            "async/",
+            "bootstrap",
+            "bullmq",
+            "config/",
+            "configs/",
+            "consumer",
+            "consumers/",
+            "cron",
+            "events/",
+            "jobs/",
+            "messaging/",
+            "queues/",
+            "scheduler",
+            "workers/",
+        )
+        async_transport_terms = {"amqplib", "rabbitmq", "redis", "rmq"}
+        async_config_paths = ("bootstrap", "config/", "configs/", "main.", "module", "runtime")
+        query_compact = _compact_identifier(query)
+        query_phrase = _normalized_token_phrase(query)
+        pattern_query = bool(re.search(r"[./:-]", query)) and len(query_tokens) >= 2
+
+        for row in results:
+            rank = float(row.get("rank", 0))
+            file_path = str(row.get("file", "")).lower()
+            sym_kind = str(row.get("kind", "")).lower()
+            name_tokens = _search_query_tokens(row.get("name", "") or "")
+            overlap = len(query_tokens & name_tokens)
+            if overlap:
+                rank -= min(overlap * 0.8, 3.2)
+
+            row_context = context.get(int(row["symbol_id"]), {})
+            metadata = row_context.get("metadata") or {}
+            framework = re.sub(r"[^a-z0-9]+", "", str(metadata.get("framework") or "").lower())
+            resource = str(metadata.get("resource") or "").lower()
+            edge_count = int(row_context.get("edge_count") or 0)
+            transport = str(metadata.get("transport") or "").lower()
+            role = str(metadata.get("role") or "").lower()
+            pattern_values = [
+                str(metadata.get(key) or "")
+                for key in ("pattern", "message_pattern", "event_pattern")
+                if metadata.get(key)
+            ]
+            pattern_compact_matches = any(_compact_identifier(value) == query_compact for value in pattern_values)
+            pattern_phrase_matches = any(_normalized_token_phrase(value) == query_phrase for value in pattern_values)
+            has_async_metadata = bool(
+                pattern_values
+                or transport
+                or role
+                or any(
+                    metadata.get(key)
+                    for key in ("queue_name", "cron", "every_ms", "interval_name", "connection_url")
+                )
+            )
+
+            if backend_intent and is_documentation_path(file_path):
+                rank += 8.0
+
+            if pattern_query:
+                if pattern_compact_matches or pattern_phrase_matches:
+                    rank -= 14.0
+                elif is_documentation_path(file_path):
+                    rank += 6.0
+
+            if route_intent:
+                if sym_kind in route_kinds or resource in route_kinds:
+                    rank -= 12.0
+                elif sym_kind in {"controller", "module"} or resource in {"controller", "module"}:
+                    rank -= 4.0
+                if any(marker in file_path for marker in route_paths):
+                    rank -= 5.0
+                if metadata.get("http_method") or metadata.get("route_path") or metadata.get("route_prefix"):
+                    rank -= 2.5
+
+            if persistence_intent:
+                if sym_kind in persistence_kinds or resource in persistence_kinds:
+                    rank -= 12.0
+                elif sym_kind in {"schema", "table"} or resource in {"schema", "table"}:
+                    rank -= 7.0
+                if any(marker in file_path for marker in persistence_paths):
+                    rank -= 5.0
+                if any(
+                    metadata.get(key)
+                    for key in ("collection_name", "entity_name", "entity_names", "table_name")
+                ):
+                    rank -= 2.5
+
+            if async_intent:
+                if sym_kind in async_kinds or resource in async_kinds:
+                    rank -= 12.0
+                elif sym_kind in async_support_kinds or resource in async_support_kinds:
+                    rank -= 7.0
+                if any(marker in file_path for marker in async_paths):
+                    rank -= 5.0
+                if any(
+                    metadata.get(key)
+                    for key in (
+                        "event_pattern",
+                        "message_pattern",
+                        "pattern",
+                        "queue_name",
+                        "cron",
+                        "every_ms",
+                        "interval_name",
+                    )
+                ):
+                    rank -= 3.0
+                if (transport in async_transport_terms) or (framework in async_transport_terms):
+                    rank -= 3.5
+                if transport == "rmq":
+                    rank -= 1.0
+                if role and role in query_tokens:
+                    rank -= 2.0
+                if "handler" in query_tokens and (sym_kind == "microservice_handler" or resource == "microservice_handler"):
+                    rank -= 4.0
+                if "worker" in query_tokens and (sym_kind == "queue_processor" or resource == "queue_processor"):
+                    rank -= 4.0
+                if ("cron" in query_tokens or "schedule" in query_tokens) and (
+                    sym_kind == "scheduled_job" or resource == "scheduled_job"
+                ):
+                    rank -= 4.0
+                if pattern_compact_matches or pattern_phrase_matches:
+                    rank -= 10.0
+                elif pattern_values and ({"message", "pattern"} <= query_tokens or {"event", "pattern"} <= query_tokens):
+                    rank -= 4.0
+                if async_transport_query and not has_async_metadata and is_documentation_path(file_path):
+                    rank += 6.0
+
+            if async_config_intent:
+                async_config_candidate = (
+                    (transport in async_transport_terms)
+                    or (framework in async_transport_terms)
+                    or any(term in file_path for term in async_transport_terms)
+                )
+                if async_config_candidate:
+                    if resource in {"module", "transport"} or sym_kind in {"module", "transport"}:
+                        rank -= 8.0
+                    if any(marker in file_path for marker in async_config_paths):
+                        rank -= 6.0
+                    if metadata.get("connection_url"):
+                        rank -= 3.5
+                    if role in {"bootstrap", "client", "config", "producer"}:
+                        rank -= 2.5
+                elif is_documentation_path(file_path):
+                    rank += 4.0
+
+            if framework_terms and framework in framework_terms:
+                rank -= 10.0
+
+            if sym_kind in entrypoint_kinds or resource in entrypoint_kinds:
+                rank -= 2.5
+
+            if edge_count > 0:
+                rank -= min(edge_count, 8) * 0.35
+
+            row["rank"] = rank
+
     def get_symbol_by_id(self, symbol_id: int) -> SymbolRecord | None:
         assert self.conn is not None
         row = self.conn.execute(
@@ -576,8 +1177,7 @@ class Database:
         if isinstance(d.get("metadata"), str):
             d["metadata"] = json.loads(d["metadata"])
         # Filter to only SymbolRecord fields (joined queries may add extras)
-        import dataclasses
-        valid_fields = {f.name for f in dataclasses.fields(SymbolRecord)}
+        valid_fields = {f.name for f in fields(SymbolRecord)}
         d = {k: v for k, v in d.items() if k in valid_fields}
         return SymbolRecord(**d)
 
@@ -604,6 +1204,7 @@ class Database:
         # High-value kinds that agents typically search for
         _PRIMARY_KINDS = {"class", "struct", "interface", "enum", "function", "method"}
         query_lower = query.lower()
+        code_like_query = is_code_like_query(query)
 
         def _add_row(row_dict: dict) -> None:
             sid = row_dict["symbol_id"]
@@ -621,6 +1222,8 @@ class Database:
                 # Boost primary symbol kinds (class/struct > prototype/namespace)
                 if sym_kind in _PRIMARY_KINDS:
                     rank -= 5.0
+                if code_like_query and sym_kind == "component":
+                    rank -= 4.0
                 # Name length normalization: shorter names closer to query length
                 # are more relevant (ICaptureService > CaptureServiceImpl::OnHover)
                 query_len = len(query)
@@ -634,6 +1237,10 @@ class Database:
                     row_dict["vendored"] = True
                 elif file_path.startswith("bindings/"):
                     rank += 3.0  # Slight penalty vs core src/
+                if code_like_query and (
+                    sym_kind in {"section", "document"} or is_documentation_path(file_path)
+                ):
+                    rank += 18.0
                 row_dict["rank"] = rank
                 results.append(row_dict)
                 seen_ids.add(sid)
@@ -644,8 +1251,7 @@ class Database:
 
         # Tier 1: FTS5 on symbol names (includes tokenized name_tokens column)
         try:
-            query_tokens = split_identifier(query)
-            for fts_query in [query, query_tokens]:
+            for fts_query in _search_query_variants(query):
                 if not fts_query or len(results) >= fetch_limit:
                     break
                 rows = self.conn.execute(
@@ -728,59 +1334,161 @@ class Database:
                 "rank": -15.0,
             })
 
+        tokenized_hint = tokenized_query_hint(query)
+        if tokenized_hint:
+            like_limit = limit * 3
+            tokenized_pattern = f"%{tokenized_hint}%"
+            if kind:
+                rows = self.conn.execute(
+                    """SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
+                       FROM symbols s JOIN files f ON s.file_id = f.id
+                       WHERE s.kind = ?
+                         AND (
+                             COALESCE(s.signature, '') LIKE ? COLLATE NOCASE
+                             OR s.content LIKE ? COLLATE NOCASE
+                             OR COALESCE(s.doc_comment, '') LIKE ? COLLATE NOCASE
+                         )
+                       ORDER BY
+                           CASE WHEN s.kind IN ('microservice_handler', 'queue_processor', 'scheduled_job') THEN 0
+                                ELSE 1 END,
+                           length(s.name),
+                           s.name
+                       LIMIT ?""",
+                    (kind, tokenized_pattern, tokenized_pattern, tokenized_pattern, like_limit),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    """SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
+                       FROM symbols s JOIN files f ON s.file_id = f.id
+                       WHERE COALESCE(s.signature, '') LIKE ? COLLATE NOCASE
+                          OR s.content LIKE ? COLLATE NOCASE
+                          OR COALESCE(s.doc_comment, '') LIKE ? COLLATE NOCASE
+                       ORDER BY
+                           CASE WHEN s.kind IN ('microservice_handler', 'queue_processor', 'scheduled_job') THEN 0
+                                ELSE 1 END,
+                           length(s.name),
+                           s.name
+                       LIMIT ?""",
+                    (tokenized_pattern, tokenized_pattern, tokenized_pattern, like_limit),
+                ).fetchall()
+            for row in rows:
+                _add_row({
+                    "symbol_id": int(row["symbol_id"]),
+                    "name": row["name"],
+                    "file": row["file_path"],
+                    "kind": row["kind"],
+                    "snippet": tokenized_hint,
+                    "source": "tokenized_like",
+                    "rank": -14.0,
+                })
+
+        metadata_patterns = _metadata_like_patterns(query)
+        if metadata_patterns:
+            like_limit = limit * 3
+            where_clause = " OR ".join("COALESCE(s.metadata, '') LIKE ? COLLATE NOCASE" for _ in metadata_patterns)
+            params: list[Any] = []
+            if kind:
+                params.append(kind)
+            params.extend(metadata_patterns)
+            params.append(like_limit)
+            if kind:
+                rows = self.conn.execute(
+                    f"""SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
+                        FROM symbols s JOIN files f ON s.file_id = f.id
+                        WHERE s.kind = ? AND ({where_clause})
+                        ORDER BY
+                            CASE WHEN s.kind IN ('microservice_handler', 'queue_processor', 'scheduled_job', 'transport', 'module') THEN 0
+                                 ELSE 1 END,
+                            length(s.name),
+                            s.name
+                        LIMIT ?""",
+                    params,
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    f"""SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
+                        FROM symbols s JOIN files f ON s.file_id = f.id
+                        WHERE {where_clause}
+                        ORDER BY
+                            CASE WHEN s.kind IN ('microservice_handler', 'queue_processor', 'scheduled_job', 'transport', 'module') THEN 0
+                                 ELSE 1 END,
+                            length(s.name),
+                            s.name
+                        LIMIT ?""",
+                    params,
+                ).fetchall()
+            for row in rows:
+                _add_row({
+                    "symbol_id": int(row["symbol_id"]),
+                    "name": row["name"],
+                    "file": row["file_path"],
+                    "kind": row["kind"],
+                    "snippet": query,
+                    "source": "metadata_like",
+                    "rank": -13.0,
+                })
+
         # Tier 3: FTS5 on source code content (trigram)
         if len(results) < fetch_limit:
             try:
-                rows = self.conn.execute(
-                    """SELECT symbol_id, name, file_path, kind,
-                              rank, snippet(symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
-                       FROM symbol_content_fts
-                       WHERE symbol_content_fts MATCH ?
-                       ORDER BY rank
-                       LIMIT ?""",
-                    (query, fetch_limit),
-                ).fetchall()
-                for row in rows:
+                for content_query in _search_query_variants(query):
                     if len(results) >= fetch_limit:
                         break
-                    _add_row({
-                        "symbol_id": int(row["symbol_id"]),
-                        "name": row["name"],
-                        "file": row["file_path"],
-                        "kind": row["kind"],
-                        "snippet": row["snippet"],
-                        "source": "content",
-                        "rank": row["rank"],
-                    })
+                    rows = self.conn.execute(
+                        """SELECT symbol_id, name, file_path, kind,
+                                  rank, snippet(symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
+                           FROM symbol_content_fts
+                           WHERE symbol_content_fts MATCH ?
+                           ORDER BY rank
+                           LIMIT ?""",
+                        (content_query, fetch_limit),
+                    ).fetchall()
+                    for row in rows:
+                        if len(results) >= fetch_limit:
+                            break
+                        _add_row({
+                            "symbol_id": int(row["symbol_id"]),
+                            "name": row["name"],
+                            "file": row["file_path"],
+                            "kind": row["kind"],
+                            "snippet": row["snippet"],
+                            "source": "content",
+                            "rank": row["rank"],
+                        })
             except sqlite3.OperationalError:
                 pass
 
         # Tier 4: FTS5 on documentation
         if len(results) < fetch_limit:
             try:
-                rows = self.conn.execute(
-                    """SELECT symbol_id, name, file_path, kind,
-                              rank, snippet(symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
-                       FROM symbol_docs_fts
-                       WHERE symbol_docs_fts MATCH ?
-                       ORDER BY rank
-                       LIMIT ?""",
-                    (query, fetch_limit),
-                ).fetchall()
-                for row in rows:
+                for docs_query in _search_query_variants(query):
                     if len(results) >= fetch_limit:
                         break
-                    _add_row({
-                        "symbol_id": int(row["symbol_id"]),
-                        "name": row["name"],
-                        "file": row["file_path"],
-                        "kind": row["kind"],
-                        "snippet": row["snippet"],
-                        "source": "docs",
-                        "rank": row["rank"],
-                    })
+                    rows = self.conn.execute(
+                        """SELECT symbol_id, name, file_path, kind,
+                                  rank, snippet(symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
+                           FROM symbol_docs_fts
+                           WHERE symbol_docs_fts MATCH ?
+                           ORDER BY rank
+                           LIMIT ?""",
+                        (docs_query, fetch_limit),
+                    ).fetchall()
+                    for row in rows:
+                        if len(results) >= fetch_limit:
+                            break
+                        _add_row({
+                            "symbol_id": int(row["symbol_id"]),
+                            "name": row["name"],
+                            "file": row["file_path"],
+                            "kind": row["kind"],
+                            "snippet": row["snippet"],
+                            "source": "docs",
+                            "rank": row["rank"],
+                        })
             except sqlite3.OperationalError:
                 pass
+
+        self._rerank_search_results(results, query, code_like_query)
 
         # Sort: project code first, then by rank within each group
         results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
@@ -1023,8 +1731,7 @@ class Database:
         """Get symbols that need embeddings (no embedding or body_hash changed)."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.id, s.name, s.qualified_name, s.signature, s.doc_comment,
-                      s.content, s.body_hash, s.kind, f.path as file_path
+            """SELECT s.*, f.path as file_path
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?
@@ -1032,7 +1739,7 @@ class Database:
                LIMIT ?""",
             (model, limit),
         ).fetchall()
-        return [{k: row[k] for k in row.keys()} for row in rows]
+        return [asdict(self._row_to_symbol(row)) for row in rows]
 
     def vector_search(self, query_embedding: bytes, dimensions: int,
                       limit: int = 10, kind: str | None = None,
@@ -1050,9 +1757,6 @@ class Database:
             return self._enrich_results(top_k)
 
         # Slow path: fetch all embeddings from SQLite
-        import struct
-        from .vector_math import cosine_top_k, decode_matrix
-
         n_floats = len(query_embedding) // 4
         query_vec = struct.unpack(f'{n_floats}f', query_embedding)
 

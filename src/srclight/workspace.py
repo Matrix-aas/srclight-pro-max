@@ -14,6 +14,7 @@ import json
 import logging
 import re
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -228,6 +229,23 @@ class WorkspaceDB:
         """schema_name -> project_name mapping for currently attached projects."""
         return dict(self._attached)
 
+    def _iter_entries(self, project_filter: str | None = None) -> list[ProjectEntry]:
+        entries = self._all_indexable
+        if project_filter is not None:
+            entries = [entry for entry in entries if entry.name == project_filter]
+        return entries
+
+    @contextmanager
+    def _open_project_db(self, entry: ProjectEntry):
+        from .db import Database
+
+        db = Database(entry.index_db)
+        db.open()
+        try:
+            yield db
+        finally:
+            db.close()
+
     def list_projects(self) -> list[dict[str, Any]]:
         """List all projects in the workspace with their stats."""
         assert self.conn is not None
@@ -294,192 +312,67 @@ class WorkspaceDB:
         self, query: str, kind: str | None = None,
         project: str | None = None, limit: int = 20,
     ) -> list[dict[str, Any]]:
-        """Search symbols across all projects using UNION ALL.
-
-        FTS5 virtual tables are queried per-schema, results merged and ranked.
-        Uses batched ATTACH when projects exceed SQLite's 10-database limit.
-        """
+        """Search symbols across projects using the single-repo ranker per DB."""
         assert self.conn is not None
-        from .db import split_identifier, is_vendored_path
 
         results: list[dict[str, Any]] = []
-        seen_ids: set[tuple[str, int]] = set()  # (project, symbol_id)
-
-        _PRIMARY_KINDS = {"class", "struct", "interface", "enum", "function", "method"}
-        query_lower = query.lower()
-        query_tokens = split_identifier(query)
-
-        def _rank_result(row_dict: dict) -> float:
-            rank = row_dict.get("rank", 0)
-            name = row_dict.get("name", "")
-            sym_kind = row_dict.get("kind", "")
-            file_path = row_dict.get("file", "")
-
-            if name == query:
-                rank -= 50.0
-            elif name and query_lower in name.lower():
-                rank -= 10.0
-            if sym_kind in _PRIMARY_KINDS:
-                rank -= 5.0
-            if is_vendored_path(file_path):
-                rank += 20.0
-                row_dict["vendored"] = True
-            return rank
-
-        # Tier 1+2: FTS5 name search + LIKE fallback per schema
-        for batch in self._iter_batches(project_filter=project):
-          for schema, project_name in batch:
-            # FTS5 on symbol names
-            for fts_query in [query, query_tokens]:
-                if not fts_query:
-                    continue
-                try:
-                    rows = self.conn.execute(
-                        f"""SELECT symbol_id, name, file_path, kind, rank,
-                               snippet([{schema}].symbol_names_fts, 1, '>>>', '<<<', '...', 20) as snippet
-                           FROM [{schema}].symbol_names_fts
-                           WHERE [{schema}].symbol_names_fts MATCH ?
-                           ORDER BY rank LIMIT ?""",
-                        (fts_query, limit * 3),
-                    ).fetchall()
-                    for row in rows:
-                        sid = int(row["symbol_id"])
-                        key = (project_name, sid)
-                        if key in seen_ids:
-                            continue
-                        if kind and row["kind"] != kind:
-                            continue
-                        d = {
-                            "project": project_name,
-                            "symbol_id": sid,
-                            "name": row["name"],
-                            "file": row["file_path"],
-                            "kind": row["kind"],
-                            "snippet": row["snippet"],
-                            "source": "name",
-                            "rank": row["rank"],
-                        }
-                        d["rank"] = _rank_result(d)
-                        results.append(d)
-                        seen_ids.add(key)
-                except sqlite3.OperationalError:
-                    pass
-
-            # LIKE fallback
+        for entry in self._iter_entries(project_filter=project):
             try:
-                kind_filter = "AND s.kind = ?" if kind else ""
-                like_params: list = [f"%{query}%"]
-                if kind:
-                    like_params.append(kind)
-                like_params.extend([query, limit * 3])
+                with self._open_project_db(entry) as db:
+                    project_results = db.search_symbols(query, kind=kind, limit=limit * 3)
+                    for row in project_results:
+                        results.append({"project": entry.name, **row})
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Skipping search for %s due to project DB error: %s", entry.name, e)
+                continue
 
-                rows = self.conn.execute(
-                    f"""SELECT s.id as symbol_id, s.name, f.path as file_path, s.kind
-                       FROM [{schema}].symbols s
-                       JOIN [{schema}].files f ON s.file_id = f.id
-                       WHERE s.name LIKE ? COLLATE NOCASE {kind_filter}
-                       ORDER BY
-                           CASE WHEN s.name = ? THEN 0 ELSE 1 END,
-                           length(s.name), s.name
-                       LIMIT ?""",
-                    like_params,
-                ).fetchall()
-                for row in rows:
-                    sid = int(row["symbol_id"])
-                    key = (project_name, sid)
-                    if key in seen_ids:
-                        continue
-                    if kind and row["kind"] != kind:
-                        continue
-                    d = {
-                        "project": project_name,
-                        "symbol_id": sid,
-                        "name": row["name"],
-                        "file": row["file_path"],
-                        "kind": row["kind"],
-                        "snippet": row["name"],
-                        "source": "name_like",
-                        "rank": -15.0,
-                    }
-                    d["rank"] = _rank_result(d)
-                    results.append(d)
-                    seen_ids.add(key)
-            except sqlite3.OperationalError:
-                pass
-
-            # Tier 3: FTS5 on content (trigram)
-            try:
-                rows = self.conn.execute(
-                    f"""SELECT symbol_id, name, file_path, kind, rank,
-                           snippet([{schema}].symbol_content_fts, 0, '>>>', '<<<', '...', 30) as snippet
-                       FROM [{schema}].symbol_content_fts
-                       WHERE [{schema}].symbol_content_fts MATCH ?
-                       ORDER BY rank LIMIT ?""",
-                    (query, limit * 2),
-                ).fetchall()
-                for row in rows:
-                    sid = int(row["symbol_id"])
-                    key = (project_name, sid)
-                    if key in seen_ids:
-                        continue
-                    if kind and row["kind"] != kind:
-                        continue
-                    d = {
-                        "project": project_name,
-                        "symbol_id": sid,
-                        "name": row["name"],
-                        "file": row["file_path"],
-                        "kind": row["kind"],
-                        "snippet": row["snippet"],
-                        "source": "content",
-                        "rank": row["rank"],
-                    }
-                    d["rank"] = _rank_result(d)
-                    results.append(d)
-                    seen_ids.add(key)
-            except sqlite3.OperationalError:
-                pass
-
-            # Tier 4: FTS5 on docs
-            try:
-                rows = self.conn.execute(
-                    f"""SELECT symbol_id, name, file_path, kind, rank,
-                           snippet([{schema}].symbol_docs_fts, 0, '>>>', '<<<', '...', 30) as snippet
-                       FROM [{schema}].symbol_docs_fts
-                       WHERE [{schema}].symbol_docs_fts MATCH ?
-                       ORDER BY rank LIMIT ?""",
-                    (query, limit * 2),
-                ).fetchall()
-                for row in rows:
-                    sid = int(row["symbol_id"])
-                    key = (project_name, sid)
-                    if key in seen_ids:
-                        continue
-                    if kind and row["kind"] != kind:
-                        continue
-                    d = {
-                        "project": project_name,
-                        "symbol_id": sid,
-                        "name": row["name"],
-                        "file": row["file_path"],
-                        "kind": row["kind"],
-                        "snippet": row["snippet"],
-                        "source": "docs",
-                        "rank": row["rank"],
-                    }
-                    d["rank"] = _rank_result(d)
-                    results.append(d)
-                    seen_ids.add(key)
-            except sqlite3.OperationalError:
-                pass
-
-        # Sort by rank (lower = better), project code > vendored
-        results.sort(key=lambda r: (r.get("vendored", False), r.get("rank", 0)))
+        results.sort(
+            key=lambda r: (
+                r.get("vendored", False),
+                r.get("rank", 0),
+                r.get("project", ""),
+                r.get("name", ""),
+            )
+        )
         return results[:limit]
+
+    def suggest_symbol_names(
+        self, query: str, project: str | None = None, limit: int = 5
+    ) -> list[dict[str, str]]:
+        """Suggest nearby symbol names across workspace projects."""
+        suggestions: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for entry in self._iter_entries(project_filter=project):
+            try:
+                with self._open_project_db(entry) as db:
+                    for match in db.suggest_symbol_name_matches(query, limit=limit * 2):
+                        name = match["name"]
+                        key = (entry.name, name)
+                        if key in seen:
+                            continue
+                        suggestions.append({
+                            "project": entry.name,
+                            "name": name,
+                            "score": match["score"],
+                        })
+                        seen.add(key)
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Skipping suggestions for %s due to project DB error: %s", entry.name, e)
+                continue
+
+        suggestions.sort(key=lambda item: (item["score"], item["project"], item["name"]))
+        return [
+            {"project": item["project"], "name": item["name"]}
+            for item in suggestions[:limit]
+        ]
 
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None
+
+        if project is not None and not any(entry.name == project for entry in self.workspace.get_entries()):
+            raise LookupError(project)
 
         total_files = 0
         total_symbols = 0
@@ -525,7 +418,7 @@ class WorkspaceDB:
                 except sqlite3.OperationalError as e:
                     logger.warning("Error reading %s: %s", project_name, e)
 
-        return {
+        result = {
             "workspace": self.workspace.name,
             "projects_attached": self.project_count,
             "totals": {
@@ -537,6 +430,56 @@ class WorkspaceDB:
             "symbol_kinds": dict(sorted(all_kinds.items(), key=lambda x: -x[1])),
             "projects": project_summaries,
         }
+
+        if project is not None:
+            from .server import (
+                _build_repo_brief,
+                _build_start_here,
+                _build_topology,
+                _detect_framework_hints,
+                _find_representative_files,
+                _indexed_orientation_hints,
+                _merge_indexed_representative_files,
+            )
+
+            entry = next(
+                (candidate for candidate in self.workspace.get_entries() if candidate.name == project),
+                None,
+            )
+            if entry is not None:
+                repo_root = Path(entry.path)
+                representative_files = _find_representative_files(repo_root)
+                indexed_hints = None
+                try:
+                    with self._open_project_db(entry) as db:
+                        indexed_hints = _indexed_orientation_hints(db.orientation_symbols())
+                except (OSError, sqlite3.Error, json.JSONDecodeError):
+                    indexed_hints = None
+
+                representative_files = _merge_indexed_representative_files(representative_files, indexed_hints)
+                extra_signals = set(indexed_hints.get("signals") or []) if indexed_hints else None
+                framework_hints = _detect_framework_hints(
+                    repo_root,
+                    representative_files,
+                    extra_signals=extra_signals,
+                )
+                start_here = _build_start_here(representative_files, framework_hints)
+                topology = _build_topology(
+                    repo_root,
+                    representative_files,
+                    framework_hints,
+                    indexed_hints=indexed_hints,
+                )
+                result.update({
+                    "repo_root": str(repo_root),
+                    "framework_hints": framework_hints,
+                    "representative_files": representative_files,
+                    "topology": topology,
+                    "start_here": start_here,
+                    "brief": _build_repo_brief(framework_hints, start_here, indexed=True),
+                })
+
+        return result
 
     def get_symbol(self, name: str, project: str | None = None) -> list[dict[str, Any]]:
         """Get full symbol details by name across projects."""
@@ -645,13 +588,11 @@ class WorkspaceDB:
                 candidates = cache.search(query_embedding, dimensions, limit * 2, kind)
                 for row_idx, sim, sym_id in candidates:
                     all_candidates.append((entry.name, row_idx, sim, sym_id))
-            elif cache is None and self._caches.get(entry.name) is None:
-                # None sentinel — project has no sidecar (and likely no embeddings).
-                # Skip it silently.
-                pass
             else:
-                # Has embeddings but no valid cache — needs slow path
-                cache_miss_projects.append(entry.name)
+                # No loaded sidecar. Fall back if the project actually has embeddings;
+                # otherwise keep the fast path for unindexed projects.
+                if self._project_has_embeddings(entry):
+                    cache_miss_projects.append(entry.name)
 
         # If we got cache hits and no misses, use fast enrichment
         if all_candidates and not cache_miss_projects:
@@ -677,7 +618,7 @@ class WorkspaceDB:
             by_project.setdefault(proj_name, []).append((row_idx, sim, sym_id))
 
         # Fetch metadata per-project (one connection per project)
-        enriched: dict[int, dict] = {}  # sym_id -> result dict
+        enriched: dict[tuple[str, int], dict] = {}
         for proj_name, items in by_project.items():
             entry = next(
                 (e for e in self._all_indexable if e.name == proj_name), None
@@ -699,7 +640,7 @@ class WorkspaceDB:
                     ).fetchone()
                     if row is None:
                         continue
-                    enriched[sym_id] = {
+                    enriched[(proj_name, sym_id)] = {
                         "project": proj_name,
                         "symbol_id": sym_id,
                         "name": row["name"],
@@ -718,7 +659,24 @@ class WorkspaceDB:
                 logger.warning("Error enriching results from %s: %s", proj_name, e)
 
         # Return in original order (sorted by similarity)
-        return [enriched[sym_id] for _, _, _, sym_id in candidates if sym_id in enriched]
+        return [
+            enriched[(proj_name, sym_id)]
+            for proj_name, _row_idx, _sim, sym_id in candidates
+            if (proj_name, sym_id) in enriched
+        ]
+
+    def _project_has_embeddings(self, entry: ProjectEntry) -> bool:
+        """Return True when a project has embeddings worth falling back for."""
+        try:
+            conn = sqlite3.connect(str(entry.index_db))
+            try:
+                row = conn.execute("SELECT 1 FROM symbol_embeddings LIMIT 1").fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except (OSError, sqlite3.Error):
+            # If we cannot inspect the DB, prefer correctness and fall back.
+            return True
 
     def _vector_search_slow(
         self, query_embedding: bytes, dimensions: int,
@@ -727,6 +685,7 @@ class WorkspaceDB:
         """Slow path: fetch all embeddings from SQLite via ATTACH+UNION."""
         assert self.conn is not None
         import struct
+
         from .vector_math import cosine_top_k, decode_matrix
 
         n_floats = len(query_embedding) // 4

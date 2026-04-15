@@ -1,7 +1,6 @@
 """Tests for VectorCache — GPU/CPU-resident embedding matrix with .npy sidecar."""
 
 import json
-import struct
 
 import numpy as np
 import pytest
@@ -9,7 +8,6 @@ import pytest
 from srclight.db import Database, FileRecord, SymbolRecord
 from srclight.embeddings import vector_to_bytes
 from srclight.vector_cache import VectorCache
-
 
 # --- Helpers ---
 

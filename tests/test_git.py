@@ -1,7 +1,6 @@
 """Tests for git intelligence layer."""
 
 import subprocess
-from pathlib import Path
 
 import pytest
 

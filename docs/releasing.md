@@ -68,11 +68,11 @@ Both PyPI and MCP registry publishing are **fully automated**. No manual `mcp-pu
 ### PyPI publish fails
 - Check the GitHub Actions run: `gh run view --log`
 - Verify the `pypi` environment exists in repo settings
-- Verify Trusted Publisher is configured on PyPI for `srclight/srclight`
+- Verify Trusted Publisher is configured on PyPI for `Matrix-aas/srclight`
 
 ### MCP registry publish fails
 - Check the `mcp-registry` job in the GitHub Actions run
-- The server name `io.github.srclight/srclight` requires the `srclight` GitHub org to exist
+- The server name `io.github.srclight/srclight` still assumes the original `srclight` org namespace
 - OIDC auth requires `id-token: write` permission in the workflow
 
 ### MCP registry 400 (duplicate version)

@@ -12,12 +12,325 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import click
 
 from . import __version__
+from .embeddings import DEFAULT_OLLAMA_EMBED_MODEL
+
+try:
+    from rich.console import Console
+    from rich.logging import RichHandler
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
+    from rich.table import Column
+except ImportError:  # pragma: no cover - fallback path is exercised without rich installed
+    BarColumn = Progress = RichHandler = SpinnerColumn = TaskProgressColumn = None
+    TextColumn = TimeElapsedColumn = TimeRemainingColumn = None
+    Console = None
+    Column = None
+
+
+_RICH_CONSOLE: Console | None = None
+_INDEX_PROGRESS_LOG_PREFIXES = (
+    "Indexing ",
+    "Using git ls-files",
+    "Detected ",
+    "Embedding ",
+    "  Embedding batch ",
+    "Embedded ",
+    "Indexed ",
+)
+
+
+def _stderr_supports_rich() -> bool:
+    if Progress is None or Console is None:
+        return False
+    if not hasattr(sys.stderr, "isatty") or not sys.stderr.isatty():
+        return False
+    return os.environ.get("TERM", "").lower() != "dumb"
+
+
+def _get_rich_console() -> Console | None:
+    global _RICH_CONSOLE
+    if not _stderr_supports_rich():
+        return None
+    if _RICH_CONSOLE is None:
+        _RICH_CONSOLE = Console(stderr=True)
+    return _RICH_CONSOLE
+
+
+def _configure_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    console = _get_rich_console()
+    if console is not None and RichHandler is not None:
+        logging.basicConfig(
+            level=level,
+            format="%(message)s",
+            handlers=[
+                RichHandler(
+                    console=console,
+                    show_path=verbose,
+                    rich_tracebacks=verbose,
+                    markup=False,
+                )
+            ],
+            force=True,
+        )
+        return
+
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+
+
+def _format_eta(seconds: float | int | None) -> str | None:
+    if seconds is None:
+        return None
+    total_seconds = max(0, int(round(float(seconds))))
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _truncate_progress_text(value: str, width: int) -> str:
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
+
+
+class _IndexProgressLogFilter(logging.Filter):
+    """Suppress info-level indexer progress logs that the CLI renders itself."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        if record.name != "srclight.indexer":
+            return True
+        return not record.getMessage().startswith(_INDEX_PROGRESS_LOG_PREFIXES)
+
+
+@contextmanager
+def _suppress_index_progress_logs():
+    filter_ = _IndexProgressLogFilter()
+    logger = logging.getLogger("srclight.indexer")
+    logger.addFilter(filter_)
+    try:
+        yield
+    finally:
+        logger.removeFilter(filter_)
+
+
+class _PlainIndexProgress:
+    def __init__(self, *, indent: int = 2, width: int = 60):
+        self._indent = " " * indent
+        self._width = width
+        self._line_open = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.finish()
+        return False
+
+    def _close_line(self) -> None:
+        if self._line_open:
+            click.echo(err=True)
+            self._line_open = False
+
+    def update_scan(self, file: str, current: int, total: int) -> None:
+        pct = (current / total * 100) if total > 0 else 0
+        text = _truncate_progress_text(file, self._width)
+        finished = total > 0 and current >= total
+        click.echo(
+            f"\r{self._indent}[{current}/{total}] {pct:5.1f}% {text:<{self._width}}",
+            nl=finished,
+            err=True,
+        )
+        self._line_open = not finished
+
+    def emit_event(self, event: dict[str, object]) -> None:
+        self._close_line()
+        phase = str(event.get("phase", "")).strip().lower()
+        if phase == "graph":
+            message = event.get("message", "Building call graph and inheritance edges")
+            click.echo(
+                f"{self._indent}Graph: {message}",
+                err=True,
+            )
+            return
+        if phase == "communities":
+            message = event.get("message", "Detecting communities and execution flows")
+            click.echo(
+                f"{self._indent}Communities: {message}",
+                err=True,
+            )
+            return
+        if phase == "embeddings":
+            current = event.get("current")
+            total = event.get("total")
+            detail = str(event.get("detail", "")).strip()
+            elapsed = _format_eta(event.get("elapsed_seconds"))
+            remaining = _format_eta(event.get("remaining_seconds"))
+            parts: list[str] = []
+            if current is not None and total is not None:
+                parts.append(f"Embeddings: {current}/{total}")
+            else:
+                parts.append("Embeddings")
+            if detail:
+                parts.append(detail)
+            if elapsed:
+                parts.append(f"{elapsed} elapsed")
+            if remaining:
+                parts.append(f"~{remaining} remaining")
+            click.echo(f"{self._indent}{' | '.join(parts)}", err=True)
+
+    def finish(self) -> None:
+        self._close_line()
+
+
+class _RichIndexProgress:
+    def __init__(self, *, label: str | None = None):
+        self._label = label
+        self._console = _get_rich_console()
+        self._phase = "scan"
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}", justify="left"),
+            BarColumn(bar_width=28),
+            TaskProgressColumn(),
+            TextColumn("{task.fields[counts]}", justify="right"),
+            TextColumn(
+                "{task.fields[detail]}",
+                table_column=Column(overflow="ellipsis", no_wrap=True),
+            ),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self._console,
+            transient=False,
+        )
+        self._task_id: int | None = None
+
+    def __enter__(self):
+        self._progress.start()
+        self._task_id = self._progress.add_task(
+            self._phase_description("scan"),
+            total=None,
+            counts="",
+            detail="Preparing file list",
+        )
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.finish()
+        return False
+
+    def _phase_description(self, phase: str) -> str:
+        if self._label:
+            return f"{self._label} {phase}"
+        return phase
+
+    def _replace_task(
+        self,
+        *,
+        description: str,
+        total: float | None,
+        completed: float,
+        counts: str,
+        detail: str,
+    ) -> None:
+        if self._task_id is not None:
+            self._progress.remove_task(self._task_id)
+        self._task_id = self._progress.add_task(
+            description,
+            total=total,
+            completed=completed,
+            counts=counts,
+            detail=detail,
+        )
+
+    def update_scan(self, file: str, current: int, total: int) -> None:
+        kwargs = {
+            "description": self._phase_description("scan"),
+            "total": total,
+            "completed": current,
+            "counts": f"{current}/{total}",
+            "detail": _truncate_progress_text(file, 72),
+        }
+        if self._phase != "scan":
+            self._replace_task(**kwargs)
+            self._phase = "scan"
+            return
+
+        self._progress.update(self._task_id, **kwargs)
+
+    def emit_event(self, event: dict[str, object]) -> None:
+        phase = str(event.get("phase", "")).strip().lower() or "index"
+        current = event.get("current")
+        total = event.get("total")
+        detail = str(event.get("detail", "")).strip()
+        message = str(event.get("message", "")).strip()
+
+        counts = ""
+        if current is not None and total is not None:
+            counts = f"{current}/{total}"
+
+        extra: list[str] = []
+        if detail:
+            extra.append(detail)
+        elif message:
+            extra.append(message)
+
+        elapsed = _format_eta(event.get("elapsed_seconds"))
+        remaining = _format_eta(event.get("remaining_seconds"))
+        if elapsed:
+            extra.append(f"{elapsed} elapsed")
+        if remaining:
+            extra.append(f"~{remaining} remaining")
+
+        kwargs = {
+            "description": self._phase_description(phase),
+            "total": total,
+            "completed": current if current is not None else 0,
+            "counts": counts,
+            "detail": " | ".join(extra),
+        }
+        if phase != self._phase or total is None:
+            self._replace_task(**kwargs)
+            self._phase = phase
+            return
+
+        self._progress.update(self._task_id, **kwargs)
+
+    def finish(self) -> None:
+        self._progress.stop()
+
+
+def _create_index_progress(*, label: str | None = None, indent: int = 2, width: int = 60):
+    if _get_rich_console() is not None:
+        return _RichIndexProgress(label=label)
+    return _PlainIndexProgress(indent=indent, width=width)
 
 
 def _find_repo_root(start: Path) -> Path:
@@ -42,6 +355,25 @@ def _migrate_legacy_dir(root: Path) -> None:
             pass  # Cross-device or permission issue — user can move manually
 
 
+class EmbedAwareGroup(click.Group):
+    """Group that lets `--embed` default to the local Ollama model."""
+
+    def parse_args(self, ctx, args):
+        rewritten: list[str] = []
+        i = 0
+        while i < len(args):
+            arg = args[i]
+            if arg == "--embed":
+                next_arg = args[i + 1] if i + 1 < len(args) else None
+                if next_arg is None or next_arg.startswith("-"):
+                    rewritten.extend([arg, DEFAULT_OLLAMA_EMBED_MODEL])
+                    i += 1
+                    continue
+            rewritten.append(arg)
+            i += 1
+        return super().parse_args(ctx, rewritten)
+
+
 def _get_db_path(root: Path) -> Path:
     """Get the index database path, migrating from legacy locations if needed.
 
@@ -62,24 +394,29 @@ def _get_db_path(root: Path) -> Path:
     return new_path
 
 
-@click.group()
+@click.group(cls=EmbedAwareGroup)
 @click.version_option(version=__version__)
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
 def main(verbose: bool):
     """Srclight — Deep code indexing for AI agents."""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(levelname)s %(name)s: %(message)s",
-        stream=sys.stderr,
-    )
+    _configure_logging(verbose)
 
 
 @main.command()
 @click.argument("path", default=".", type=click.Path(exists=True))
-@click.option("--db", "db_path", type=click.Path(), help="Database path (default: .srclight/index.db)")
-@click.option("--embed", "embed_model", type=str, default=None,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3)")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(),
+    help="Database path (default: .srclight/index.db)",
+)
+@click.option(
+    "--embed",
+    "embed_model",
+    type=str,
+    default=None,
+    help=f"Embedding model (bare --embed defaults to {DEFAULT_OLLAMA_EMBED_MODEL})",
+)
 def index(path: str, db_path: str | None, embed_model: str | None):
     """Index a codebase for AI-powered search."""
     from .db import Database
@@ -111,12 +448,16 @@ def index(path: str, db_path: str | None, embed_model: str | None):
     config = IndexConfig(root=root, embed_model=embed_model)
     indexer = Indexer(db, config)
 
-    def on_progress(file: str, current: int, total: int):
-        pct = (current / total * 100) if total > 0 else 0
-        click.echo(f"\r  [{current}/{total}] {pct:5.1f}% {file[:60]:<60}", nl=False)
+    progress = _create_index_progress(indent=2, width=60)
 
-    stats = indexer.index(root, on_progress=on_progress)
-    click.echo()  # newline after progress
+    def on_progress(file: str, current: int, total: int):
+        progress.update_scan(file, current, total)
+
+    def on_event(event: dict[str, object]):
+        progress.emit_event(event)
+
+    with progress, _suppress_index_progress_logs():
+        stats = indexer.index(root, on_progress=on_progress, on_event=on_event)
 
     click.echo()
     click.echo(f"  Files scanned:   {stats.files_scanned}")
@@ -132,8 +473,10 @@ def index(path: str, db_path: str | None, embed_model: str | None):
 
     if embed_model:
         emb_stats = db.embedding_stats()
-        click.echo(f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
-                    f" ({emb_stats['coverage_pct']}%)")
+        click.echo(
+            f"  Embeddings:      {emb_stats['embedded_symbols']}/{emb_stats['total_symbols']}"
+            f" ({emb_stats['coverage_pct']}%)"
+        )
 
     db.close()
 
@@ -227,7 +570,7 @@ def status(db_path: str | None):
     stats = db.stats()
     state = db.get_index_state(str(root))
 
-    click.echo(f"Srclight Index Status")
+    click.echo("Srclight Index Status")
     click.echo(f"  Database:    {db_file}")
     click.echo(f"  Repo root:   {root}")
     click.echo(f"  DB size:     {stats['db_size_mb']} MB")
@@ -237,12 +580,12 @@ def status(db_path: str | None):
     click.echo(f"  Edges:       {stats['edges']}")
 
     if stats["languages"]:
-        click.echo(f"\n  Languages:")
+        click.echo("\n  Languages:")
         for lang, count in stats["languages"].items():
             click.echo(f"    {lang:<15} {count} files")
 
     if stats["symbol_kinds"]:
-        click.echo(f"\n  Symbol kinds:")
+        click.echo("\n  Symbol kinds:")
         for kind, count in stats["symbol_kinds"].items():
             click.echo(f"    {kind:<15} {count}")
 
@@ -256,7 +599,13 @@ def status(db_path: str | None):
 @main.command()
 @click.option("--db", "db_path", type=click.Path(), help="Database path")
 @click.option("--workspace", "-w", "workspace_name", help="Workspace name (multi-repo mode)")
-@click.option("--transport", "-t", type=click.Choice(["stdio", "sse"]), default="sse", help="Transport (stdio or sse, default: sse)")
+@click.option(
+    "--transport",
+    "-t",
+    type=click.Choice(["stdio", "sse"]),
+    default="stdio",
+    help="Transport (stdio or sse, default: stdio)",
+)
 @click.option("--port", "-p", default=8742, help="Port for SSE transport (default: 8742)")
 @click.option("--web", is_flag=True, help="Serve dashboard and REST API at / and /api/* (SSE only)")
 def serve(db_path: str | None, workspace_name: str | None, transport: str, port: int, web: bool):
@@ -274,9 +623,15 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
         db_file = _get_db_path(root)
         configure(db_path=db_file, repo_root=root)
 
+    if web and transport != "sse":
+        click.echo("--web requires SSE transport; switching to --transport sse.", err=True)
+        transport = "sse"
+
     if transport == "sse" and web:
-        import anyio
         import time
+
+        import anyio
+
         from . import server as server_mod
         if server_mod._server_start_time is None:
             server_mod._server_start_time = time.time()
@@ -303,9 +658,6 @@ def serve(db_path: str | None, workspace_name: str | None, transport: str, port:
 
         anyio.run(_run)
         return
-
-    if web and transport != "sse":
-        click.echo("--web requires --transport sse; ignoring --web.", err=True)
 
     run_server(transport=transport, port=port)
 
@@ -360,8 +712,13 @@ def workspace_remove(project_name: str, ws_name: str):
 @workspace.command("index")
 @click.option("--workspace", "-w", "ws_name", required=True, help="Workspace to index")
 @click.option("--project", "-p", help="Index only this project (default: all)")
-@click.option("--embed", "embed_model", type=str, default=None,
-              help="Embedding model (e.g., qwen3-embedding, voyage-code-3)")
+@click.option(
+    "--embed",
+    "embed_model",
+    type=str,
+    default=None,
+    help=f"Embedding model (bare --embed defaults to {DEFAULT_OLLAMA_EMBED_MODEL})",
+)
 def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
     """Index all (or one) project in a workspace."""
     from .db import Database
@@ -399,12 +756,16 @@ def workspace_index(ws_name: str, project: str | None, embed_model: str | None):
             indexer_config = IndexConfig(root=root, embed_model=embed_model)
             indexer = Indexer(db, indexer_config)
 
-            def on_progress(file: str, current: int, total: int):
-                pct = (current / total * 100) if total > 0 else 0
-                click.echo(f"\r    [{current}/{total}] {pct:5.1f}% {file[:55]:<55}", nl=False)
+            progress = _create_index_progress(label=entry.name, indent=4, width=55)
 
-            stats = indexer.index(root, on_progress=on_progress)
-            click.echo()  # newline after progress
+            def on_progress(file: str, current: int, total: int):
+                progress.update_scan(file, current, total)
+
+            def on_event(event: dict[str, object]):
+                progress.emit_event(event)
+
+            with progress, _suppress_index_progress_logs():
+                stats = indexer.index(root, on_progress=on_progress, on_event=on_event)
 
             click.echo(f"    {stats.files_scanned} files, {stats.symbols_extracted} symbols, "
                         f"{stats.files_unchanged} unchanged, {stats.elapsed_seconds:.1f}s")
@@ -437,7 +798,10 @@ def workspace_status(ws_name: str):
             if "error" in p:
                 click.echo(f"  {p['project']:<20} ERROR: {p['error']}")
                 continue
-            langs = ", ".join(f"{l}:{n}" for l, n in p.get("languages", {}).items())
+            langs = ", ".join(
+                f"{lang_name}:{count}"
+                for lang_name, count in p.get("languages", {}).items()
+            )
             click.echo(f"  {p['project']:<20} {p['files']:>5} files  {p['symbols']:>6} symbols  "
                         f"{p['db_size_mb']:>5.1f} MB  [{langs}]")
 

@@ -26,6 +26,7 @@ classifiers = [
 dependencies = [
     "mcp>=1.26.0",
     "click>=8.1.0",
+    "rich>=13.9.0",
     "tree-sitter>=0.25.0",
     "tree-sitter-c>=0.24.0",
     "tree-sitter-cpp>=0.23.0",
@@ -35,7 +36,7 @@ dependencies = [
     "tree-sitter-rust>=0.24.0",
     "tree-sitter-c-sharp>=0.23.0",
     "tree-sitter-markdown>=0.5.0",
-    "tree-sitter-dart>=0.0.1",
+    "tree-sitter-language-pack>=1.6.0",
     "tree-sitter-swift>=0.0.1",
     "tree-sitter-kotlin>=1.0.0",
     "tree-sitter-java>=0.23.0",
@@ -66,9 +67,9 @@ dev = [
 srclight = "srclight.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/srclight/srclight"
-Repository = "https://github.com/srclight/srclight"
-Issues = "https://github.com/srclight/srclight/issues"
+Homepage = "https://github.com/Matrix-aas/srclight"
+Repository = "https://github.com/Matrix-aas/srclight"
+Issues = "https://github.com/Matrix-aas/srclight/issues"
 
 [tool.ruff]
 line-length = 100
@@ -76,6 +77,24 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/srclight/build.py" = ["E501"]
+"src/srclight/cli.py" = ["E501"]
+"src/srclight/db.py" = ["E501"]
+"src/srclight/embeddings.py" = ["E501"]
+"src/srclight/extractors/html_extractor.py" = ["E501"]
+"src/srclight/extractors/pdf_extractor.py" = ["E501"]
+"src/srclight/indexer.py" = ["E501"]
+"src/srclight/server.py" = ["E501"]
+"src/srclight/web.py" = ["E501"]
+"src/srclight/workspace.py" = ["E501"]
+"tests/test_db.py" = ["E501"]
+"tests/test_embedding_ux.py" = ["E501"]
+"tests/test_features.py" = ["E501"]
+"tests/test_indexer.py" = ["E501"]
+"tests/test_new_tools.py" = ["E501"]
+"tests/test_workspace.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

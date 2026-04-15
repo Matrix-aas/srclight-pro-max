@@ -2,7 +2,7 @@
 
 import pytest
 
-from srclight.db import Database, FileRecord, SymbolRecord, EdgeRecord
+from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
 
 
 @pytest.fixture
@@ -203,7 +203,7 @@ def test_flow_communities_crossed(db):
     """Flows crossing community boundaries should be counted."""
     from srclight.community import detect_communities, trace_execution_flows
 
-    syms = _build_test_graph(db)
+    _build_test_graph(db)
     communities = detect_communities(db)
 
     sym_to_comm = {}
@@ -220,7 +220,7 @@ def test_flow_communities_crossed(db):
 
 def test_compute_impact_low_risk(db):
     """Leaf node with few dependents should be LOW risk."""
-    from srclight.community import detect_communities, trace_execution_flows, compute_impact
+    from srclight.community import compute_impact, detect_communities, trace_execution_flows
 
     syms = _build_test_graph(db)
     communities = detect_communities(db)
@@ -239,7 +239,7 @@ def test_compute_impact_low_risk(db):
 
 def test_compute_impact_higher_risk_for_bridge(db):
     """Symbol that bridges communities should have higher risk."""
-    from srclight.community import detect_communities, trace_execution_flows, compute_impact
+    from srclight.community import compute_impact, detect_communities, trace_execution_flows
 
     syms = _build_test_graph(db)
     communities = detect_communities(db)

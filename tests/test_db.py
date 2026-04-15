@@ -1,11 +1,9 @@
 """Tests for the database layer."""
 
-import tempfile
-from pathlib import Path
 
 import pytest
 
-from srclight.db import Database, FileRecord, SymbolRecord, EdgeRecord, content_hash
+from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
 
 
 @pytest.fixture

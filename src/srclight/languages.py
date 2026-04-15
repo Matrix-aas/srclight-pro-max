@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+
 from tree_sitter import Language
 
 # Lazy-loaded language modules
@@ -127,6 +128,15 @@ _JS_QUERY = """
 (export_statement
     declaration: (class_declaration
         name: (identifier) @export_cls.name)) @export_cls.def
+
+(export_statement
+    value: (call_expression) @default_call.def)
+
+(export_statement
+    declaration: (lexical_declaration
+        (variable_declarator
+            name: (identifier) @const.name
+            value: [(call_expression) (new_expression)]) @const.def))
 """
 
 _TS_QUERY = """
@@ -156,6 +166,15 @@ _TS_QUERY = """
 (export_statement
     declaration: (function_declaration
         name: (identifier) @export_fn.name)) @export_fn.def
+
+(export_statement
+    value: (call_expression) @default_call.def)
+
+(export_statement
+    declaration: (lexical_declaration
+        (variable_declarator
+            name: (identifier) @const.name
+            value: [(call_expression) (new_expression)]) @const.def))
 """
 
 _RUST_QUERY = """
@@ -462,6 +481,10 @@ for lang_name, config in LANGUAGES.items():
             continue
         _EXT_TO_LANG.setdefault(ext, lang_name)
 
+# Vue SFCs are handled as a special case in the indexer, not as a normal
+# parser-backed language.
+_EXT_TO_LANG[".vue"] = "vue"
+
 
 _FILENAME_TO_LANG: dict[str, str] = {
     "CMakeLists.txt": "cmake",
@@ -513,8 +536,15 @@ def get_language(name: str) -> Language | None:
             return None
         _LANGUAGES[name] = lang
         return lang
-    except (ImportError, AttributeError) as e:
-        return None
+    except (ImportError, AttributeError):
+        try:
+            from tree_sitter_language_pack import get_language as get_packed_language
+
+            lang = get_packed_language(name)
+        except Exception:
+            return None
+        _LANGUAGES[name] = lang
+        return lang
 
 
 def get_tsx_language() -> Language | None:

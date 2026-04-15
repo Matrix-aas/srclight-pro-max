@@ -33,7 +33,7 @@ def _run_git(repo_root: Path, *args: str, timeout: int = 30) -> str:
 def _run_git_lines(repo_root: Path, *args: str, timeout: int = 30) -> list[str]:
     """Run a git command and return non-empty stdout lines."""
     out = _run_git(repo_root, *args, timeout=timeout)
-    return [l for l in out.splitlines() if l.strip()]
+    return [line for line in out.splitlines() if line.strip()]
 
 
 @dataclass

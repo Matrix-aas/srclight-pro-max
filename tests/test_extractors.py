@@ -2,7 +2,6 @@
 
 import csv
 import io
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -295,7 +294,7 @@ class TestPdfOcr:
     def test_paddle_ocr_integration(self, db, tmp_path):
         """End-to-end: create an image-only PDF and verify OCR extracts text."""
         fpdf2 = pytest.importorskip("fpdf")
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
 
         project = tmp_path / "proj"
         project.mkdir()

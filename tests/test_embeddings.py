@@ -1,16 +1,18 @@
 """Tests for embedding providers, vector search, and hybrid RRF."""
 
-import struct
 from unittest.mock import patch
 
 import pytest
 
 from srclight.embeddings import (
+    DEFAULT_OLLAMA_EMBED_MODEL,
     CohereProvider,
     EmbeddingProvider,
     OllamaProvider,
     OpenAIProvider,
     VoyageProvider,
+    _embed_request_timeout,
+    _index_embed_request_timeout,
     bytes_to_vector,
     cosine_similarity,
     embed_symbols,
@@ -20,8 +22,6 @@ from srclight.embeddings import (
     vector_to_bytes,
     vectors_to_bytes,
 )
-from srclight.embeddings import _embed_request_timeout
-
 
 # --- Embed request timeout (Cursor/IDE tool timeout) ---
 
@@ -36,6 +36,19 @@ def test_embed_request_timeout_default():
 def test_embed_request_timeout_from_env():
     with patch.dict("os.environ", {"SRCLIGHT_EMBED_REQUEST_TIMEOUT": "45"}, clear=False):
         assert _embed_request_timeout() == 45
+
+
+def test_index_embed_request_timeout_default():
+    import os
+
+    with patch.dict("os.environ", {}, clear=False):
+        os.environ.pop("SRCLIGHT_INDEX_EMBED_REQUEST_TIMEOUT", None)
+        assert _index_embed_request_timeout() == 120
+
+
+def test_index_embed_request_timeout_from_env():
+    with patch.dict("os.environ", {"SRCLIGHT_INDEX_EMBED_REQUEST_TIMEOUT": "240"}, clear=False):
+        assert _index_embed_request_timeout() == 240
 
 
 # --- Fixtures ---
@@ -99,6 +112,407 @@ def test_prepare_embedding_text_truncation():
     text = prepare_embedding_text(sym)
     # Content should be truncated to ~2000 chars
     assert len(text) < 2100
+
+
+def test_prepare_embedding_text_vue_component_summary():
+    sym = {
+        "name": "TemplateStyleSignals",
+        "qualified_name": "TemplateStyleSignals",
+        "signature": (
+            "component TemplateStyleSignals | BaseCard, NuxtLink, slot | "
+            "v-for, v-if | postcss, module, .card, .hero, --accent-color"
+        ),
+        "doc_comment": (
+            "Vue component TemplateStyleSignals. "
+            "Template components: BaseCard (Base Card), NuxtLink (Nuxt Link), slot. "
+            "Style vars: --accent-color (accent color). Style mode: postcss, module."
+        ),
+        "content": "",
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "BaseCard" in text
+    assert "Base Card" in text
+    assert "accent color" in text
+    assert "postcss" in text
+
+
+def test_prepare_embedding_text_vue_script_hint_summary():
+    sym = {
+        "name": "ScriptHints",
+        "qualified_name": "ScriptHints",
+        "signature": (
+            "component ScriptHints | definePageMeta, defineProps | useFetch, useRoute"
+        ),
+        "doc_comment": (
+            "Vue component ScriptHints. "
+            "Script macros: definePageMeta (define Page Meta), defineProps (define Props). "
+            "Script composables: useFetch (use Fetch), useRoute (use Route). "
+            "Fetch paths: /api/items. Page meta values: auth, dashboard."
+        ),
+        "content": "",
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "define Page Meta" in text
+    assert "use Fetch" in text
+    assert "/api/items" in text
+    assert "dashboard" in text
+
+
+def test_prepare_embedding_text_mongoose_schema_metadata():
+    sym = {
+        "name": "UserSchema",
+        "kind": "schema",
+        "signature": "mongoose schema | User | users",
+        "metadata": {
+            "framework": "mongoose",
+            "resource": "schema",
+            "entity_name": "User",
+            "collection_name": "users",
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "mongoose" in text
+    assert "schema" in text
+    assert "User" in text
+    assert "users" in text
+
+
+def test_prepare_embedding_text_mikroorm_repository_metadata():
+    sym = {
+        "name": "UserRepository",
+        "kind": "repository",
+        "signature": "mikroorm repository | UserRepository",
+        "metadata": {
+            "framework": "mikroorm",
+            "resource": "repository",
+            "entity_name": "User",
+            "table_name": "users",
+            "repository_owner": "User",
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "mikroorm" in text
+    assert "repository" in text
+    assert "User" in text
+    assert "users" in text
+
+
+def test_prepare_embedding_text_persistence_aggregate_metadata():
+    sym = {
+        "name": "accountModels",
+        "kind": "database",
+        "signature": "mongoose model registry | Account | accounts",
+        "metadata": {
+            "framework": "mongoose",
+            "resource": "database",
+            "entity_names": ["Account", "Session"],
+            "collection_names": ["accounts", "sessions"],
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "Account" in text
+    assert "Session" in text
+    assert "accounts" in text
+    assert "sessions" in text
+
+
+def test_prepare_embedding_text_wave1_backend_symbols():
+    route_handler = {
+        "name": "getMe",
+        "kind": "route_handler",
+        "signature": "GET /auth/me",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "route_handler",
+            "http_method": "GET",
+            "route_path": "/auth/me",
+            "controller_path": "/auth",
+        },
+    }
+    module = {
+        "name": "AuthModule",
+        "kind": "module",
+        "signature": "Nest module AuthModule",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "module",
+            "imports": ["AuthModule", "ConfigModule", "TypeOrmModule"],
+            "controllers": ["AuthController"],
+            "providers": ["AuthService", "JwtAuthGuard"],
+            "exports": ["AuthService"],
+        },
+    }
+    schema = {
+        "name": "UserSchema",
+        "kind": "schema",
+        "signature": "mongoose schema | User | users",
+        "metadata": {
+            "framework": "mongoose",
+            "resource": "schema",
+            "entity_name": "User",
+            "collection_name": "users",
+        },
+    }
+    entity = {
+        "name": "User",
+        "kind": "entity",
+        "signature": "mikroorm entity | User | users",
+        "metadata": {
+            "framework": "mikroorm",
+            "resource": "entity",
+            "entity_name": "User",
+            "table_name": "users",
+            "fields": [
+                {"name": "id", "field_name": "id", "kind": "primary_key"},
+                {"name": "email", "field_name": "email_address", "kind": "property"},
+            ],
+        },
+    }
+
+    prepared = "\n".join(
+        prepare_embedding_text(symbol)
+        for symbol in (route_handler, module, schema, entity)
+    )
+
+    assert "GET /auth/me" in prepared
+    assert "module AuthModule" in prepared
+    assert "schema users" in prepared
+    assert "mikroorm entity User" in prepared
+
+
+def test_prepare_embedding_text_wave2_messagepattern_bullmq_redis_rabbitmq_metadata():
+    microservice_handler = {
+        "name": "handlePrediction",
+        "kind": "microservice_handler",
+        "signature": "MessagePattern prediction.run",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "microservice_handler",
+            "message_pattern": "prediction.run",
+            "pattern": "prediction.run",
+            "transport": "rmq",
+            "role": "consumer",
+        },
+    }
+    queue_processor = {
+        "name": "notificationWorker",
+        "kind": "queue_processor",
+        "signature": "BullMQ worker notifications",
+        "metadata": {
+            "framework": "bullmq",
+            "resource": "queue_processor",
+            "queue_name": "notifications",
+            "job_name": "deliver-email",
+            "role": "consumer",
+        },
+    }
+    redis_transport = {
+        "name": "redisClient",
+        "kind": "transport",
+        "signature": "Redis client",
+        "metadata": {
+            "framework": "redis",
+            "resource": "transport",
+            "transport": "redis",
+            "connection_url": "process.env.REDIS_URL",
+            "role": "client",
+        },
+    }
+    rabbitmq_consumer = {
+        "name": "startAchievementConsumer",
+        "kind": "microservice_handler",
+        "signature": "RabbitMQ consumer achievement-events",
+        "metadata": {
+            "framework": "amqplib",
+            "resource": "microservice_handler",
+            "queue_name": "achievement-events",
+            "transport": "rmq",
+            "role": "consumer",
+        },
+    }
+
+    prepared = "\n".join(
+        prepare_embedding_text(symbol)
+        for symbol in (microservice_handler, queue_processor, redis_transport, rabbitmq_consumer)
+    )
+
+    assert "prediction.run" in prepared
+    assert "rmq" in prepared
+    assert "notifications" in prepared
+    assert "deliver-email" in prepared
+    assert "process.env.REDIS_URL" in prepared
+    assert "achievement-events" in prepared
+
+
+def test_prepare_embedding_text_wrapper_backed_microservice_handler_uses_resolved_metadata():
+    wrapped_handler = {
+        "name": "handleDiaryPush",
+        "kind": "microservice_handler",
+        "signature": "RpcRequest diary.note.push",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "microservice_handler",
+            "message_pattern": "diary.note.push",
+            "pattern": "diary.note.push",
+            "transport": "rmq",
+            "role": "consumer",
+        },
+    }
+
+    prepared = prepare_embedding_text(wrapped_handler)
+
+    assert "diary.note.push" in prepared
+    assert "message pattern: diary.note.push" in prepared
+    assert "transport: rmq" in prepared
+    assert "nestjs microservice_handler" in prepared
+
+
+def test_prepare_embedding_text_async_symbols_include_transport_role_and_queue_hints():
+    publisher = {
+        "name": "publishDiaryPush",
+        "kind": "microservice_handler",
+        "signature": "ClientProxy emit diary.note.push",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "microservice_handler",
+            "event_pattern": "diary.note.push",
+            "pattern": "diary.note.push",
+            "transport": "rabbitmq",
+            "role": "producer",
+            "queue_name": "diary-events",
+        },
+    }
+    worker = {
+        "name": "notificationWorker",
+        "kind": "queue_processor",
+        "signature": "BullMQ worker notifications",
+        "metadata": {
+            "framework": "bullmq",
+            "resource": "queue_processor",
+            "queue_name": "notifications",
+            "job_name": "deliver-email",
+            "role": "consumer",
+            "transport": "redis",
+        },
+    }
+
+    prepared = "\n".join(prepare_embedding_text(symbol) for symbol in (publisher, worker))
+
+    assert "event pattern: diary.note.push" in prepared
+    assert "transport: rabbitmq" in prepared
+    assert "producer" in prepared
+    assert "queue: diary-events" in prepared
+    assert "transport: redis" in prepared
+    assert "consumer" in prepared
+
+
+@pytest.mark.parametrize(
+    "connection_url",
+    [
+        "redis://user:secret@host:6379/0",
+        "'redis://user:secret@host:6379/0'",
+        '"redis://user:secret@host:6379/0"',
+        "`redis://user:secret@host:6379/0`",
+    ],
+)
+def test_prepare_embedding_text_redacts_transport_connection_url(connection_url):
+    sym = {
+        "name": "redisClient",
+        "kind": "transport",
+        "signature": "Redis client",
+        "metadata": {
+            "framework": "redis",
+            "resource": "transport",
+            "transport": "redis",
+            "connection_url": connection_url,
+            "role": "client",
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "connection: redis://host:6379/0" in text
+    assert "secret" not in text
+    assert "user@" not in text
+
+
+def test_indexer_build_embeddings_defers_dimensions_probe_until_after_embed_batch(
+    tmp_path, monkeypatch
+):
+    from srclight.indexer import IndexConfig, Indexer
+
+    class _LazyDimensionsProvider:
+        def __init__(self):
+            self._ready = False
+            self._dimensions = None
+
+        @property
+        def name(self) -> str:
+            return "mock:lazy-dimensions"
+
+        @property
+        def dimensions(self) -> int:
+            if not self._ready:
+                raise RuntimeError("dimensions unavailable before batch")
+            return 4
+
+        def embed_batch(self, texts: list[str]) -> list[list[float]]:
+            self._ready = True
+            self._dimensions = 4
+            return [[0.0, 1.0, 0.0, 0.0] for _ in texts]
+
+    class _FakeDB:
+        def __init__(self):
+            self.upserted = []
+            self.committed = 0
+            self.conn = object()
+
+        def get_symbols_needing_embeddings(self, model):
+            return [
+                {"id": 1, "body_hash": "h1"},
+                {"id": 2, "body_hash": "h2"},
+            ]
+
+        def upsert_embedding(self, symbol_id, provider_name, dims, emb_bytes, body_hash):
+            self.upserted.append((symbol_id, provider_name, dims, body_hash))
+
+        def commit(self):
+            self.committed += 1
+
+    provider = _LazyDimensionsProvider()
+    events = []
+
+    monkeypatch.setattr(
+        "srclight.embeddings.get_provider",
+        lambda model_spec, **kwargs: provider,
+    )
+    monkeypatch.setattr(
+        "srclight.vector_cache.VectorCache",
+        type(
+            "_NoopVectorCache",
+            (),
+            {
+                "__init__": lambda self, *args, **kwargs: None,
+                "build_from_db": lambda self, conn: None,
+            },
+        ),
+    )
+
+    indexer = Indexer(_FakeDB(), IndexConfig(root=tmp_path))
+    assert indexer._build_embeddings(DEFAULT_OLLAMA_EMBED_MODEL, on_event=events.append) == 2
+    assert events[0]["phase"] == "embeddings"
+    assert "mock:lazy-dimensions" in events[0]["detail"]
+    assert any("4d" in event.get("detail", "") for event in events)
 
 
 # --- Test vector math ---
@@ -187,15 +601,68 @@ def test_rrf_merge_empty():
 
 
 def test_get_provider_ollama():
-    provider = get_provider("qwen3-embedding")
+    provider = get_provider(DEFAULT_OLLAMA_EMBED_MODEL)
     assert isinstance(provider, OllamaProvider)
     assert "ollama" in provider.name
 
 
 def test_get_provider_ollama_explicit():
-    provider = get_provider("ollama:nomic-embed-text")
+    provider = get_provider("ollama:qwen3-embedding:4b")
     assert isinstance(provider, OllamaProvider)
-    assert "nomic-embed-text" in provider.name
+    assert provider.name == "ollama:qwen3-embedding:4b"
+
+
+def test_get_provider_ollama_tagged_without_prefix():
+    provider = get_provider("qwen3-embedding:4b")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == "ollama:qwen3-embedding:4b"
+
+
+def test_get_provider_ollama_hyphenated_without_prefix():
+    provider = get_provider("all-minilm")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == "ollama:all-minilm"
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_name"),
+    [
+        ("bge-m3", "ollama:bge-m3"),
+        ("snowflake-arctic-embed", "ollama:snowflake-arctic-embed"),
+        ("nomic-embed-text-v2-moe", "ollama:nomic-embed-text-v2-moe"),
+    ],
+)
+def test_get_provider_supported_embedding_families_without_prefix(model, expected_name):
+    provider = get_provider(model)
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == expected_name
+
+
+def test_get_provider_ollama_latest_tag_without_prefix():
+    provider = get_provider("nomic-embed-text:latest")
+    assert isinstance(provider, OllamaProvider)
+    assert provider.name == "ollama:nomic-embed-text:latest"
+
+
+def test_ollama_is_available_matches_tagged_model(monkeypatch):
+    provider = OllamaProvider(model="qwen3-embedding:4b", timeout=19)
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return b'{"models":[{"name":"qwen3-embedding:4b"}]}'
+
+    def fake_urlopen(req, timeout=None):
+        assert timeout == 19
+        return _Response()
+
+    monkeypatch.setattr("srclight.embeddings.urllib.request.urlopen", fake_urlopen)
+    assert provider.is_available() is True
 
 
 def test_get_provider_voyage():
@@ -267,6 +734,177 @@ def test_get_provider_cohere_no_key():
 def test_get_provider_unknown():
     with pytest.raises(ValueError, match="Unknown embedding provider"):
         get_provider("unknown:model")
+
+
+def test_get_provider_unknown_bare_model():
+    with pytest.raises(ValueError, match="Unknown embedding provider"):
+        get_provider("banana")
+
+
+@pytest.mark.parametrize("model", ["foo-embedding", "myembed", "embedder-123"])
+def test_get_provider_unknown_embeddingish_bare_model(model):
+    with pytest.raises(ValueError, match="Unknown embedding provider"):
+        get_provider(model)
+
+
+@pytest.mark.parametrize("model", ["foo:4b", "banana:latest", "foo-bar:1"])
+def test_get_provider_unknown_tagged_model(model):
+    with pytest.raises(ValueError, match="Unknown embedding provider"):
+        get_provider(model)
+
+
+@pytest.mark.parametrize(
+    ("provider", "method_name", "call_args", "expected_timeout"),
+    [
+        (OllamaProvider(model="qwen3-embedding:4b", timeout=33), "embed_batch", [["hello"]], 33),
+        (
+            OpenAIProvider(api_key="test-key", model="text-embedding-3-small", timeout=34),
+            "embed_batch",
+            [["hello"]],
+            34,
+        ),
+        (
+            CohereProvider(api_key="test-key", model="embed-v4.0", timeout=35),
+            "embed_batch",
+            [["hello"]],
+            35,
+        ),
+        (
+            VoyageProvider(api_key="test-key", model="voyage-code-3", timeout=36),
+            "embed_batch",
+            [["hello"]],
+            36,
+        ),
+    ],
+)
+def test_provider_timeout_used(provider, method_name, call_args, expected_timeout, monkeypatch):
+    """Provider constructors should pass their timeout through to HTTP requests."""
+    import json
+
+    responses = {
+        OllamaProvider: {"embeddings": [[1.0, 2.0, 3.0, 4.0]]},
+        OpenAIProvider: {"data": [{"index": 0, "embedding": [1.0, 2.0, 3.0, 4.0]}]},
+        CohereProvider: {"embeddings": {"float": [[1.0, 2.0, 3.0, 4.0]]}},
+        VoyageProvider: {"data": [{"index": 0, "embedding": [1.0, 2.0, 3.0, 4.0]}]},
+    }
+    seen_timeouts: list[int | None] = []
+
+    class _Response:
+        def __init__(self, payload: dict):
+            self._payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(self._payload).encode()
+
+    def fake_urlopen(req, timeout=None):
+        seen_timeouts.append(timeout)
+        return _Response(responses[type(provider)])
+
+    monkeypatch.setattr("srclight.embeddings.urllib.request.urlopen", fake_urlopen)
+
+    result = getattr(provider, method_name)(*call_args)
+    assert result
+    assert seen_timeouts == [expected_timeout]
+
+
+def test_indexer_build_embeddings_uses_index_timeout(tmp_path, monkeypatch):
+    from srclight.indexer import IndexConfig, Indexer
+
+    seen: dict[str, object] = {}
+
+    class _FakeProvider:
+        name = "ollama:qwen3-embedding:4b"
+        dimensions = 4
+
+    class _FakeDB:
+        def get_symbols_needing_embeddings(self, model):
+            seen["model_name"] = model
+            return []
+
+    def fake_get_provider(model_spec, **kwargs):
+        seen["model_spec"] = model_spec
+        seen["timeout"] = kwargs.get("timeout")
+        return _FakeProvider()
+
+    monkeypatch.setattr("srclight.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setenv("SRCLIGHT_INDEX_EMBED_REQUEST_TIMEOUT", "240")
+
+    indexer = Indexer(_FakeDB(), IndexConfig(root=tmp_path))
+    assert indexer._build_embeddings(DEFAULT_OLLAMA_EMBED_MODEL) == 0
+    assert seen == {
+        "model_spec": DEFAULT_OLLAMA_EMBED_MODEL,
+        "timeout": 240,
+        "model_name": "ollama:qwen3-embedding:4b",
+    }
+
+
+def test_indexer_build_embeddings_emits_provider_dims_rates_and_smoothed_eta(tmp_path, monkeypatch):
+    from srclight.indexer import IndexConfig, Indexer
+
+    class _FakeProvider:
+        name = "ollama:qwen3-embedding:4b"
+        dimensions = 2560
+
+    class _FakeDB:
+        def __init__(self):
+            self.upserted = []
+            self.committed = 0
+            self.conn = object()
+
+        def get_symbols_needing_embeddings(self, model):
+            return [
+                {"id": i, "body_hash": f"h{i}"}
+                for i in range(1, 66)
+            ]
+
+        def upsert_embedding(self, symbol_id, provider_name, dims, emb_bytes, body_hash):
+            self.upserted.append((symbol_id, provider_name, dims, body_hash))
+
+        def commit(self):
+            self.committed += 1
+
+    timeline = iter([100.0, 101.0, 103.0, 106.0, 106.0])
+    events = []
+
+    def fake_get_provider(model_spec, **kwargs):
+        return _FakeProvider()
+
+    def fake_embed_symbols(provider, symbols, on_progress=None, batch_size=32):
+        assert batch_size == 32
+        if on_progress is not None:
+            on_progress(1, 3)
+            on_progress(2, 3)
+            on_progress(3, 3)
+        return [(symbol["id"], b"vec") for symbol in symbols]
+
+    monkeypatch.setattr("srclight.embeddings.get_provider", fake_get_provider)
+    monkeypatch.setattr("srclight.embeddings.embed_symbols", fake_embed_symbols)
+    monkeypatch.setattr("srclight.indexer.time.monotonic", lambda: next(timeline))
+    monkeypatch.setattr("srclight.vector_cache.VectorCache.build_from_db", lambda self, conn: None)
+
+    db = _FakeDB()
+    indexer = Indexer(db, IndexConfig(root=tmp_path))
+
+    assert indexer._build_embeddings(DEFAULT_OLLAMA_EMBED_MODEL, on_event=events.append) == 65
+    assert len(db.upserted) == 65
+    assert db.committed >= 1
+
+    assert events[0]["detail"] == "65 symbols | ollama:qwen3-embedding:4b | 2560d"
+    assert "32.0 sym/s" in events[1]["detail"]
+    assert "1.00 batch/s" in events[1]["detail"]
+    assert events[1]["remaining_seconds"] == 0
+    assert "21.3 sym/s" in events[2]["detail"]
+    assert "0.67 batch/s" in events[2]["detail"]
+    assert events[2]["remaining_seconds"] == 2
+    assert "10.8 sym/s" in events[3]["detail"]
+    assert "0.50 batch/s" in events[3]["detail"]
+    assert "0.50 batch/s" in events[4]["detail"]
 
 
 # --- Test embed_symbols ---
@@ -390,5 +1028,114 @@ def test_db_embeddings_incremental(tmp_path):
     needing = db.get_symbols_needing_embeddings(provider.name)
     assert len(needing) == 1
     assert needing[0]["id"] == sym_id
+
+    db.close()
+
+
+def test_db_symbols_needing_embeddings_decode_metadata_for_wave1_backend_text(tmp_path):
+    """DB embedding fetches should preserve JSON metadata for backend summary text."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+
+    file_id = db.upsert_file(FileRecord(
+        path="server/src/modules/auth/auth.controller.ts",
+        content_hash="backend-hash",
+        mtime=1.0,
+        language="typescript",
+        size=200,
+        line_count=20,
+    ))
+
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="route_handler",
+        name="getMe",
+        signature="GET /auth/me",
+        start_line=1,
+        end_line=3,
+        content="getMe() { return this.auth.me(); }",
+        body_hash="route-v1",
+        metadata={
+            "framework": "nestjs",
+            "resource": "route_handler",
+            "http_method": "GET",
+            "route_path": "/auth/me",
+            "controller_path": "/auth",
+        },
+    ), "server/src/modules/auth/auth.controller.ts")
+
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="module",
+        name="AuthModule",
+        signature="Nest module AuthModule",
+        start_line=5,
+        end_line=12,
+        content="export class AuthModule {}",
+        body_hash="module-v1",
+        metadata={
+            "framework": "nestjs",
+            "resource": "module",
+            "imports": ["AuthModule", "ConfigModule", "TypeOrmModule"],
+            "controllers": ["AuthController"],
+            "providers": ["AuthService", "JwtAuthGuard"],
+            "exports": ["AuthService"],
+        },
+    ), "server/src/modules/auth/auth.controller.ts")
+
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="schema",
+        name="UserSchema",
+        signature="mongoose schema | User | users",
+        start_line=14,
+        end_line=18,
+        content="export const UserSchema = SchemaFactory.createForClass(User);",
+        body_hash="schema-v1",
+        metadata={
+            "framework": "mongoose",
+            "resource": "schema",
+            "entity_name": "User",
+            "collection_name": "users",
+        },
+    ), "server/src/modules/auth/auth.controller.ts")
+
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="entity",
+        name="User",
+        signature="mikroorm entity | User | users",
+        start_line=20,
+        end_line=28,
+        content="export class User { id!: number; email!: string; }",
+        body_hash="entity-v1",
+        metadata={
+            "framework": "mikroorm",
+            "resource": "entity",
+            "entity_name": "User",
+            "table_name": "users",
+            "fields": [
+                {"name": "id", "field_name": "id", "kind": "primary_key"},
+                {"name": "email", "field_name": "email_address", "kind": "property"},
+            ],
+        },
+    ), "server/src/modules/auth/auth.controller.ts")
+    db.commit()
+
+    needing = db.get_symbols_needing_embeddings("mock:test-model")
+
+    assert len(needing) == 4
+    assert all(isinstance(symbol["metadata"], dict) for symbol in needing)
+
+    prepared = "\n".join(prepare_embedding_text(symbol) for symbol in needing)
+
+    assert "GET /auth/me" in prepared
+    assert "module AuthModule" in prepared
+    assert "schema users" in prepared
+    assert "mikroorm entity User" in prepared
 
     db.close()

@@ -18,21 +18,112 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import struct
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger("srclight.embeddings")
 
-# Timeout for embedding API requests (MCP tool path). Kept short so Cursor/IDE
-# tool calls don't hang; indexing can set SRCLIGHT_EMBED_REQUEST_TIMEOUT=120.
-def _embed_request_timeout() -> int:
+# Default Ollama embedding model used by the bare `--embed` CLI UX.
+DEFAULT_OLLAMA_EMBED_MODEL = "ollama:qwen3-embedding:4b"
+
+
+def _transport_aliases(transport: str) -> list[str]:
+    transport_lower = (transport or "").strip().lower()
+    if not transport_lower:
+        return []
+    if transport_lower == "rmq":
+        return ["rabbitmq"]
+    return []
+
+
+def _redact_connection_url(connection_url: str) -> str:
+    """Strip credentials from a transport connection URL."""
+    normalized = connection_url.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"', "`"}:
+        normalized = normalized[1:-1].strip()
+
     try:
-        return int(os.environ.get("SRCLIGHT_EMBED_REQUEST_TIMEOUT", "20"))
+        parsed = urlsplit(normalized)
     except ValueError:
-        return 20
+        return normalized
+
+    if not parsed.scheme or not parsed.hostname:
+        return normalized
+
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+
+    netloc = host
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _timeout_from_env(var_name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(var_name, str(default)))
+    except ValueError:
+        return default
+
+
+# Timeout for interactive embedding API requests (MCP tool path). Kept short so
+# Cursor/IDE tool calls don't hang; indexing uses a longer timeout.
+def _embed_request_timeout() -> int:
+    return _timeout_from_env("SRCLIGHT_EMBED_REQUEST_TIMEOUT", 20)
+
+
+def _index_embed_request_timeout() -> int:
+    return _timeout_from_env("SRCLIGHT_INDEX_EMBED_REQUEST_TIMEOUT", 120)
+
+
+_OLLAMA_MODEL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+_KNOWN_OLLAMA_EMBED_MODEL_TOKENS = {
+    "arctic",
+    "bge",
+    "e5",
+    "embeddinggemma",
+    "gte",
+    "jina",
+    "minilm",
+    "mxbai",
+    "nomic",
+    "qwen",
+    "qwen3",
+    "snowflake",
+}
+
+
+def _looks_like_ollama_model(model: str) -> bool:
+    """Heuristically recognize unprefixed Ollama model strings.
+
+    Explicit prefixes are handled separately. For unprefixed strings, accept
+    plain model names like `qwen3-embedding` and tagged names like
+    `qwen3-embedding:4b` for known Ollama embedding families. Arbitrary/custom
+    Ollama names should use the explicit `ollama:` prefix.
+    """
+    if not model:
+        return False
+    base, sep, tag = model.partition(":")
+    if not _OLLAMA_MODEL_NAME_RE.match(base):
+        return False
+
+    tokens = {token for token in re.split(r"[-_.]", base) if token}
+    if not any(token in _KNOWN_OLLAMA_EMBED_MODEL_TOKENS for token in tokens):
+        return False
+    if not sep:
+        return True
+    if not tag:
+        return False
+    if tag == "latest":
+        return True
+    return any(ch.isdigit() for ch in tag)
 
 
 # --- Embedding text preparation ---
@@ -66,6 +157,160 @@ def prepare_embedding_text(symbol: dict) -> str:
     if content:
         # Truncate to ~2000 chars (~500 tokens) to stay within limits
         parts.append(content[:2000])
+
+    metadata = symbol.get("metadata") or {}
+    if isinstance(metadata, dict):
+        metadata_parts = []
+        symbol_name = symbol.get("name") or ""
+        resource = metadata.get("resource")
+        framework = metadata.get("framework")
+
+        if framework or resource:
+            metadata_parts.append(" ".join(part for part in (framework, resource) if part))
+
+        if resource == "route_handler":
+            method = metadata.get("http_method")
+            route_path = metadata.get("route_path")
+            controller_path = metadata.get("controller_path")
+            if framework and method and route_path:
+                metadata_parts.append(f"{framework} route {method} {route_path}")
+            if controller_path:
+                metadata_parts.append(f"controller {controller_path}")
+
+        if resource == "module" and symbol_name:
+            metadata_parts.append(f"module {symbol_name}")
+            for key, label in (
+                ("imports", "imports"),
+                ("controllers", "controllers"),
+                ("providers", "providers"),
+                ("exports", "exports"),
+            ):
+                values = metadata.get(key)
+                if isinstance(values, list) and values:
+                    metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+
+        for key, label in (
+            ("entity_name", "entity"),
+            ("table_name", "table"),
+            ("collection_name", "collection"),
+            ("repository_owner", "repository owner"),
+        ):
+            value = metadata.get(key)
+            if value:
+                metadata_parts.append(f"{label}: {value}")
+
+        entity_name = metadata.get("entity_name") or symbol_name
+        collection_name = metadata.get("collection_name")
+        if framework and resource == "entity" and entity_name:
+            metadata_parts.append(f"{framework} entity {entity_name}")
+        if framework and resource == "schema":
+            if entity_name:
+                metadata_parts.append(f"{framework} schema {entity_name}")
+            if collection_name:
+                metadata_parts.append(f"schema {collection_name}")
+        if framework and resource == "repository" and entity_name:
+            metadata_parts.append(f"{framework} repository {entity_name}")
+        if framework and resource == "database":
+            names = metadata.get("entity_names")
+            if isinstance(names, list) and names:
+                metadata_parts.append(f"{framework} database " + ", ".join(str(value) for value in names))
+
+        if resource == "microservice_handler":
+            for key, label in (
+                ("pattern", "pattern"),
+                ("message_pattern", "message pattern"),
+                ("event_pattern", "event pattern"),
+                ("queue_name", "queue"),
+                ("transport", "transport"),
+                ("role", "role"),
+            ):
+                value = metadata.get(key)
+                if value:
+                    metadata_parts.append(f"{label}: {value}")
+            role = metadata.get("role")
+            queue_name = metadata.get("queue_name")
+            transport = metadata.get("transport")
+            if role:
+                metadata_parts.append(f"{role} message handler")
+            if queue_name and role:
+                metadata_parts.append(f"{role} queue {queue_name}")
+            if transport:
+                for alias in _transport_aliases(str(transport)):
+                    metadata_parts.append(f"transport: {alias}")
+
+        if resource == "queue_processor":
+            for key, label in (
+                ("queue_name", "queue"),
+                ("job_name", "job"),
+                ("transport", "transport"),
+                ("role", "role"),
+            ):
+                value = metadata.get(key)
+                if value:
+                    metadata_parts.append(f"{label}: {value}")
+            role = metadata.get("role")
+            queue_name = metadata.get("queue_name")
+            if role:
+                metadata_parts.append(f"{role} worker")
+            if queue_name and role:
+                metadata_parts.append(f"{role} queue {queue_name}")
+
+        if resource == "scheduled_job":
+            schedule_type = metadata.get("schedule_type")
+            if schedule_type:
+                metadata_parts.append(f"schedule: {schedule_type}")
+            for key, label in (
+                ("cron", "cron"),
+                ("interval_name", "interval"),
+                ("every_ms", "every ms"),
+                ("timeout_name", "timeout"),
+                ("delay_ms", "delay ms"),
+            ):
+                value = metadata.get(key)
+                if value is not None:
+                    metadata_parts.append(f"{label}: {value}")
+
+        if resource == "transport":
+            for key, label in (
+                ("transport", "transport"),
+                ("queue_name", "queue"),
+                ("connection_url", "connection"),
+                ("role", "role"),
+            ):
+                value = metadata.get(key)
+                if value:
+                    if key == "connection_url":
+                        value = _redact_connection_url(str(value))
+                    metadata_parts.append(f"{label}: {value}")
+
+        for key, label in (
+            ("entity_names", "entities"),
+            ("collection_names", "collections"),
+        ):
+            values = metadata.get(key)
+            if isinstance(values, list) and values:
+                metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+
+        fields = metadata.get("fields")
+        if isinstance(fields, list) and fields:
+            field_summaries = []
+            for field in fields:
+                if not isinstance(field, dict):
+                    continue
+                field_name = field.get("name")
+                storage_name = field.get("field_name")
+                field_kind = field.get("kind")
+                if field_name and storage_name and storage_name != field_name:
+                    field_summaries.append(f"{field_name} -> {storage_name} ({field_kind})")
+                elif field_name:
+                    field_summaries.append(
+                        f"{field_name} ({field_kind})" if field_kind else str(field_name)
+                    )
+            if field_summaries:
+                metadata_parts.append("fields: " + ", ".join(field_summaries))
+
+        if metadata_parts:
+            parts.append("\n".join(metadata_parts))
 
     return "\n".join(parts)
 
@@ -104,15 +349,21 @@ class EmbeddingProvider(ABC):
 class OllamaProvider(EmbeddingProvider):
     """Embed via Ollama's HTTP API (local, zero Python ML deps).
 
-    Default model: qwen3-embedding (best quality available locally).
-    Fallback: nomic-embed-text (lighter, well-tested).
+    Default model: qwen3-embedding:4b (best quality available locally).
+    Alternative: nomic-embed-text-v2-moe (strong multilingual fallback).
 
     Ollama endpoint: http://localhost:11434 (accessible from WSL to Windows Ollama).
     """
 
-    def __init__(self, model: str = "qwen3-embedding", base_url: str = "http://localhost:11434"):
+    def __init__(
+        self,
+        model: str = "qwen3-embedding:4b",
+        base_url: str = "http://localhost:11434",
+        timeout: int | None = None,
+    ):
         self._model = model
         self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
         self._dimensions: int | None = None
 
     @property
@@ -139,7 +390,8 @@ class OllamaProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
+            timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
         except urllib.error.URLError as e:
             raise ConnectionError(
@@ -164,10 +416,11 @@ class OllamaProvider(EmbeddingProvider):
         try:
             url = f"{self._base_url}/api/tags"
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
-            models = [m.get("name", "").split(":")[0] for m in data.get("models", [])]
-            return self._model in models or f"{self._model}:latest" in models
+            models = [m.get("name", "") for m in data.get("models", [])]
+            return any(self._matches_model(name) for name in models)
         except Exception:
             return False
 
@@ -176,7 +429,8 @@ class OllamaProvider(EmbeddingProvider):
         try:
             url = f"{self._base_url}/api/tags"
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
             return [m.get("name", "") for m in data.get("models", [])]
         except Exception:
@@ -194,6 +448,22 @@ class OllamaProvider(EmbeddingProvider):
         # This can take a while for large models
         with urllib.request.urlopen(req, timeout=600) as resp:
             resp.read()
+
+    def _matches_model(self, tag_name: str) -> bool:
+        """Match Ollama tag names against the configured model string."""
+        if not tag_name:
+            return False
+        if tag_name == self._model:
+            return True
+        if self._model.startswith("ollama:") and tag_name == self._model.split(":", 1)[1]:
+            return True
+        if tag_name.endswith(":latest") and tag_name[:-7] == self._model:
+            return True
+        if tag_name.endswith(":latest") and self._model == tag_name[:-7]:
+            return True
+        if ":" not in self._model and tag_name.split(":", 1)[0] == self._model:
+            return True
+        return False
 
 
 # --- OpenAI-compatible provider ---
@@ -215,11 +485,13 @@ class OpenAIProvider(EmbeddingProvider):
         model: str = "text-embedding-3-small",
         api_key: str | None = None,
         base_url: str | None = None,
+        timeout: int | None = None,
     ):
         import os
         self._model = model
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._base_url = (base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com")).rstrip("/")
+        self._timeout = timeout
         self._dimensions: int | None = None
         if not self._api_key:
             raise ValueError(
@@ -257,7 +529,8 @@ class OpenAIProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
+            timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode() if hasattr(e, 'read') else str(e)
@@ -296,10 +569,16 @@ class CohereProvider(EmbeddingProvider):
 
     API_URL = "https://api.cohere.com/v2/embed"
 
-    def __init__(self, api_key: str | None = None, model: str = "embed-v4.0"):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "embed-v4.0",
+        timeout: int | None = None,
+    ):
         import os
         self._api_key = api_key or os.environ.get("COHERE_API_KEY", "")
         self._model = model
+        self._timeout = timeout
         if not self._api_key:
             raise ValueError(
                 "Cohere API key required. Set COHERE_API_KEY environment variable "
@@ -334,7 +613,8 @@ class CohereProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
+            timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode() if hasattr(e, 'read') else str(e)
@@ -367,10 +647,16 @@ class VoyageProvider(EmbeddingProvider):
 
     API_URL = "https://api.voyageai.com/v1/embeddings"
 
-    def __init__(self, api_key: str | None = None, model: str = "voyage-code-3"):
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = "voyage-code-3",
+        timeout: int | None = None,
+    ):
         import os
         self._api_key = api_key or os.environ.get("VOYAGE_API_KEY", "")
         self._model = model
+        self._timeout = timeout
         if not self._api_key:
             raise ValueError(
                 "Voyage API key required. Set VOYAGE_API_KEY environment variable "
@@ -404,7 +690,8 @@ class VoyageProvider(EmbeddingProvider):
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=_embed_request_timeout()) as resp:
+            timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode() if hasattr(e, 'read') else str(e)
@@ -520,7 +807,7 @@ def get_provider(model: str, **kwargs) -> EmbeddingProvider:
     """Create an embedding provider from a model specifier.
 
     Formats:
-        "ollama:qwen3-embedding" or "qwen3-embedding" -> OllamaProvider
+        "ollama:qwen3-embedding:4b" or "qwen3-embedding:4b" -> OllamaProvider
         "openai:text-embedding-3-small" -> OpenAIProvider
         "cohere:embed-v4.0" or "embed-v4.0" -> CohereProvider
         "voyage:voyage-code-3" or "voyage-code-3" -> VoyageProvider
@@ -528,36 +815,41 @@ def get_provider(model: str, **kwargs) -> EmbeddingProvider:
     OpenAI-compatible providers (Together, Fireworks, Mistral, vLLM, etc.)
     use the "openai:" prefix with OPENAI_BASE_URL env var to set the endpoint.
     """
-    if ":" in model:
+    explicit_prefixes = ("openai:", "cohere:", "voyage:", "ollama:")
+    if model.startswith(explicit_prefixes):
         provider_type, model_name = model.split(":", 1)
+    elif model.startswith("voyage"):
+        provider_type = "voyage"
+        model_name = model
+    elif model.startswith("embed-") and ("v3" in model or "v4" in model):
+        provider_type = "cohere"
+        model_name = model
+    elif model.startswith("text-embedding"):
+        provider_type = "openai"
+        model_name = model
+    elif _looks_like_ollama_model(model):
+        provider_type = "ollama"
+        model_name = model
     else:
-        # Default: infer provider from model name prefix
-        if model.startswith("voyage"):
-            provider_type = "voyage"
-            model_name = model
-        elif model.startswith("embed-") and ("v3" in model or "v4" in model):
-            provider_type = "cohere"
-            model_name = model
-        elif model.startswith("text-embedding"):
-            provider_type = "openai"
-            model_name = model
-        else:
-            provider_type = "ollama"
-            model_name = model
+        raise ValueError(f"Unknown embedding provider: {model}")
 
     if provider_type == "ollama":
         base_url = kwargs.get("base_url", "http://localhost:11434")
-        return OllamaProvider(model=model_name, base_url=base_url)
+        timeout = kwargs.get("timeout")
+        return OllamaProvider(model=model_name, base_url=base_url, timeout=timeout)
     elif provider_type == "openai":
         api_key = kwargs.get("api_key")
         base_url = kwargs.get("base_url")
-        return OpenAIProvider(model=model_name, api_key=api_key, base_url=base_url)
+        timeout = kwargs.get("timeout")
+        return OpenAIProvider(model=model_name, api_key=api_key, base_url=base_url, timeout=timeout)
     elif provider_type == "cohere":
         api_key = kwargs.get("api_key")
-        return CohereProvider(api_key=api_key, model=model_name)
+        timeout = kwargs.get("timeout")
+        return CohereProvider(api_key=api_key, model=model_name, timeout=timeout)
     elif provider_type == "voyage":
         api_key = kwargs.get("api_key")
-        return VoyageProvider(api_key=api_key, model=model_name)
+        timeout = kwargs.get("timeout")
+        return VoyageProvider(api_key=api_key, model=model_name, timeout=timeout)
     else:
         raise ValueError(f"Unknown embedding provider: {provider_type}")
 
