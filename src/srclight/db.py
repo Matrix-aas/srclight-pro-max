@@ -1976,20 +1976,102 @@ class Database:
                     (member["id"], c["id"]),
                 )
 
-    def get_communities(self) -> list[dict]:
-        """Get all communities with stats."""
+    def _file_filter_sql(
+        self,
+        *,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+        file_alias: str = "f",
+    ) -> tuple[str, list[str]]:
+        """Build a SQL fragment for optional file path filters."""
+        clauses: list[str] = []
+        params: list[str] = []
+        if path_prefix:
+            clauses.append(f"{file_alias}.path LIKE ?")
+            params.append(f"{path_prefix}%")
+        if layer:
+            clauses.append(f"{file_alias}.path LIKE ?")
+            params.append(f"{layer}/%")
+        if not clauses:
+            return "", []
+        return " AND " + " AND ".join(clauses), params
+
+    def get_community_records(
+        self,
+        *,
+        limit: int | None = None,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+    ) -> list[dict]:
+        """Get community metadata with optional member-based file filters."""
         assert self.conn is not None
-        rows = self.conn.execute(
-            "SELECT * FROM communities ORDER BY symbol_count DESC"
-        ).fetchall()
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
+        query = (
+            """SELECT c.id, c.label, c.symbol_count, c.cohesion, c.keywords,
+                      COUNT(sc.symbol_id) AS member_count
+               FROM communities c
+               JOIN symbol_communities sc ON sc.community_id = c.id
+               JOIN symbols s ON sc.symbol_id = s.id
+               JOIN files f ON s.file_id = f.id
+               WHERE 1 = 1"""
+            + filter_sql
+            + """
+               GROUP BY c.id, c.label, c.symbol_count, c.cohesion, c.keywords
+               HAVING COUNT(sc.symbol_id) > 0
+               ORDER BY member_count DESC, c.symbol_count DESC, c.id"""
+        )
+        params: list[Any] = list(filter_params)
+        if limit is not None:
+            query += "\n               LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
         return [
             {
-                "id": r["id"], "label": r["label"],
-                "symbol_count": r["symbol_count"], "cohesion": r["cohesion"],
-                "keywords": json.loads(r["keywords"] or "[]"),
+                "id": row["id"],
+                "label": row["label"],
+                "symbol_count": row["symbol_count"],
+                "member_count": row["member_count"],
+                "cohesion": row["cohesion"],
+                "keywords": json.loads(row["keywords"] or "[]"),
             }
-            for r in rows
+            for row in rows
         ]
+
+    def get_communities(
+        self,
+        *,
+        verbose: bool = False,
+        limit: int | None = 25,
+        member_limit: int | None = 5,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+    ) -> list[dict]:
+        """Get shaped community results for summary or verbose consumers."""
+        communities = self.get_community_records(
+            limit=limit,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
+        results: list[dict] = []
+        for community in communities:
+            members = self.get_community_members(
+                community["id"],
+                limit=member_limit,
+                path_prefix=path_prefix,
+                layer=layer,
+                verbose=verbose,
+            )
+            results.append(
+                {
+                    "id": community["id"],
+                    "label": community["label"],
+                    "member_count": community["member_count"],
+                    "cohesion": community["cohesion"],
+                    "keywords": community["keywords"],
+                    "members": members,
+                }
+            )
+        return results
 
     def get_community_for_symbol(self, symbol_id: int) -> int | None:
         """Get the community ID for a symbol, or None."""
@@ -2000,19 +2082,45 @@ class Database:
         ).fetchone()
         return row["community_id"] if row else None
 
-    def get_community_members(self, community_id: int) -> list[dict]:
-        """Get all symbols in a community."""
+    def get_community_members(
+        self,
+        community_id: int,
+        *,
+        limit: int | None = None,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+        verbose: bool = True,
+    ) -> list[dict]:
+        """Get community members with optional file filters and compact shaping."""
         assert self.conn is not None
-        rows = self.conn.execute(
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
+        query = (
             """SELECT s.id, s.name, s.qualified_name, s.kind, f.path as file_path
                FROM symbol_communities sc
                JOIN symbols s ON sc.symbol_id = s.id
                JOIN files f ON s.file_id = f.id
-               WHERE sc.community_id = ?
-               ORDER BY s.name""",
-            (community_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+               WHERE sc.community_id = ?"""
+            + filter_sql
+            + """
+               ORDER BY s.name"""
+        )
+        params: list[Any] = [community_id, *filter_params]
+        if limit is not None:
+            query += "\n               LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        members: list[dict] = []
+        for row in rows:
+            member = {
+                "name": row["name"],
+                "kind": row["kind"],
+                "file_path": row["file_path"],
+            }
+            if verbose:
+                member["id"] = row["id"]
+                member["qualified_name"] = row["qualified_name"]
+            members.append(member)
+        return members
 
     # --- Execution Flows ---
 
@@ -2038,19 +2146,114 @@ class Database:
                     (flow_id, step["order"], step["symbol_id"], step.get("community_id")),
                 )
 
-    def get_execution_flows(self, limit: int = 50) -> list[dict]:
-        """Get top execution flows ordered by step count."""
+    def get_execution_flow_records(
+        self,
+        limit: int | None = 50,
+        *,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+    ) -> list[dict]:
+        """Get raw execution flow rows with optional step-based file filters."""
         assert self.conn is not None
-        rows = self.conn.execute(
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
+        query = (
             """SELECT ef.*, s1.name as entry_name, s2.name as terminal_name
                FROM execution_flows ef
                LEFT JOIN symbols s1 ON ef.entry_symbol_id = s1.id
-               LEFT JOIN symbols s2 ON ef.terminal_symbol_id = s2.id
-               ORDER BY ef.step_count DESC
-               LIMIT ?""",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+               LEFT JOIN symbols s2 ON ef.terminal_symbol_id = s2.id"""
+        )
+        params: list[Any] = []
+        if filter_sql:
+            query += (
+                """
+               WHERE EXISTS (
+                   SELECT 1
+                   FROM flow_steps fs
+                   JOIN symbols s ON fs.symbol_id = s.id
+                   JOIN files f ON s.file_id = f.id
+                   WHERE fs.flow_id = ef.id"""
+                + filter_sql
+                + """
+               )"""
+            )
+            params.extend(filter_params)
+        query += "\n               ORDER BY ef.step_count DESC, ef.id"
+        if limit is not None:
+            query += "\n               LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def _count_flow_steps(
+        self,
+        flow_id: int,
+        *,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+    ) -> int:
+        """Count steps in a flow after optional file filters are applied."""
+        assert self.conn is not None
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
+        row = self.conn.execute(
+            (
+                """SELECT COUNT(*) AS step_count
+                   FROM flow_steps fs
+                   JOIN symbols s ON fs.symbol_id = s.id
+                   JOIN files f ON s.file_id = f.id
+                   WHERE fs.flow_id = ?"""
+                + filter_sql
+            ),
+            (flow_id, *filter_params),
+        ).fetchone()
+        return row["step_count"] if row else 0
+
+    def get_execution_flows(
+        self,
+        limit: int | None = 50,
+        *,
+        verbose: bool = False,
+        max_depth: int | None = None,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+    ) -> list[dict]:
+        """Get shaped execution flow results for summary or verbose consumers."""
+        flows = self.get_execution_flow_records(
+            limit=limit,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
+        results: list[dict] = []
+        step_limit = max_depth if max_depth is not None else (None if verbose else 3)
+        for flow in flows:
+            total_steps = self._count_flow_steps(
+                flow["id"],
+                path_prefix=path_prefix,
+                layer=layer,
+            )
+            steps = self.get_flow_steps(
+                flow["id"],
+                limit=step_limit,
+                path_prefix=path_prefix,
+                layer=layer,
+                verbose=verbose,
+            )
+            item = {
+                "id": flow["id"],
+                "label": flow["label"],
+                "entry": flow["entry_name"],
+                "terminal": flow["terminal_name"],
+                "step_count": total_steps,
+                "communities_crossed": flow["communities_crossed"],
+                "truncated": total_steps > len(steps),
+            }
+            if max_depth is not None:
+                item["max_depth_applied"] = max_depth
+            if verbose:
+                item["steps"] = steps
+            elif steps:
+                item["key_steps"] = steps
+            results.append(item)
+        return results
 
     def get_flows_for_symbol(self, symbol_id: int) -> list[dict]:
         """Get all execution flows that pass through a symbol."""
@@ -2067,20 +2270,48 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_flow_steps(self, flow_id: int) -> list[dict]:
-        """Get ordered steps for a specific flow."""
+    def get_flow_steps(
+        self,
+        flow_id: int,
+        *,
+        limit: int | None = None,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+        verbose: bool = True,
+    ) -> list[dict]:
+        """Get ordered steps for a specific flow with optional compact shaping."""
         assert self.conn is not None
-        rows = self.conn.execute(
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
+        query = (
             """SELECT fs.step_order, fs.symbol_id, fs.community_id,
                       s.name, s.qualified_name, s.kind, f.path as file_path
                FROM flow_steps fs
                JOIN symbols s ON fs.symbol_id = s.id
                JOIN files f ON s.file_id = f.id
-               WHERE fs.flow_id = ?
-               ORDER BY fs.step_order""",
-            (flow_id,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+               WHERE fs.flow_id = ?"""
+            + filter_sql
+            + """
+               ORDER BY fs.step_order"""
+        )
+        params: list[Any] = [flow_id, *filter_params]
+        if limit is not None:
+            query += "\n               LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        steps: list[dict] = []
+        for row in rows:
+            step = {
+                "step_order": row["step_order"],
+                "name": row["name"],
+                "kind": row["kind"],
+                "file_path": row["file_path"],
+                "community_id": row["community_id"],
+            }
+            if verbose:
+                step["symbol_id"] = row["symbol_id"]
+                step["qualified_name"] = row["qualified_name"]
+            steps.append(step)
+        return steps
 
     # --- Stats ---
 

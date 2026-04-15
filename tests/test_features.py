@@ -5,7 +5,7 @@ import json
 import pytest
 
 import srclight.server as server
-from srclight.db import Database, FileRecord, SymbolRecord, split_identifier
+from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord, split_identifier
 from srclight.indexer import IndexConfig, Indexer
 
 
@@ -56,6 +56,138 @@ def _insert_search_symbol(
         ),
         path,
     )
+
+
+def _store_server_flow_graph(db: Database) -> None:
+    from srclight.community import detect_communities, trace_execution_flows
+
+    server_file = db.upsert_file(
+        FileRecord(
+            path="server/app.ts",
+            content_hash="server/app.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    server_db_file = db.upsert_file(
+        FileRecord(
+            path="server/data.ts",
+            content_hash="server/data.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    worker_file = db.upsert_file(
+        FileRecord(
+            path="worker/jobs.ts",
+            content_hash="worker/jobs.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+
+    bootstrap = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="bootstrap",
+            qualified_name="server.bootstrap",
+            start_line=1,
+            end_line=5,
+            content="bootstrap calls routeRequest",
+            line_count=5,
+        ),
+        "server/app.ts",
+    )
+    route_request = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="routeRequest",
+            qualified_name="server.routeRequest",
+            start_line=6,
+            end_line=10,
+            content="routeRequest calls fetchUser",
+            line_count=5,
+        ),
+        "server/app.ts",
+    )
+    fetch_user = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_db_file,
+            kind="function",
+            name="fetchUser",
+            qualified_name="server.fetchUser",
+            start_line=1,
+            end_line=5,
+            content="fetchUser calls hydrateUser",
+            line_count=5,
+        ),
+        "server/data.ts",
+    )
+    hydrate_user = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_db_file,
+            kind="function",
+            name="hydrateUser",
+            qualified_name="server.hydrateUser",
+            start_line=6,
+            end_line=10,
+            content="hydrateUser terminal",
+            line_count=5,
+        ),
+        "server/data.ts",
+    )
+    run_jobs = db.insert_symbol(
+        SymbolRecord(
+            file_id=worker_file,
+            kind="function",
+            name="runJobs",
+            qualified_name="worker.runJobs",
+            start_line=1,
+            end_line=5,
+            content="runJobs calls sendEmail",
+            line_count=5,
+        ),
+        "worker/jobs.ts",
+    )
+    send_email = db.insert_symbol(
+        SymbolRecord(
+            file_id=worker_file,
+            kind="function",
+            name="sendEmail",
+            qualified_name="worker.sendEmail",
+            start_line=6,
+            end_line=10,
+            content="sendEmail terminal",
+            line_count=5,
+        ),
+        "worker/jobs.ts",
+    )
+
+    db.insert_edge(EdgeRecord(source_id=bootstrap, target_id=route_request, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=route_request, target_id=fetch_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=fetch_user, target_id=hydrate_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=run_jobs, target_id=send_email, edge_type="calls"))
+    db.commit()
+
+    communities = detect_communities(db)
+    sym_to_comm = {
+        member["id"]: community["id"]
+        for community in communities
+        for member in community["members"]
+    }
+    flows = trace_execution_flows(db, sym_to_comm)
+
+    db.store_communities(communities)
+    db.store_execution_flows(flows)
+    db.commit()
 
 
 # --- 1. CamelCase / identifier splitting ---
@@ -424,6 +556,62 @@ def test_fallback_hint_suggests_tokenized_identifier_search(monkeypatch, db):
         'Try search_symbols("auth routes") for tokenized identifier search'
         in payload["suggestions"]
     )
+
+
+def test_get_communities_summary_first_by_default(monkeypatch, db):
+    _store_server_flow_graph(db)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    communities = json.loads(
+        server.get_communities(member_limit=2, path_prefix="server/", layer="server")
+    )
+
+    assert communities["communities"]
+    assert communities["communities"][0]["member_count"] >= len(communities["communities"][0]["members"])
+    assert len(communities["communities"][0]["members"]) <= 2
+
+
+def test_get_communities_verbose_returns_detailed_members(monkeypatch, db):
+    _store_server_flow_graph(db)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    communities = json.loads(server.get_communities(verbose=True))
+
+    assert communities["communities"]
+    assert communities["communities"][0]["members"]
+    assert "qualified_name" in communities["communities"][0]["members"][0]
+
+
+def test_get_execution_flows_summary_first_by_default(monkeypatch, db):
+    _store_server_flow_graph(db)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_execution_flows())
+
+    assert payload["flows"]
+    assert payload["flows"][0]["truncated"] is True
+    assert "steps" not in payload["flows"][0]
+
+
+def test_get_execution_flows_verbose_and_filtered(monkeypatch, db):
+    _store_server_flow_graph(db)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    verbose = json.loads(server.get_execution_flows(verbose=True, max_depth=4))
+    filtered = json.loads(server.get_execution_flows(path_prefix="server/", layer="server"))
+
+    assert verbose["flows"]
+    assert verbose["flows"][0]["steps"]
+    assert verbose["flows"][0]["max_depth_applied"] == 4
+    assert filtered["flows"]
 
 
 # --- 2. Call graph edges ---

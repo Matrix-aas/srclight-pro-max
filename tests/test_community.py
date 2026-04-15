@@ -84,6 +84,74 @@ def _build_test_graph(db):
     }
 
 
+def _store_server_and_worker_flows(db):
+    """Store communities and execution flows spanning server and worker paths."""
+    from srclight.community import detect_communities, trace_execution_flows
+
+    server_file = db.upsert_file(FileRecord(
+        path="server/app.py", content_hash="server-app", mtime=1.0,
+        language="python", size=120, line_count=20,
+    ))
+    server_db_file = db.upsert_file(FileRecord(
+        path="server/db.py", content_hash="server-db", mtime=1.0,
+        language="python", size=120, line_count=20,
+    ))
+    worker_file = db.upsert_file(FileRecord(
+        path="worker/jobs.py", content_hash="worker-jobs", mtime=1.0,
+        language="python", size=120, line_count=20,
+    ))
+
+    bootstrap = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="bootstrap",
+        qualified_name="server.bootstrap", start_line=1, end_line=5,
+        content="def bootstrap(): route_request()",
+    ), file_path="server/app.py")
+    route_request = db.insert_symbol(SymbolRecord(
+        file_id=server_file, kind="function", name="route_request",
+        qualified_name="server.route_request", start_line=6, end_line=10,
+        content="def route_request(): load_user()",
+    ), file_path="server/app.py")
+    load_user = db.insert_symbol(SymbolRecord(
+        file_id=server_db_file, kind="function", name="load_user",
+        qualified_name="server.load_user", start_line=1, end_line=5,
+        content="def load_user(): hydrate_user()",
+    ), file_path="server/db.py")
+    hydrate_user = db.insert_symbol(SymbolRecord(
+        file_id=server_db_file, kind="function", name="hydrate_user",
+        qualified_name="server.hydrate_user", start_line=6, end_line=10,
+        content="def hydrate_user(): pass",
+    ), file_path="server/db.py")
+
+    run_jobs = db.insert_symbol(SymbolRecord(
+        file_id=worker_file, kind="function", name="run_jobs",
+        qualified_name="worker.run_jobs", start_line=1, end_line=5,
+        content="def run_jobs(): send_email()",
+    ), file_path="worker/jobs.py")
+    send_email = db.insert_symbol(SymbolRecord(
+        file_id=worker_file, kind="function", name="send_email",
+        qualified_name="worker.send_email", start_line=6, end_line=10,
+        content="def send_email(): pass",
+    ), file_path="worker/jobs.py")
+
+    db.insert_edge(EdgeRecord(source_id=bootstrap, target_id=route_request, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=route_request, target_id=load_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=load_user, target_id=hydrate_user, edge_type="calls"))
+    db.insert_edge(EdgeRecord(source_id=run_jobs, target_id=send_email, edge_type="calls"))
+    db.commit()
+
+    communities = detect_communities(db)
+    sym_to_comm = {
+        member["id"]: community["id"]
+        for community in communities
+        for member in community["members"]
+    }
+    flows = trace_execution_flows(db, sym_to_comm)
+
+    db.store_communities(communities)
+    db.store_execution_flows(flows)
+    db.commit()
+
+
 def test_detect_communities_two_clusters(db):
     """Louvain should detect two communities in a graph with two clear clusters."""
     from srclight.community import detect_communities
@@ -297,6 +365,33 @@ def test_store_and_retrieve_communities(db):
     assert comm_id is not None
 
 
+def test_get_communities_returns_compact_entries_by_default(db):
+    _store_server_and_worker_flows(db)
+
+    communities = db.get_communities(member_limit=2)
+
+    assert communities
+    assert communities[0]["member_count"] >= len(communities[0]["members"])
+    assert len(communities[0]["members"]) <= 2
+    assert "qualified_name" not in communities[0]["members"][0]
+
+
+def test_get_communities_verbose_includes_detailed_members_and_filters(db):
+    _store_server_and_worker_flows(db)
+
+    communities = db.get_communities(
+        verbose=True,
+        member_limit=3,
+        path_prefix="server/",
+        layer="server",
+    )
+
+    assert communities
+    assert all(member["file_path"].startswith("server/") for member in communities[0]["members"])
+    assert len(communities[0]["members"]) <= 3
+    assert "qualified_name" in communities[0]["members"][0]
+
+
 def test_store_and_retrieve_flows(db):
     """Can store and retrieve execution flow data."""
     from srclight.community import detect_communities, trace_execution_flows
@@ -318,3 +413,30 @@ def test_store_and_retrieve_flows(db):
 
     login_flows = db.get_flows_for_symbol(syms["login"])
     assert len(login_flows) >= 1
+
+
+def test_get_execution_flows_returns_compact_entries_by_default(db):
+    _store_server_and_worker_flows(db)
+
+    flows = db.get_execution_flows()
+
+    assert flows
+    assert flows[0]["truncated"] is True
+    assert "steps" not in flows[0]
+    assert flows[0]["key_steps"]
+
+
+def test_get_execution_flows_verbose_supports_depth_and_filters(db):
+    _store_server_and_worker_flows(db)
+
+    flows = db.get_execution_flows(
+        verbose=True,
+        max_depth=4,
+        path_prefix="server/",
+        layer="server",
+    )
+
+    assert flows
+    assert flows[0]["steps"]
+    assert flows[0]["max_depth_applied"] == 4
+    assert all(step["file_path"].startswith("server/") for step in flows[0]["steps"])

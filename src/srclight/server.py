@@ -3390,7 +3390,14 @@ def learning_stats(
 
 
 @mcp.tool()
-def get_communities(project: str | None = None) -> str:
+def get_communities(
+    project: str | None = None,
+    verbose: bool = False,
+    limit: int = 25,
+    member_limit: int = 5,
+    path_prefix: str | None = None,
+    layer: str | None = None,
+) -> str:
     """Get detected functional communities (module clusters) in the call graph.
 
     Communities are auto-detected using the Louvain algorithm on call-graph edges.
@@ -3412,11 +3419,23 @@ def get_communities(project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        communities = db.get_communities()
+        communities = db.get_communities(
+            verbose=verbose,
+            limit=limit,
+            member_limit=member_limit,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
         db.close()
     else:
         db = _get_db()
-        communities = db.get_communities()
+        communities = db.get_communities(
+            verbose=verbose,
+            limit=limit,
+            member_limit=member_limit,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
 
     if not communities:
         return json.dumps({"info": "No communities detected. Run reindex to generate.", "communities": []})
@@ -3460,7 +3479,7 @@ def get_community(symbol_name: str, project: str | None = None) -> str:
             db.close()
             return json.dumps({"symbol": symbol_name, "community": None, "info": "Symbol not assigned to any community"})
         members = db.get_community_members(comm_id)
-        communities = db.get_communities()
+        communities = db.get_community_records(limit=None)
         db.close()
     else:
         db = _get_db()
@@ -3471,7 +3490,7 @@ def get_community(symbol_name: str, project: str | None = None) -> str:
         if comm_id is None:
             return json.dumps({"symbol": symbol_name, "community": None, "info": "Symbol not assigned to any community"})
         members = db.get_community_members(comm_id)
-        communities = db.get_communities()
+        communities = db.get_community_records(limit=None)
 
     # Find the community metadata
     comm_info = next((c for c in communities if c["id"] == comm_id), None)
@@ -3488,7 +3507,14 @@ def get_community(symbol_name: str, project: str | None = None) -> str:
 
 
 @mcp.tool()
-def get_execution_flows(project: str | None = None) -> str:
+def get_execution_flows(
+    project: str | None = None,
+    verbose: bool = False,
+    limit: int = 25,
+    max_depth: int | None = None,
+    path_prefix: str | None = None,
+    layer: str | None = None,
+) -> str:
     """Get traced execution flows through the call graph.
 
     Flows are paths from entry points (like main, run, handle) through the call graph,
@@ -3510,11 +3536,23 @@ def get_execution_flows(project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        flows = db.get_execution_flows()
+        flows = db.get_execution_flows(
+            limit=limit,
+            verbose=verbose,
+            max_depth=max_depth,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
         db.close()
     else:
         db = _get_db()
-        flows = db.get_execution_flows()
+        flows = db.get_execution_flows(
+            limit=limit,
+            verbose=verbose,
+            max_depth=max_depth,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
 
     if not flows:
         return json.dumps({"info": "No execution flows traced. Run reindex to generate.", "flows": []})
@@ -3558,12 +3596,12 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
             db.close()
             return _symbol_not_found_error(symbol_name, project)
         # Build sym_to_community map from stored data
-        communities = db.get_communities()
+        communities = db.get_community_records(limit=None)
         sym_to_comm: dict[int, int] = {}
         for c in communities:
             for m in db.get_community_members(c["id"]):
                 sym_to_comm[m["id"]] = c["id"]
-        flows = db.get_execution_flows()
+        flows = db.get_execution_flow_records(limit=None)
         # Reconstruct flow step dicts for compute_impact
         flow_dicts = _reconstruct_flows(db, flows)
         result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
@@ -3573,12 +3611,12 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         sym = db.get_symbol_by_name(symbol_name)
         if sym is None:
             return _symbol_not_found_error(symbol_name)
-        communities = db.get_communities()
+        communities = db.get_community_records(limit=None)
         sym_to_comm = {}
         for c in communities:
             for m in db.get_community_members(c["id"]):
                 sym_to_comm[m["id"]] = c["id"]
-        flows = db.get_execution_flows()
+        flows = db.get_execution_flow_records(limit=None)
         flow_dicts = _reconstruct_flows(db, flows)
         result = compute_impact(db, sym.id, sym_to_comm, flow_dicts)
 
@@ -3690,13 +3728,13 @@ def detect_changes(
         })
 
     # Load community and flow data for impact analysis
-    communities = db.get_communities()
+    communities = db.get_community_records(limit=None)
     sym_to_comm: dict[int, int] = {}
     for c in communities:
         for m in db.get_community_members(c["id"]):
             sym_to_comm[m["id"]] = c["id"]
 
-    flows = db.get_execution_flows()
+    flows = db.get_execution_flow_records(limit=None)
     flow_dicts = _reconstruct_flows(db, flows)
 
     # Run impact analysis on each changed symbol
