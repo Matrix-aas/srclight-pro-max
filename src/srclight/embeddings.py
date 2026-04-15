@@ -393,6 +393,16 @@ class OllamaProvider(EmbeddingProvider):
             timeout = self._timeout if self._timeout is not None else _embed_request_timeout()
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+            if e.code == 404 and "model" in body and "not found" in body:
+                raise ConnectionError(
+                    f"Ollama model '{self._model}' is not available at {self._base_url}. "
+                    f"Pull it first: ollama pull {self._model}"
+                ) from e
+            raise ConnectionError(
+                f"Ollama request to {self._base_url}/api/embed failed with HTTP {e.code}: {body}"
+            ) from e
         except urllib.error.URLError as e:
             raise ConnectionError(
                 f"Cannot reach Ollama at {self._base_url}. "

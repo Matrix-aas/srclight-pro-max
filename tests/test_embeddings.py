@@ -1,5 +1,7 @@
 """Tests for embedding providers, vector search, and hybrid RRF."""
 
+import io
+import urllib.error
 from unittest.mock import patch
 
 import pytest
@@ -663,6 +665,26 @@ def test_ollama_is_available_matches_tagged_model(monkeypatch):
 
     monkeypatch.setattr("srclight.embeddings.urllib.request.urlopen", fake_urlopen)
     assert provider.is_available() is True
+
+
+def test_ollama_embed_batch_reports_missing_model_cleanly(monkeypatch):
+    provider = OllamaProvider(model="nomic-embed-text-v2-moe", timeout=19)
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            404,
+            "Not Found",
+            hdrs=None,
+            fp=io.BytesIO(
+                b'{"error":"model \\"nomic-embed-text-v2-moe\\" not found, try pulling it first"}'
+            ),
+        )
+
+    monkeypatch.setattr("srclight.embeddings.urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(ConnectionError, match="Pull it first: ollama pull nomic-embed-text-v2-moe"):
+        provider.embed_batch(["hello"])
 
 
 def test_get_provider_voyage():
