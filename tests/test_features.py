@@ -565,12 +565,14 @@ def test_get_communities_summary_first_by_default(monkeypatch, db):
     monkeypatch.setattr(server, "_get_db", lambda: db)
 
     communities = json.loads(
-        server.get_communities(member_limit=2, path_prefix="server/", layer="server")
+        server.get_communities(member_limit=1, path_prefix="server/", layer="server")
     )
 
     assert communities["communities"]
     assert communities["communities"][0]["member_count"] >= len(communities["communities"][0]["members"])
-    assert len(communities["communities"][0]["members"]) <= 2
+    assert len(communities["communities"][0]["members"]) <= 1
+    assert communities["communities"][0]["truncated"] is True
+    assert communities["communities"][0]["member_limit_applied"] == 1
 
 
 def test_get_communities_verbose_returns_detailed_members(monkeypatch, db):

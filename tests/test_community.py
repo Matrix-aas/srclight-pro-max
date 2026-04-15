@@ -368,11 +368,13 @@ def test_store_and_retrieve_communities(db):
 def test_get_communities_returns_compact_entries_by_default(db):
     _store_server_and_worker_flows(db)
 
-    communities = db.get_communities(member_limit=2)
+    communities = db.get_communities(member_limit=1)
 
     assert communities
     assert communities[0]["member_count"] >= len(communities[0]["members"])
-    assert len(communities[0]["members"]) <= 2
+    assert len(communities[0]["members"]) <= 1
+    assert communities[0]["truncated"] is True
+    assert communities[0]["member_limit_applied"] == 1
     assert "qualified_name" not in communities[0]["members"][0]
 
 
@@ -389,6 +391,7 @@ def test_get_communities_verbose_includes_detailed_members_and_filters(db):
     assert communities
     assert all(member["file_path"].startswith("server/") for member in communities[0]["members"])
     assert len(communities[0]["members"]) <= 3
+    assert communities[0]["member_limit_applied"] == 3
     assert "qualified_name" in communities[0]["members"][0]
 
 

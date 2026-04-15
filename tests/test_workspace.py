@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 import srclight.server as server
-from srclight.db import Database, FileRecord, SymbolRecord
+from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
 from srclight.embeddings import vector_to_bytes
 from srclight.vector_cache import VectorCache
 from srclight.workspace import WorkspaceConfig, WorkspaceDB, _sanitize_schema_name
@@ -102,6 +102,56 @@ def _build_project_sidecar(project_dir: Path, vector: list[float]) -> None:
         db.upsert_embedding(symbol_id, "mock:test", len(vector), vector_to_bytes(vector), "hash-1")
         db.commit()
         VectorCache(project_dir / ".srclight").build_from_db(db.conn)
+    finally:
+        db.close()
+
+
+def _store_workspace_communities_and_flows(project_dir: Path) -> None:
+    from srclight.community import detect_communities, trace_execution_flows
+
+    db_path = project_dir / ".srclight" / "index.db"
+    db = Database(db_path)
+    db.open()
+    try:
+        rows = db.conn.execute(
+            """SELECT s.id, s.name
+               FROM symbols s
+               ORDER BY s.start_line, s.id"""
+        ).fetchall()
+        symbol_ids = {row["name"]: row["id"] for row in rows}
+
+        db.insert_edge(EdgeRecord(
+            source_id=symbol_ids["bootstrap"],
+            target_id=symbol_ids["routeRequest"],
+            edge_type="calls",
+        ))
+        db.insert_edge(EdgeRecord(
+            source_id=symbol_ids["routeRequest"],
+            target_id=symbol_ids["fetchUser"],
+            edge_type="calls",
+        ))
+        db.insert_edge(EdgeRecord(
+            source_id=symbol_ids["fetchUser"],
+            target_id=symbol_ids["serializeUser"],
+            edge_type="calls",
+        ))
+        db.insert_edge(EdgeRecord(
+            source_id=symbol_ids["runJobs"],
+            target_id=symbol_ids["sendEmail"],
+            edge_type="calls",
+        ))
+        db.commit()
+
+        communities = detect_communities(db)
+        sym_to_comm = {
+            member["id"]: community["id"]
+            for community in communities
+            for member in community["members"]
+        }
+        flows = trace_execution_flows(db, sym_to_comm)
+        db.store_communities(communities)
+        db.store_execution_flows(flows)
+        db.commit()
     finally:
         db.close()
 
@@ -1002,6 +1052,175 @@ def test_workspace_project_scoped_miss_recovery_strings_include_project(
         for suggestion in search_payload["suggestions"]
     )
     assert 'project="alpha"' in search_payload["hint"]
+
+
+def test_workspace_get_communities_supports_summary_and_verbose_params(
+    tmp_path, ws_dir, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "flowproj", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "server/app.ts",
+            "signature": "function bootstrap()",
+            "content": "bootstrap routeRequest",
+        },
+        {
+            "name": "routeRequest",
+            "kind": "function",
+            "path": "server/app.ts",
+            "signature": "function routeRequest()",
+            "content": "routeRequest fetchUser",
+        },
+        {
+            "name": "fetchUser",
+            "kind": "function",
+            "path": "server/data.ts",
+            "signature": "function fetchUser()",
+            "content": "fetchUser serializeUser",
+        },
+        {
+            "name": "serializeUser",
+            "kind": "function",
+            "path": "server/data.ts",
+            "signature": "function serializeUser()",
+            "content": "serializeUser return",
+        },
+        {
+            "name": "runJobs",
+            "kind": "function",
+            "path": "worker/jobs.ts",
+            "signature": "function runJobs()",
+            "content": "runJobs sendEmail",
+        },
+        {
+            "name": "sendEmail",
+            "kind": "function",
+            "path": "worker/jobs.ts",
+            "signature": "function sendEmail()",
+            "content": "sendEmail return",
+        },
+    ])
+    _store_workspace_communities_and_flows(project_dir)
+
+    config = WorkspaceConfig(name="workspace-flow-tools")
+    config.add_project("flowproj", str(project_dir))
+    config.save()
+
+    monkeypatch.setattr(server, "_workspace_name", "workspace-flow-tools")
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: True)
+
+    summary = json.loads(
+        server.get_communities(
+            project="flowproj",
+            member_limit=1,
+            path_prefix="server/",
+            layer="server",
+        )
+    )
+    verbose = json.loads(
+        server.get_communities(
+            project="flowproj",
+            verbose=True,
+            member_limit=3,
+            path_prefix="server/",
+            layer="server",
+        )
+    )
+
+    assert summary["communities"]
+    assert summary["project"] == "flowproj"
+    assert len(summary["communities"][0]["members"]) <= 1
+    assert any(item["truncated"] is True for item in summary["communities"])
+    assert all(item["member_limit_applied"] == 1 for item in summary["communities"])
+    assert all(member["file_path"].startswith("server/") for member in summary["communities"][0]["members"])
+    assert verbose["communities"][0]["members"]
+    assert "qualified_name" in verbose["communities"][0]["members"][0]
+
+
+def test_workspace_get_execution_flows_supports_verbose_depth_and_filters(
+    tmp_path, ws_dir, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "flowproj", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "server/app.ts",
+            "signature": "function bootstrap()",
+            "content": "bootstrap routeRequest",
+        },
+        {
+            "name": "routeRequest",
+            "kind": "function",
+            "path": "server/app.ts",
+            "signature": "function routeRequest()",
+            "content": "routeRequest fetchUser",
+        },
+        {
+            "name": "fetchUser",
+            "kind": "function",
+            "path": "server/data.ts",
+            "signature": "function fetchUser()",
+            "content": "fetchUser serializeUser",
+        },
+        {
+            "name": "serializeUser",
+            "kind": "function",
+            "path": "server/data.ts",
+            "signature": "function serializeUser()",
+            "content": "serializeUser return",
+        },
+        {
+            "name": "runJobs",
+            "kind": "function",
+            "path": "worker/jobs.ts",
+            "signature": "function runJobs()",
+            "content": "runJobs sendEmail",
+        },
+        {
+            "name": "sendEmail",
+            "kind": "function",
+            "path": "worker/jobs.ts",
+            "signature": "function sendEmail()",
+            "content": "sendEmail return",
+        },
+    ])
+    _store_workspace_communities_and_flows(project_dir)
+
+    config = WorkspaceConfig(name="workspace-flow-tools-exec")
+    config.add_project("flowproj", str(project_dir))
+    config.save()
+
+    monkeypatch.setattr(server, "_workspace_name", "workspace-flow-tools-exec")
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: True)
+
+    summary = json.loads(
+        server.get_execution_flows(
+            project="flowproj",
+            path_prefix="server/",
+            layer="server",
+        )
+    )
+    verbose = json.loads(
+        server.get_execution_flows(
+            project="flowproj",
+            verbose=True,
+            max_depth=3,
+            path_prefix="server/",
+            layer="server",
+        )
+    )
+
+    assert summary["flows"]
+    assert summary["project"] == "flowproj"
+    assert summary["flows"][0]["terminal"] == "serializeUser"
+    assert summary["flows"][0]["truncated"] is True
+    assert "steps" not in summary["flows"][0]
+    assert len(summary["flows"][0]["key_steps"]) == 3
+    assert verbose["flows"][0]["steps"]
+    assert verbose["flows"][0]["max_depth_applied"] == 3
+    assert verbose["flows"][0]["terminal"] == "serializeUser"
+    assert all(step["file_path"].startswith("server/") for step in verbose["flows"][0]["steps"])
 
 
 def test_workspace_task7_paths_do_not_retain_project_db_handles_over_max_attach(

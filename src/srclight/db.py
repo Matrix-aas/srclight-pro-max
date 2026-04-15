@@ -2068,6 +2068,8 @@ class Database:
                     "member_count": community["member_count"],
                     "cohesion": community["cohesion"],
                     "keywords": community["keywords"],
+                    "truncated": member_limit is not None and community["member_count"] > len(members),
+                    "member_limit_applied": member_limit,
                     "members": members,
                 }
             )
@@ -2184,39 +2186,53 @@ class Database:
         rows = self.conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
-    def _count_flow_steps(
+    def get_filtered_flow_metadata(
         self,
         flow_id: int,
         *,
         path_prefix: str | None = None,
         layer: str | None = None,
-    ) -> int:
-        """Count steps in a flow after optional file filters are applied."""
+    ) -> dict[str, Any]:
+        """Get filtered flow metadata without materializing the full step payload."""
         assert self.conn is not None
         filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
         row = self.conn.execute(
             (
-                """SELECT COUNT(*) AS step_count
-                   FROM flow_steps fs
-                   JOIN symbols s ON fs.symbol_id = s.id
-                   JOIN files f ON s.file_id = f.id
-                   WHERE fs.flow_id = ?"""
+                """WITH filtered_steps AS (
+                       SELECT fs.step_order, s.name, fs.community_id
+                       FROM flow_steps fs
+                       JOIN symbols s ON fs.symbol_id = s.id
+                       JOIN files f ON s.file_id = f.id
+                       WHERE fs.flow_id = ?"""
                 + filter_sql
+                + """
+                   ),
+                   ordered_steps AS (
+                       SELECT step_order, name, community_id,
+                              LAG(community_id) OVER (ORDER BY step_order) AS prev_community_id
+                       FROM filtered_steps
+                   )
+                   SELECT
+                       COUNT(*) AS step_count,
+                       (SELECT name FROM filtered_steps ORDER BY step_order LIMIT 1) AS entry_name,
+                       (SELECT name FROM filtered_steps ORDER BY step_order DESC LIMIT 1) AS terminal_name,
+                       COALESCE(SUM(
+                           CASE
+                               WHEN prev_community_id IS NOT NULL AND community_id != prev_community_id
+                               THEN 1
+                               ELSE 0
+                           END
+                       ), 0) AS communities_crossed
+                   FROM ordered_steps"""
             ),
             (flow_id, *filter_params),
         ).fetchone()
-        return row["step_count"] if row else 0
-
-    def _communities_crossed_for_steps(self, steps: list[dict]) -> int:
-        """Count community boundary crossings across an ordered step subset."""
-        crossings = 0
-        previous = None
-        for step in steps:
-            community_id = step.get("community_id")
-            if previous is not None and community_id != previous:
-                crossings += 1
-            previous = community_id
-        return crossings
+        return dict(row) if row else {
+            "step_count": 0,
+            "entry_name": None,
+            "terminal_name": None,
+            "communities_crossed": 0,
+        }
 
     def get_execution_flows(
         self,
@@ -2236,13 +2252,11 @@ class Database:
         results: list[dict] = []
         step_limit = max_depth if max_depth is not None else (None if verbose else 3)
         for flow in flows:
-            full_steps = self.get_flow_steps(
+            metadata = self.get_filtered_flow_metadata(
                 flow["id"],
                 path_prefix=path_prefix,
                 layer=layer,
-                verbose=False,
             )
-            total_steps = len(full_steps)
             steps = self.get_flow_steps(
                 flow["id"],
                 limit=step_limit,
@@ -2250,19 +2264,16 @@ class Database:
                 layer=layer,
                 verbose=verbose,
             )
-            entry_name = full_steps[0]["name"] if full_steps else flow["entry_name"]
-            terminal_name = full_steps[-1]["name"] if full_steps else flow["terminal_name"]
+            total_steps = metadata["step_count"]
+            entry_name = metadata["entry_name"] or flow["entry_name"]
+            terminal_name = metadata["terminal_name"] or flow["terminal_name"]
             item = {
                 "id": flow["id"],
                 "label": f"{entry_name} -> {terminal_name}" if entry_name and terminal_name else flow["label"],
                 "entry": entry_name,
                 "terminal": terminal_name,
                 "step_count": total_steps,
-                "communities_crossed": (
-                    self._communities_crossed_for_steps(full_steps)
-                    if full_steps
-                    else flow["communities_crossed"]
-                ),
+                "communities_crossed": metadata["communities_crossed"],
                 "truncated": total_steps > len(steps),
             }
             if max_depth is not None:

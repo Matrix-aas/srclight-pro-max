@@ -3440,11 +3440,13 @@ def get_communities(
     if not communities:
         return json.dumps({"info": "No communities detected. Run reindex to generate.", "communities": []})
 
-    return json.dumps({
-        "project": project,
+    payload = {
         "community_count": len(communities),
         "communities": communities,
-    }, indent=2)
+    }
+    if project is not None:
+        payload["project"] = project
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
@@ -3557,11 +3559,13 @@ def get_execution_flows(
     if not flows:
         return json.dumps({"info": "No execution flows traced. Run reindex to generate.", "flows": []})
 
-    return json.dumps({
-        "project": project,
+    payload = {
         "flow_count": len(flows),
         "flows": flows,
-    }, indent=2)
+    }
+    if project is not None:
+        payload["project"] = project
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
