@@ -498,6 +498,9 @@ class TestSearchRanking:
         assert payload["model"] == "mock:test-model"
         assert payload["results"]
         assert payload["results"][0]["kind"] == "microservice_handler"
+        assert "rrf_score" not in payload["results"][0]
+        assert payload["results"][0]["rank_source"] in {"keyword", "semantic", "hybrid"}
+        assert payload["results"][0]["match_reasons"]
 
     def test_search_symbols_tokenizes_dotted_async_patterns_for_handlers(self, db):
         _insert_search_symbol(
@@ -614,6 +617,40 @@ def test_get_execution_flows_verbose_and_filtered(monkeypatch, db):
     assert verbose["flows"][0]["steps"]
     assert verbose["flows"][0]["max_depth_applied"] == 4
     assert filtered["flows"]
+
+
+def test_get_community_missing_symbol_returns_file_level_fallback(monkeypatch, db):
+    _insert_search_symbol(
+        db,
+        path="src/ui/LayoutEngine.ts",
+        kind="function",
+        name="measureNode",
+        signature="function measureNode(node)",
+        content="measure layout node tree",
+        doc_comment="Measures layout nodes for rendering.",
+    )
+    _insert_search_symbol(
+        db,
+        path="src/ui/LayoutEngine.ts",
+        kind="function",
+        name="renderFrame",
+        signature="function renderFrame(frame)",
+        content="render frame after layout measurement",
+        doc_comment="Renders a frame after layout measurement.",
+    )
+    db.commit()
+    _store_server_flow_graph(db)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_community("LayoutEngine"))
+
+    assert payload["community"] is None
+    assert payload["fallback_stage"] == "file_candidate"
+    assert payload["file_candidates"]
+    assert payload["file_candidates"][0]["path"] == "src/ui/LayoutEngine.ts"
+    assert payload["next_step"]["tool"] == "symbols_in_file"
 
 
 # --- 2. Call graph edges ---

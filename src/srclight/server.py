@@ -1106,6 +1106,173 @@ def _tool_call(tool_name: str, value: str, *, project: str | None = None) -> str
     return f'{tool_name}("{value}"{project_part})'
 
 
+def _rank_source(result: dict[str, object]) -> str:
+    """Collapse internal search source metadata into agent-friendly buckets."""
+    sources = {str(source) for source in result.get("sources", []) if source}
+    if "fts" in sources and "embedding" in sources:
+        return "hybrid"
+    if "embedding" in sources:
+        return "semantic"
+
+    if result.get("similarity") is not None and not result.get("source"):
+        return "semantic"
+    return "keyword"
+
+
+def _match_reasons(result: dict[str, object]) -> list[str]:
+    """Translate internal ranking signals into terse retrieval reasons."""
+    reasons: list[str] = []
+    source = result.get("source")
+    if source in {"name", "name_like"}:
+        reasons.append("symbol name match")
+    elif source == "tokenized_like":
+        reasons.append("tokenized identifier match")
+    elif source == "metadata_like":
+        reasons.append("metadata match")
+    elif source == "content":
+        reasons.append("symbol content match")
+    elif source == "docs":
+        reasons.append("documentation match")
+
+    sources = {str(item) for item in result.get("sources", []) if item}
+    if "fts" in sources and not reasons:
+        reasons.append("keyword match")
+    if "embedding" in sources or _rank_source(result) == "semantic":
+        reasons.append("semantic similarity")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for reason in reasons:
+        if reason in seen:
+            continue
+        deduped.append(reason)
+        seen.add(reason)
+    return deduped
+
+
+def _shape_search_result(result: dict[str, object]) -> dict[str, object]:
+    """Hide low-signal internals and expose concise ranking hints."""
+    shaped = {
+        key: value
+        for key, value in result.items()
+        if key not in {"source", "sources", "rrf_score"}
+    }
+    shaped["rank_source"] = _rank_source(result)
+    reasons = _match_reasons(result)
+    if reasons:
+        shaped["match_reasons"] = reasons
+    return shaped
+
+
+def _format_community_payload(
+    db: Database,
+    symbol_name: str,
+    sym,
+    *,
+    project: str | None = None,
+    resolved_via: str = "exact_symbol",
+) -> dict[str, object]:
+    """Build the normal get_community payload for an exact or inferred symbol hit."""
+    comm_id = db.get_community_for_symbol(sym.id)
+    if comm_id is None:
+        payload: dict[str, object] = {
+            "symbol": symbol_name,
+            "community": None,
+            "info": "Symbol not assigned to any community",
+        }
+        if resolved_via != "exact_symbol":
+            payload["resolved_via"] = resolved_via
+            payload["matched_symbol"] = sym.name
+        if project is not None:
+            payload["project"] = project
+        return payload
+
+    members = db.get_community_members(comm_id)
+    communities = db.get_community_records(limit=None)
+    comm_info = next((c for c in communities if c["id"] == comm_id), None)
+
+    payload = {
+        "symbol": symbol_name,
+        "community_id": comm_id,
+        "label": comm_info["label"] if comm_info else "unknown",
+        "keywords": comm_info.get("keywords", []) if comm_info else [],
+        "cohesion": comm_info["cohesion"] if comm_info else None,
+        "member_count": len(members),
+        "members": members,
+    }
+    if resolved_via != "exact_symbol":
+        payload["resolved_via"] = resolved_via
+        payload["matched_symbol"] = sym.name
+    if project is not None:
+        payload["project"] = project
+    return payload
+
+
+def _community_fallback_payload(
+    db: Database,
+    symbol_name: str,
+    *,
+    project: str | None = None,
+) -> dict[str, object]:
+    """Build a miss payload that escalates from nearest symbol to file candidates."""
+    nearest_symbol = None
+    nearest_matches = db.suggest_symbol_name_matches(symbol_name, limit=1)
+    if nearest_matches:
+        nearest_name = nearest_matches[0]["name"]
+        nearest_sym = db.get_symbol_by_name(nearest_name)
+        if nearest_sym is not None:
+            nearest_symbol = {
+                "name": nearest_sym.name,
+                "kind": nearest_sym.kind,
+                "file": nearest_sym.file_path,
+            }
+            comm_id = db.get_community_for_symbol(nearest_sym.id)
+            if comm_id is not None:
+                payload = _format_community_payload(
+                    db,
+                    symbol_name,
+                    nearest_sym,
+                    project=project,
+                    resolved_via="nearest_symbol",
+                )
+                payload["next_step"] = {
+                    "tool": "get_symbol",
+                    "call": _tool_call("get_symbol", nearest_sym.name, project=project),
+                }
+                return payload
+
+    file_candidates = db.suggest_file_candidates(symbol_name, limit=5)
+    payload: dict[str, object] = {
+        "symbol": symbol_name,
+        "community": None,
+    }
+    if project is not None:
+        payload["project"] = project
+    if nearest_symbol is not None:
+        payload["nearest_symbol"] = nearest_symbol
+
+    if file_candidates:
+        if project is not None:
+            file_candidates = [{**candidate, "project": project} for candidate in file_candidates]
+        payload["fallback_stage"] = "file_candidate"
+        payload["file_candidates"] = file_candidates
+        payload["next_step"] = {
+            "tool": "symbols_in_file",
+            "call": _tool_call("symbols_in_file", str(file_candidates[0]["path"]), project=project),
+        }
+        return payload
+
+    payload["fallback_stage"] = "suggested_tool"
+    payload["next_step"] = {
+        "tool": "hybrid_search",
+        "call": _tool_call("hybrid_search", symbol_name, project=project),
+    }
+    did_you_mean = _symbol_name_suggestions(symbol_name, project=project)
+    if did_you_mean:
+        payload["did_you_mean"] = did_you_mean
+    return payload
+
+
 def _symbol_not_found_error(name: str, project: str | None = None) -> str:
     """Return a JSON error with recovery hints when a symbol lookup fails."""
     ctx = f" in {project}" if project else ""
@@ -1325,7 +1492,7 @@ def search_symbols(
                 payload["did_you_mean"] = suggestions
         return json.dumps(payload, indent=2)
 
-    return json.dumps(results, indent=2)
+    return json.dumps([_shape_search_result(result) for result in results], indent=2)
 
 
 @mcp.tool()
@@ -2486,7 +2653,7 @@ def hybrid_search(
             "mode": "hybrid (FTS5 + embeddings)",
             "model": model_used,
             "result_count": len(final),
-            "results": final,
+            "results": [_shape_search_result(result) for result in final],
         }
         if not final:
             payload["hint"] = "No results. Try broadening your query or check that the index is up to date with reindex()."
@@ -2496,7 +2663,7 @@ def hybrid_search(
             "query": query,
             "mode": "keyword only (no embeddings available)",
             "result_count": min(len(fts_results), limit),
-            "results": fts_results[:limit],
+            "results": [_shape_search_result(result) for result in fts_results[:limit]],
         }
         if not fts_results:
             payload["hint"] = "No results. Try broadening your query or check that the index is up to date with reindex()."
@@ -3472,40 +3639,22 @@ def get_community(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        try:
+            sym = db.get_symbol_by_name(symbol_name)
+            if sym is None:
+                return json.dumps(_community_fallback_payload(db, symbol_name, project=project), indent=2)
+            return json.dumps(
+                _format_community_payload(db, symbol_name, sym, project=project),
+                indent=2,
+            )
+        finally:
             db.close()
-            return _symbol_not_found_error(symbol_name, project)
-        comm_id = db.get_community_for_symbol(sym.id)
-        if comm_id is None:
-            db.close()
-            return json.dumps({"symbol": symbol_name, "community": None, "info": "Symbol not assigned to any community"})
-        members = db.get_community_members(comm_id)
-        communities = db.get_community_records(limit=None)
-        db.close()
     else:
         db = _get_db()
         sym = db.get_symbol_by_name(symbol_name)
         if sym is None:
-            return _symbol_not_found_error(symbol_name)
-        comm_id = db.get_community_for_symbol(sym.id)
-        if comm_id is None:
-            return json.dumps({"symbol": symbol_name, "community": None, "info": "Symbol not assigned to any community"})
-        members = db.get_community_members(comm_id)
-        communities = db.get_community_records(limit=None)
-
-    # Find the community metadata
-    comm_info = next((c for c in communities if c["id"] == comm_id), None)
-
-    return json.dumps({
-        "symbol": symbol_name,
-        "community_id": comm_id,
-        "label": comm_info["label"] if comm_info else "unknown",
-        "keywords": comm_info.get("keywords", []) if comm_info else [],
-        "cohesion": comm_info["cohesion"] if comm_info else None,
-        "member_count": len(members),
-        "members": members,
-    }, indent=2)
+            return json.dumps(_community_fallback_payload(db, symbol_name), indent=2)
+        return json.dumps(_format_community_payload(db, symbol_name, sym), indent=2)
 
 
 @mcp.tool()

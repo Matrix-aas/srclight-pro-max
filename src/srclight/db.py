@@ -889,6 +889,98 @@ class Database:
         """Suggest nearby symbol names for miss hints."""
         return [item["name"] for item in self.suggest_symbol_name_matches(query, limit=limit)]
 
+    def suggest_file_candidates(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Suggest likely symbol-bearing files for a query.
+
+        Uses indexed file rows only and prefers deterministic path/name matches
+        over broad scans of the filesystem.
+        """
+        assert self.conn is not None
+
+        raw_query = (query or "").strip()
+        compact_query = _compact_identifier(raw_query)
+        normalized_query = _normalized_token_phrase(raw_query)
+        query_tokens = _search_query_tokens(raw_query)
+        if not compact_query and not normalized_query and not query_tokens:
+            return []
+
+        compact_expr = (
+            "lower(replace(replace(replace(replace(replace(f.path, '/', ''), '_', ''), '-', ''), '.', ''), ' ', ''))"
+        )
+        clauses = ["f.path LIKE ? COLLATE NOCASE"]
+        params: list[Any] = [f"%{raw_query}%"]
+        if compact_query:
+            clauses.append(f"{compact_expr} LIKE ?")
+            params.append(f"%{compact_query}%")
+        for token in list(dict.fromkeys(sorted(query_tokens)))[:4]:
+            clauses.append("f.path LIKE ? COLLATE NOCASE")
+            params.append(f"%{token}%")
+
+        rows = self.conn.execute(
+            f"""SELECT f.path, COUNT(DISTINCT s.id) AS symbol_count
+                FROM files f
+                JOIN symbols s ON s.file_id = f.id
+                WHERE {" OR ".join(clauses)}
+                GROUP BY f.id, f.path
+                LIMIT ?""",
+            [*params, max(limit * 8, 24)],
+        ).fetchall()
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            path = row["path"]
+            basename = Path(path).name
+            stem = Path(path).stem
+            basename_compact = _compact_identifier(basename)
+            stem_compact = _compact_identifier(stem)
+            path_compact = _compact_identifier(path)
+            path_phrase = _normalized_token_phrase(path)
+            path_tokens = _search_query_tokens(path)
+            overlap = len(query_tokens & path_tokens)
+
+            reasons: list[str] = []
+            if compact_query and stem_compact == compact_query:
+                reasons.append("exact filename match")
+            elif compact_query and basename_compact == compact_query:
+                reasons.append("exact basename match")
+            elif compact_query and compact_query in basename_compact:
+                reasons.append("compact filename match")
+            elif compact_query and compact_query in path_compact:
+                reasons.append("compact path match")
+
+            if normalized_query and normalized_query in path_phrase:
+                reasons.append("token phrase match")
+            if overlap:
+                reasons.append("token overlap")
+
+            if not reasons:
+                continue
+
+            score = (
+                0 if "exact filename match" in reasons else
+                1 if "exact basename match" in reasons else
+                2 if "compact filename match" in reasons else
+                3 if "compact path match" in reasons else
+                4,
+                -overlap,
+                -int(row["symbol_count"] or 0),
+                len(path),
+                path.lower(),
+            )
+            candidates.append({
+                "path": path,
+                "symbol_count": int(row["symbol_count"] or 0),
+                "match_reason": reasons[0],
+                "match_reasons": reasons,
+                "_score": score,
+            })
+
+        candidates.sort(key=lambda item: item["_score"])
+        return [
+            {k: v for k, v in candidate.items() if k != "_score"}
+            for candidate in candidates[:limit]
+        ]
+
     def _search_rank_context(self, symbol_ids: list[int]) -> dict[int, dict[str, Any]]:
         """Fetch metadata needed for post-FTS ranking."""
         assert self.conn is not None

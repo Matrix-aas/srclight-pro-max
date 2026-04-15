@@ -367,6 +367,38 @@ class WorkspaceDB:
             for item in suggestions[:limit]
         ]
 
+    def suggest_file_candidates(
+        self, query: str, project: str | None = None, limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Suggest likely files across workspace projects using per-project DB indexes."""
+        candidates: list[dict[str, Any]] = []
+
+        for entry in self._iter_entries(project_filter=project):
+            try:
+                with self._open_project_db(entry) as db:
+                    project_candidates = db.suggest_file_candidates(query, limit=limit * 2)
+                    for order, candidate in enumerate(project_candidates):
+                        candidates.append({
+                            "project": entry.name,
+                            **candidate,
+                            "_project_order": order,
+                        })
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Skipping file suggestions for %s due to project DB error: %s", entry.name, e)
+                continue
+
+        candidates.sort(
+            key=lambda item: (
+                item["_project_order"],
+                item["project"],
+                item["path"],
+            )
+        )
+        return [
+            {k: v for k, v in item.items() if k != "_project_order"}
+            for item in candidates[:limit]
+        ]
+
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None

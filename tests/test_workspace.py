@@ -1054,6 +1054,75 @@ def test_workspace_project_scoped_miss_recovery_strings_include_project(
     assert 'project="alpha"' in search_payload["hint"]
 
 
+def test_workspace_hybrid_search_hides_rrf_score_and_exposes_rank_hints(
+    tmp_path, ws_dir, monkeypatch
+):
+    alpha = _create_indexed_project(tmp_path, "alpha", [
+        {
+            "name": "AuthRoutesService",
+            "kind": "class",
+            "path": "server/src/services/auth-routes-service.ts",
+            "signature": "class AuthRoutesService",
+            "content": "auth routes service helpers",
+            "doc_comment": "Service object for auth routes coordination.",
+        },
+    ])
+
+    config = WorkspaceConfig(name="workspace-hybrid-rank-hints")
+    config.add_project("alpha", str(alpha))
+
+    with WorkspaceDB(config) as wdb:
+        monkeypatch.setattr(server, "_is_workspace_mode", lambda: True)
+        monkeypatch.setattr(server, "_get_workspace_db", lambda: wdb)
+
+        payload = json.loads(server.hybrid_search("auth routes", project="alpha"))
+
+    assert payload["results"]
+    assert "rrf_score" not in payload["results"][0]
+    assert payload["results"][0]["rank_source"] in {"keyword", "semantic", "hybrid"}
+    assert payload["results"][0]["match_reasons"]
+
+
+def test_workspace_get_community_file_fallback_stays_project_scoped(
+    tmp_path, ws_dir, monkeypatch
+):
+    alpha = _create_indexed_project(tmp_path, "alpha", [
+        {
+            "name": "measureNode",
+            "kind": "function",
+            "path": "src/ui/LayoutEngine.ts",
+            "signature": "function measureNode(node)",
+            "content": "measure layout node tree",
+            "doc_comment": "Measures layout nodes for rendering.",
+        },
+    ])
+    beta = _create_indexed_project(tmp_path, "beta", [
+        {
+            "name": "measureNode",
+            "kind": "function",
+            "path": "src/ui/LayoutEngine.ts",
+            "signature": "function measureNode(node)",
+            "content": "beta layout engine helper",
+            "doc_comment": "Beta-local layout nodes for rendering.",
+        },
+    ])
+
+    config = WorkspaceConfig(name="workspace-community-fallback")
+    config.add_project("alpha", str(alpha))
+    config.add_project("beta", str(beta))
+    monkeypatch.setattr(server, "_workspace_name", "workspace-community-fallback")
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: True)
+
+    payload = json.loads(server.get_community("LayoutEngine", project="alpha"))
+
+    assert payload["community"] is None
+    assert payload["fallback_stage"] == "file_candidate"
+    assert payload["project"] == "alpha"
+    assert payload["file_candidates"]
+    assert all(candidate["project"] == "alpha" for candidate in payload["file_candidates"])
+    assert 'project="alpha"' in payload["next_step"]["call"]
+
+
 def test_workspace_get_communities_supports_summary_and_verbose_params(
     tmp_path, ws_dir, monkeypatch
 ):
