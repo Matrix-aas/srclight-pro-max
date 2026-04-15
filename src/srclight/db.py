@@ -2207,6 +2207,17 @@ class Database:
         ).fetchone()
         return row["step_count"] if row else 0
 
+    def _communities_crossed_for_steps(self, steps: list[dict]) -> int:
+        """Count community boundary crossings across an ordered step subset."""
+        crossings = 0
+        previous = None
+        for step in steps:
+            community_id = step.get("community_id")
+            if previous is not None and community_id != previous:
+                crossings += 1
+            previous = community_id
+        return crossings
+
     def get_execution_flows(
         self,
         limit: int | None = 50,
@@ -2237,13 +2248,15 @@ class Database:
                 layer=layer,
                 verbose=verbose,
             )
+            entry_name = steps[0]["name"] if steps else flow["entry_name"]
+            terminal_name = steps[-1]["name"] if steps else flow["terminal_name"]
             item = {
                 "id": flow["id"],
-                "label": flow["label"],
-                "entry": flow["entry_name"],
-                "terminal": flow["terminal_name"],
+                "label": f"{entry_name} -> {terminal_name}" if entry_name and terminal_name else flow["label"],
+                "entry": entry_name,
+                "terminal": terminal_name,
                 "step_count": total_steps,
-                "communities_crossed": flow["communities_crossed"],
+                "communities_crossed": self._communities_crossed_for_steps(steps) if steps else flow["communities_crossed"],
                 "truncated": total_steps > len(steps),
             }
             if max_depth is not None:
