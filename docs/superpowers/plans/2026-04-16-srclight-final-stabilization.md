@@ -127,6 +127,7 @@ git commit -m "fix: tighten same-name callee resolution"
 - [ ] **Step 1: Write failing tests for compact heavy outputs**
 
 Add tests for:
+- `get_symbol(...)` preserving compact behavior for high-frequency exact matches during any shared output-shaping refactor
 - `detect_changes(compact=True)` returning summary entries without full heavy payloads
 - any new reusable compact shaper behavior needed for multi-match symbol or change outputs
 
@@ -177,6 +178,24 @@ Add tests that assert the tool:
   - related API/tests/types
   - next steps
 - respects `budget` levels
+
+Use an explicit contract shape for `v1` so tests are stable:
+
+```python
+{
+    "task": str,
+    "budget": "small" | "medium" | "large",
+    "seeds": list[dict],
+    "primary_symbols": list[dict],
+    "primary_files": list[dict],
+    "related_api": list[dict],
+    "related_tests": list[dict],
+    "data_types": list[dict],
+    "call_chain": list[dict],
+    "next_steps": list[str],
+    "why_these_results": list[str],
+}
+```
 
 - [ ] **Step 2: Run the targeted tests and verify they fail**
 
