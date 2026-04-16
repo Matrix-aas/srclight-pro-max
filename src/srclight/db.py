@@ -564,8 +564,8 @@ class Database:
                    language=excluded.language,
                    size=excluded.size,
                    line_count=excluded.line_count,
-                   summary=excluded.summary,
-                   metadata=excluded.metadata,
+                   summary=COALESCE(excluded.summary, files.summary),
+                   metadata=COALESCE(excluded.metadata, files.metadata),
                    indexed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')""",
             (
                 rec.path,

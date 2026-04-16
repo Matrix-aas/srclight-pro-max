@@ -182,6 +182,60 @@ def test_update_and_get_file_summary(db):
     assert summary["top_level_symbols"][0]["name"] == "ProfileCard"
 
 
+def test_upsert_file_preserves_existing_summary_metadata_when_incoming_values_are_none(db):
+    """Reindex upserts do not wipe persisted summary metadata unless explicitly replaced."""
+    path = "client/src/components/ProfileCard.vue"
+    db.upsert_file(FileRecord(
+        path=path,
+        content_hash="profile-card-v1",
+        mtime=1000.0,
+        language="vue",
+        size=240,
+        line_count=20,
+    ))
+    db.update_file_summary(
+        path,
+        summary="Original profile card summary.",
+        metadata={"framework": "vue", "tags": ["profile"]},
+    )
+    db.commit()
+
+    db.upsert_file(FileRecord(
+        path=path,
+        content_hash="profile-card-v2",
+        mtime=1001.0,
+        language="vue",
+        size=245,
+        line_count=21,
+        summary=None,
+        metadata=None,
+    ))
+    db.commit()
+
+    preserved = db.get_file(path)
+    assert preserved is not None
+    assert preserved.content_hash == "profile-card-v2"
+    assert preserved.summary == "Original profile card summary."
+    assert preserved.metadata == {"framework": "vue", "tags": ["profile"]}
+
+    db.upsert_file(FileRecord(
+        path=path,
+        content_hash="profile-card-v3",
+        mtime=1002.0,
+        language="vue",
+        size=250,
+        line_count=22,
+        summary="Updated profile card summary.",
+        metadata={"framework": "vue", "tags": ["profile", "card"]},
+    ))
+    db.commit()
+
+    replaced = db.get_file(path)
+    assert replaced is not None
+    assert replaced.summary == "Updated profile card summary."
+    assert replaced.metadata == {"framework": "vue", "tags": ["profile", "card"]}
+
+
 def test_insert_symbol_and_search(db):
     """Can insert symbols and find them via FTS5."""
     # Insert a file first
