@@ -3531,8 +3531,8 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
         code_only = re.sub(r"\bgql\s*`.*?`", " ", cleaned, flags=re.DOTALL)
         code_only = re.sub(r"`[^`]*`", " ", code_only, flags=re.DOTALL)
         code_only = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", " ", code_only)
-        props.extend(_extract_vue_macro_keys(cleaned, "defineProps"))
-        emits.extend(_extract_vue_macro_keys(cleaned, "defineEmits"))
+        props.extend(_extract_vue_macro_keys(match.group(2), "defineProps"))
+        emits.extend(_extract_vue_macro_keys(match.group(2), "defineEmits"))
         macros.extend(
             re.findall(
                 r"\b(defineProps|defineEmits|defineExpose|defineSlots|definePageMeta|defineModel|defineOptions)\s*(?:<[^()]+>)?\s*\(",
@@ -3601,18 +3601,268 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
 
 
 def _extract_vue_macro_keys(text: str, macro_name: str) -> list[str]:
-    """Extract obvious string/object keys from Vue macro calls."""
+    """Extract conservative top-level keys from Vue macro calls."""
     keys: list[str] = []
 
-    for body in re.findall(rf"\b{re.escape(macro_name)}\s*<\s*\{{(.*?)\}}\s*>\s*\(", text, re.DOTALL):
-        keys.extend(
-            key
-            for key in re.findall(r"\b([A-Za-z_][\w-]*)\s*:", body)
-            if key not in {"type", "readonly"}
-        )
+    masked = _mask_js_strings_and_comments(text)
+    pattern = re.compile(rf"\b{re.escape(macro_name)}\b")
+    for match in pattern.finditer(masked):
+        cursor = match.end()
+        while cursor < len(masked) and masked[cursor].isspace():
+            cursor += 1
+        if cursor >= len(masked):
+            continue
 
-    for body in re.findall(rf"\b{re.escape(macro_name)}\s*\(\s*\[(.*?)\]\s*\)", text, re.DOTALL):
-        keys.extend(value for value in re.findall(r"['\"]([^'\"]+)['\"]", body) if value)
+        opener = masked[cursor]
+        if opener == "<":
+            body = _extract_balanced_inner_text(text, cursor, "<", ">")
+            if not body:
+                continue
+            keys.extend(_extract_top_level_vue_keys(body))
+            continue
+
+        if opener == "(":
+            body = _extract_balanced_inner_text(text, cursor, "(", ")")
+            if not body:
+                continue
+            keys.extend(
+                value
+                for value in re.findall(r"['\"]([^'\"]+)['\"]", body)
+                if value
+            )
+
+    return _unique_sorted(keys)
+
+
+def _mask_js_strings_and_comments(text: str) -> str:
+    """Replace JS strings and comments with spaces while preserving offsets."""
+    out: list[str] = []
+    i = 0
+    in_single = False
+    in_double = False
+    in_template = False
+    in_line_comment = False
+    in_block_comment = False
+    escaped = False
+
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append(ch)
+            else:
+                out.append(" ")
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                out.extend((" ", " "))
+                in_block_comment = False
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+
+        if in_single or in_double or in_template:
+            if ch == "\n":
+                out.append("\n")
+            else:
+                out.append(" ")
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif in_single and ch == "'":
+                in_single = False
+            elif in_double and ch == '"':
+                in_double = False
+            elif in_template and ch == "`":
+                in_template = False
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            out.extend((" ", " "))
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            out.extend((" ", " "))
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(" ")
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(" ")
+            i += 1
+            continue
+        if ch == "`":
+            in_template = True
+            out.append(" ")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _extract_balanced_inner_text(text: str, open_index: int, open_char: str, close_char: str) -> str | None:
+    """Return the content inside a balanced wrapper starting at open_index."""
+    if open_index >= len(text) or text[open_index] != open_char:
+        return None
+
+    stack = [close_char]
+    i = open_index + 1
+    start = i
+    in_single = False
+    in_double = False
+    in_template = False
+    in_line_comment = False
+    in_block_comment = False
+    escaped = False
+
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if in_single or in_double or in_template:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif in_single and ch == "'":
+                in_single = False
+            elif in_double and ch == '"':
+                in_double = False
+            elif in_template and ch == "`":
+                in_template = False
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "`":
+            in_template = True
+            i += 1
+            continue
+
+        if ch == open_char:
+            stack.append(close_char)
+        elif ch == close_char:
+            stack.pop()
+            if not stack:
+                return text[start:i]
+        elif ch == "<":
+            stack.append(">")
+        elif ch == ">":
+            if stack and stack[-1] == ">":
+                stack.pop()
+                if not stack:
+                    return text[start:i]
+        elif ch == "(":
+            stack.append(")")
+        elif ch == ")":
+            if stack and stack[-1] == ")":
+                stack.pop()
+                if not stack:
+                    return text[start:i]
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "}":
+            if stack and stack[-1] == "}":
+                stack.pop()
+                if not stack:
+                    return text[start:i]
+        elif ch == "[":
+            stack.append("]")
+        elif ch == "]":
+            if stack and stack[-1] == "]":
+                stack.pop()
+                if not stack:
+                    return text[start:i]
+
+        i += 1
+
+    return None
+
+
+def _extract_top_level_vue_keys(body: str) -> list[str]:
+    """Extract top-level keys from a Vue type/object body."""
+    keys: list[str] = []
+    masked = _mask_js_strings_and_comments(body)
+    depth = 0
+    i = 0
+
+    while i < len(masked):
+        ch = masked[i]
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+
+        if depth == 1 and (ch.isalpha() or ch == "_"):
+            start = i
+            while i < len(masked) and (masked[i].isalnum() or masked[i] in {"_", "-"}):
+                i += 1
+            key = masked[start:i]
+            j = i
+            while j < len(masked) and masked[j].isspace():
+                j += 1
+            if j < len(masked) and masked[j] in {"?", ":"}:
+                if masked[j] == "?":
+                    j += 1
+                    while j < len(masked) and masked[j].isspace():
+                        j += 1
+                if j < len(masked) and masked[j] == ":":
+                    if key not in {"type", "readonly"}:
+                        keys.append(key)
+            continue
+
+        i += 1
 
     return _unique_sorted(keys)
 
@@ -3756,14 +4006,14 @@ def _build_vue_component_metadata(
         "script": script_signals or {},
     }
 
+    metadata["slots"] = template_signals["slots"] if template_signals else []
+
+    css_modules: list[str] = []
+    if style_signals and "module" in style_signals["flags"]:
+        css_modules.extend(style_signals["classes"])
     if template_signals:
-        metadata["slots"] = template_signals["slots"]
-        metadata["css_modules"] = _unique_sorted(
-            template_signals["module_refs"] + template_signals["classes"]
-        )
-    else:
-        metadata["slots"] = []
-        metadata["css_modules"] = []
+        css_modules.extend(template_signals["module_refs"])
+    metadata["css_modules"] = _unique_sorted(css_modules)
 
     if style_signals:
         metadata["scoped_styles"] = ["scoped"] if "scoped" in style_signals["flags"] else []

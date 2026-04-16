@@ -895,6 +895,42 @@ await navigateTo('/checkout')
 </style>
 ''')
 
+    (src / "NestedMacroSignals.vue").write_text('''\
+<template><div /></template>
+
+<script setup lang="ts">
+const props = defineProps<{
+  id: string
+  nested: {
+    child: string
+    details: {
+      label: string
+    }
+  }
+}>()
+
+const emit = defineEmits(['save', 'cancel'])
+
+const text = "defineProps<{ fake: true }>() defineEmits(['oops'])"
+</script>
+''')
+
+    (src / "StyleOnlyCssModule.vue").write_text('''\
+<template>
+  <div class="hero" />
+</template>
+
+<style lang="postcss" module>
+.card {
+  color: var(--accent-color);
+}
+
+.badge {
+  padding: 4px;
+}
+</style>
+''')
+
     (src / "DocCommentCleanup.vue").write_text('''\
 <template><div /></template>
 
@@ -964,8 +1000,8 @@ def test_index_vue_script_setup_ts_offsets_lines(db, vue_project):
     indexer = Indexer(db, config)
     stats = indexer.index(vue_project)
 
-    assert stats.files_scanned == 22
-    assert stats.files_indexed == 22
+    assert stats.files_scanned == 24
+    assert stats.files_indexed == 24
     assert stats.symbols_extracted > 0
     assert stats.errors == 0
 
@@ -1306,6 +1342,33 @@ def test_index_vue_normalized_metadata_and_file_summary_are_persisted(db, vue_pr
     assert file_summary["metadata"]["resource"] == "component"
     assert file_summary["metadata"]["props"] == ["msg"]
     assert file_summary["metadata"]["css_modules"] == ["card"]
+
+
+def test_index_vue_nested_macro_keys_ignore_string_noise(db, vue_project):
+    """Vue macro extraction should only keep real top-level prop and emit keys."""
+    config = IndexConfig(root=vue_project)
+    indexer = Indexer(db, config)
+    indexer.index(vue_project)
+
+    syms = db.symbols_in_file("NestedMacroSignals.vue")
+    component = next(s for s in syms if s.kind == "component")
+
+    assert component.metadata is not None
+    assert component.metadata["props"] == ["id", "nested"]
+    assert component.metadata["emits"] == ["cancel", "save"]
+
+
+def test_index_vue_style_only_css_module_uses_stylesheet_classes(db, vue_project):
+    """Vue css_modules should come from module-aware stylesheet classes, not plain template classes."""
+    config = IndexConfig(root=vue_project)
+    indexer = Indexer(db, config)
+    indexer.index(vue_project)
+
+    syms = db.symbols_in_file("StyleOnlyCssModule.vue")
+    component = next(s for s in syms if s.kind == "component")
+
+    assert component.metadata is not None
+    assert component.metadata["css_modules"] == ["badge", "card"]
 
 
 def test_index_vue_reindex_clears_stale_file_summary_when_signals_disappear(db, tmp_path):
