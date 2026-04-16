@@ -950,6 +950,17 @@ const text = "defineProps<{ fake: true }>() defineEmits({ nope: null })"
 </script>
 ''')
 
+    (src / "RuntimeDefineProps.vue").write_text('''\
+<template><div /></template>
+
+<script setup lang="ts">
+const props = defineProps({
+  'data-id': String,
+  other: Number,
+})
+</script>
+''')
+
     (src / "DocCommentCleanup.vue").write_text('''\
 <template><div /></template>
 
@@ -1019,8 +1030,8 @@ def test_index_vue_script_setup_ts_offsets_lines(db, vue_project):
     indexer = Indexer(db, config)
     stats = indexer.index(vue_project)
 
-    assert stats.files_scanned == 25
-    assert stats.files_indexed == 25
+    assert stats.files_scanned == 26
+    assert stats.files_indexed == 26
     assert stats.symbols_extracted > 0
     assert stats.errors == 0
 
@@ -1402,6 +1413,19 @@ def test_index_vue_macro_edge_cases_preserve_nested_generics_and_object_emits(db
     assert component.metadata is not None
     assert component.metadata["props"] == ["cb", "data-id", "other"]
     assert component.metadata["emits"] == ["cancel", "save"]
+
+
+def test_index_vue_runtime_define_props_object_form_supports_quoted_keys(db, vue_project):
+    """Vue runtime defineProps object form should recover quoted and plain keys."""
+    config = IndexConfig(root=vue_project)
+    indexer = Indexer(db, config)
+    indexer.index(vue_project)
+
+    syms = db.symbols_in_file("RuntimeDefineProps.vue")
+    component = next(s for s in syms if s.kind == "component")
+
+    assert component.metadata is not None
+    assert component.metadata["props"] == ["data-id", "other"]
 
 
 def test_index_vue_reindex_clears_stale_file_summary_when_signals_disappear(db, tmp_path):

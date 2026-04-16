@@ -3625,12 +3625,11 @@ def _extract_vue_macro_keys(text: str, macro_name: str) -> list[str]:
             body = _extract_balanced_inner_text(text, cursor, "(", ")")
             if not body:
                 continue
-            if macro_name == "defineEmits":
-                stripped = body.lstrip()
-                if stripped.startswith("["):
-                    keys.extend(value for value in re.findall(r"['\"]([^'\"]+)['\"]", body) if value)
-                elif stripped.startswith("{"):
-                    keys.extend(_extract_top_level_vue_keys(body))
+            stripped = body.lstrip()
+            if stripped.startswith("["):
+                keys.extend(value for value in re.findall(r"['\"]([^'\"]+)['\"]", body) if value)
+            elif stripped.startswith("{"):
+                keys.extend(_extract_top_level_vue_keys(body))
 
     return _unique_sorted(keys)
 
