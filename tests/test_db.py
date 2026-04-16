@@ -98,6 +98,59 @@ def test_initialize_migrates_file_summary_columns(tmp_path):
         db.close()
 
 
+def test_initialize_only_backfills_missing_embedding_context_hashes(tmp_path):
+    """initialize() should only backfill missing embedding context hashes."""
+    db_path = tmp_path / "embedded-context.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+    try:
+        db.upsert_file(FileRecord(
+            path="client/src/components/MissingHash.vue",
+            content_hash="missing-hash",
+            mtime=1.0,
+            language="vue",
+            size=100,
+            line_count=10,
+            summary="Needs a backfilled hash.",
+            metadata={"framework": "vue", "resource": "component"},
+        ))
+        db.upsert_file(FileRecord(
+            path="client/src/components/KeepHash.vue",
+            content_hash="keep-hash",
+            mtime=2.0,
+            language="vue",
+            size=100,
+            line_count=10,
+            summary="Hash already present.",
+            metadata={"framework": "vue", "resource": "component"},
+        ))
+        db.commit()
+
+        db.conn.execute(
+            "UPDATE files SET embedding_context_hash = NULL WHERE path = ?",
+            ("client/src/components/MissingHash.vue",),
+        )
+        db.conn.execute(
+            "UPDATE files SET embedding_context_hash = ? WHERE path = ?",
+            ("keep-me", "client/src/components/KeepHash.vue"),
+        )
+        db.commit()
+
+        db.initialize()
+
+        rows = {
+            row["path"]: row["embedding_context_hash"]
+            for row in db.conn.execute(
+                "SELECT path, embedding_context_hash FROM files ORDER BY path"
+            ).fetchall()
+        }
+        assert rows["client/src/components/MissingHash.vue"] is not None
+        assert rows["client/src/components/KeepHash.vue"] == "keep-me"
+    finally:
+        db.close()
+
+
 def test_file_needs_reindex(db):
     """Change detection works via content hash."""
     rec = FileRecord(

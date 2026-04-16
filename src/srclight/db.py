@@ -790,7 +790,12 @@ class Database:
         """Backfill file embedding context hashes after migrations."""
         assert self.conn is not None
         rows = self.conn.execute(
-            "SELECT id, summary, metadata FROM files WHERE summary IS NOT NULL OR metadata IS NOT NULL"
+            """
+            SELECT id, summary, metadata
+            FROM files
+            WHERE (summary IS NOT NULL OR metadata IS NOT NULL)
+              AND embedding_context_hash IS NULL
+            """
         ).fetchall()
         for row in rows:
             metadata = row["metadata"]
