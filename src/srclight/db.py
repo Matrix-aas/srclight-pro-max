@@ -460,6 +460,8 @@ class SymbolRecord:
     metadata: dict | None = None
     # Joined fields (not in symbols table directly)
     file_path: str | None = None
+    file_summary: str | None = None
+    file_summary_metadata: dict | None = None
 
 
 @dataclass
@@ -1501,6 +1503,8 @@ class Database:
             d["parameters"] = json.loads(d["parameters"])
         if isinstance(d.get("metadata"), str):
             d["metadata"] = json.loads(d["metadata"])
+        if isinstance(d.get("file_summary_metadata"), str):
+            d["file_summary_metadata"] = json.loads(d["file_summary_metadata"])
         # Filter to only SymbolRecord fields (joined queries may add extras)
         valid_fields = {f.name for f in fields(SymbolRecord)}
         d = {k: v for k, v in d.items() if k in valid_fields}
@@ -2056,7 +2060,7 @@ class Database:
         """Get symbols that need embeddings (no embedding or body_hash changed)."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path
+            """SELECT s.*, f.path as file_path, f.summary as file_summary, f.metadata as file_summary_metadata
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?

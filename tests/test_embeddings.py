@@ -198,6 +198,31 @@ def test_prepare_embedding_text_vue_normalized_metadata():
     assert "scoped styles: scoped" in text
 
 
+def test_prepare_embedding_text_includes_file_summary_context_for_fullstack_vue_symbols():
+    sym = {
+        "name": "ObservedFullstackSignal",
+        "qualified_name": "ObservedFullstackSignal",
+        "signature": "component ObservedFullstackSignal",
+        "content": "",
+        "file_summary": "Vue shell around auth and GraphQL flow.",
+        "file_summary_metadata": {
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "graphql_ops_used": ["query GetUser"],
+            "css_modules": ["card"],
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "file summary: Vue shell around auth and GraphQL flow." in text
+    assert "file summary metadata: vue component" in text
+    assert "props: msg" in text
+    assert "graphql ops: query GetUser" in text
+    assert "css modules: card" in text
+
+
 def test_prepare_embedding_text_mongoose_schema_metadata():
     sym = {
         "name": "UserSchema",
@@ -239,6 +264,66 @@ def test_prepare_embedding_text_mikroorm_repository_metadata():
     assert "repository" in text
     assert "User" in text
     assert "users" in text
+
+
+def test_prepare_embedding_text_serializes_graphql_and_nest_mikroorm_extras():
+    resolver = {
+        "name": "viewer",
+        "qualified_name": "ViewerResolver.viewer",
+        "signature": "Query viewer",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "query",
+            "graphql_field": "viewer",
+            "resolver_type": "Viewer",
+        },
+    }
+    module = {
+        "name": "PersistenceModule",
+        "qualified_name": "PersistenceModule",
+        "signature": "Nest module PersistenceModule",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "module",
+            "config_refs": ["AuthConfig"],
+            "mikroorm_root_entities": ["AuditLogSchema", "Book", "User"],
+            "mikroorm_feature_entities": ["User"],
+        },
+    }
+    bootstrap = {
+        "name": "bootstrap",
+        "qualified_name": "bootstrap",
+        "signature": "Nest bootstrap AppModule",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "bootstrap",
+            "root_module": "AppModule",
+        },
+    }
+    mikro_schema = {
+        "name": "UserSchema",
+        "qualified_name": "UserSchema",
+        "signature": "mikroorm schema | UserSchema | users",
+        "metadata": {
+            "framework": "mikroorm",
+            "resource": "entity",
+            "entity_name": "User",
+            "schema_name": "UserSchema",
+            "table_name": "users",
+        },
+    }
+
+    text = "\n".join(
+        prepare_embedding_text(sym) for sym in (resolver, module, bootstrap, mikro_schema)
+    )
+
+    assert "graphql field: viewer" in text
+    assert "resolver type: Viewer" in text
+    assert "config refs: AuthConfig" in text
+    assert "mikroorm root entities: AuditLogSchema, Book, User" in text
+    assert "mikroorm feature entities: User" in text
+    assert "root module: AppModule" in text
+    assert "schema: UserSchema" in text
 
 
 def test_prepare_embedding_text_persistence_aggregate_metadata():
@@ -1195,3 +1280,51 @@ def test_db_symbols_needing_embeddings_decode_metadata_for_wave1_backend_text(tm
     assert "mikroorm entity User" in prepared
 
     db.close()
+
+
+def test_db_symbols_needing_embeddings_include_file_summary_context(tmp_path):
+    """Embedding fetches should carry file summary context for noisy symbols."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+
+    file_id = db.upsert_file(FileRecord(
+        path="client/src/components/ProfileCard.vue",
+        content_hash="hash-1",
+        mtime=1.0,
+        language="vue",
+        size=100,
+        line_count=20,
+        summary="Vue shell around auth and GraphQL flow.",
+        metadata={
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "css_modules": ["card"],
+        },
+    ))
+
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="component",
+        name="ProfileCard",
+        start_line=1,
+        end_line=5,
+        content="<template />",
+        body_hash="v1",
+    ), "client/src/components/ProfileCard.vue")
+    db.commit()
+
+    needing = db.get_symbols_needing_embeddings("mock:test-model")
+
+    assert len(needing) == 1
+    assert needing[0]["file_summary"] == "Vue shell around auth and GraphQL flow."
+    assert needing[0]["file_summary_metadata"] == {
+        "framework": "vue",
+        "resource": "component",
+        "props": ["msg"],
+        "css_modules": ["card"],
+    }

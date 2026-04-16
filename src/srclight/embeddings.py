@@ -158,6 +158,38 @@ def prepare_embedding_text(symbol: dict) -> str:
         # Truncate to ~2000 chars (~500 tokens) to stay within limits
         parts.append(content[:2000])
 
+    file_summary = symbol.get("file_summary") or ""
+    if file_summary:
+        parts.append(f"file summary: {str(file_summary).strip()}")
+
+    file_summary_metadata = symbol.get("file_summary_metadata")
+    if isinstance(file_summary_metadata, dict):
+        file_metadata_parts = []
+        file_framework = file_summary_metadata.get("framework")
+        file_resource = file_summary_metadata.get("resource")
+        if file_framework or file_resource:
+            file_metadata_parts.append(
+                "file summary metadata: "
+                + " ".join(part for part in (file_framework, file_resource) if part)
+            )
+        for key, label in (
+            ("props", "props"),
+            ("emits", "emits"),
+            ("slots", "slots"),
+            ("graphql_ops_used", "graphql ops"),
+            ("routes_used", "routes"),
+            ("css_modules", "css modules"),
+            ("scoped_styles", "scoped styles"),
+            ("config_refs", "config refs"),
+            ("mikroorm_root_entities", "mikroorm root entities"),
+            ("mikroorm_feature_entities", "mikroorm feature entities"),
+        ):
+            values = file_summary_metadata.get(key)
+            if isinstance(values, list) and values:
+                file_metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+        if file_metadata_parts:
+            parts.append("\n".join(file_metadata_parts))
+
     metadata = symbol.get("metadata") or {}
     if isinstance(metadata, dict):
         metadata_parts = []
@@ -184,6 +216,9 @@ def prepare_embedding_text(symbol: dict) -> str:
                 ("controllers", "controllers"),
                 ("providers", "providers"),
                 ("exports", "exports"),
+                ("config_refs", "config refs"),
+                ("mikroorm_root_entities", "mikroorm root entities"),
+                ("mikroorm_feature_entities", "mikroorm feature entities"),
             ):
                 values = metadata.get(key)
                 if isinstance(values, list) and values:
@@ -230,6 +265,18 @@ def prepare_embedding_text(symbol: dict) -> str:
             names = metadata.get("entity_names")
             if isinstance(names, list) and names:
                 metadata_parts.append(f"{framework} database " + ", ".join(str(value) for value in names))
+        if resource == "bootstrap":
+            root_module = metadata.get("root_module")
+            if root_module:
+                metadata_parts.append(f"root module: {root_module}")
+        for key, label in (
+            ("graphql_field", "graphql field"),
+            ("resolver_type", "resolver type"),
+            ("schema_name", "schema"),
+        ):
+            value = metadata.get(key)
+            if value:
+                metadata_parts.append(f"{label}: {value}")
 
         if resource == "microservice_handler":
             for key, label in (
