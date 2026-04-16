@@ -1274,17 +1274,17 @@ def test_workspace_db_codebase_map_uses_indexed_file_summaries_for_orientation(
         db.update_file_summary(
             "src/http/orders.routes.ts",
             summary="Orders HTTP routes and transport handlers.",
-            metadata={"framework": "nest", "resource": "controller", "route_prefix": "/orders"},
+            metadata=None,
         )
         db.update_file_summary(
             "src/runtime/runtime.config.ts",
             summary="Runtime configuration and module wiring.",
-            metadata={"framework": "nest", "resource": "config"},
+            metadata=None,
         )
         db.update_file_summary(
             "src/queue/email.worker.ts",
             summary="Background email worker.",
-            metadata={"framework": "bullmq", "resource": "worker", "transport": "bullmq"},
+            metadata=None,
         )
         db.commit()
     finally:
@@ -1311,10 +1311,10 @@ def test_workspace_db_codebase_map_uses_indexed_file_summaries_for_orientation(
     assert payload["topology"]["async"]["files"] == ["src/queue/email.worker.ts"]
 
 
-def test_workspace_db_codebase_map_keeps_unconventional_backend_surfaces_discoverable_from_file_summaries(
+def test_workspace_db_codebase_map_keeps_generic_unconventional_route_surfaces_discoverable_from_file_summaries(
     tmp_path, ws_dir
 ):
-    project_dir = _create_indexed_project(tmp_path, "fullstack", [
+    project_dir = _create_indexed_project(tmp_path, "generic-backend", [
         {
             "name": "bootstrap",
             "kind": "function",
@@ -1352,20 +1352,14 @@ def test_workspace_db_codebase_map_keeps_unconventional_backend_surfaces_discove
         },
     ])
 
-    (project_dir / "app/pages").mkdir(parents=True)
     (project_dir / "src/transport").mkdir(parents=True, exist_ok=True)
     (project_dir / "src/runtime").mkdir(parents=True, exist_ok=True)
     (project_dir / "src/persistence").mkdir(parents=True, exist_ok=True)
     (project_dir / "src/messaging").mkdir(parents=True, exist_ok=True)
 
     (project_dir / "package.json").write_text(json.dumps({
-        "dependencies": {
-            "nuxt": "^4.0.0",
-            "@nestjs/core": "^11.0.0",
-        },
+        "dependencies": {},
     }))
-    (project_dir / "nuxt.config.ts").write_text("export default defineNuxtConfig({})\n")
-    (project_dir / "app/pages/index.vue").write_text("<template>Home</template>\n")
     (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
     (project_dir / "src/transport/orders.endpoint.ts").write_text("export class OrdersEndpoint {}\n")
     (project_dir / "src/runtime/runtime.setup.ts").write_text("export class RuntimeSetup {}\n")
@@ -1378,50 +1372,50 @@ def test_workspace_db_codebase_map_keeps_unconventional_backend_surfaces_discove
         db.update_file_summary(
             "src/main.ts",
             summary="Application bootstrap entrypoint.",
-            metadata={"framework": "nest", "resource": "bootstrap"},
+            metadata=None,
         )
         db.update_file_summary(
             "src/transport/orders.endpoint.ts",
-            summary="Orders transport and route handlers.",
-            metadata={"framework": "nest", "resource": "controller", "route_prefix": "/orders"},
+            summary="Orders HTTP route handlers and transport entrypoints.",
+            metadata=None,
         )
         db.update_file_summary(
             "src/runtime/runtime.setup.ts",
             summary="Runtime module and environment setup.",
-            metadata={"framework": "nest", "resource": "module"},
+            metadata=None,
         )
         db.update_file_summary(
             "src/persistence/user.store.ts",
             summary="User persistence and repository wiring.",
-            metadata={"framework": "mikroorm", "resource": "repository"},
+            metadata=None,
         )
         db.update_file_summary(
             "src/messaging/orders.listener.ts",
             summary="Orders event listener.",
-            metadata={"framework": "rabbitmq", "resource": "consumer", "transport": "rabbitmq"},
+            metadata=None,
         )
         db.commit()
     finally:
         db.close()
 
-    config = WorkspaceConfig(name="summary-metadata-fullstack")
-    config.add_project("fullstack", str(project_dir))
+    config = WorkspaceConfig(name="summary-generic-backend")
+    config.add_project("generic-backend", str(project_dir))
 
     with WorkspaceDB(config) as wdb:
-        payload = wdb.codebase_map(project="fullstack")
+        payload = wdb.codebase_map(project="generic-backend")
 
     start_paths = [item["path"] for item in payload["start_here"]]
 
-    assert payload["framework_hints"]["app_type"] == "fullstack"
+    assert payload["framework_hints"]["app_type"] == "node"
     assert payload["representative_files"]["backend"] == [
         "src/main.ts",
         "src/transport/orders.endpoint.ts",
     ]
+    assert payload["topology"]["routes"]["systems"] == ["generic"]
     assert payload["topology"]["routes"]["files"] == ["src/transport/orders.endpoint.ts"]
     assert payload["topology"]["data"]["files"] == ["src/persistence/user.store.ts"]
     assert payload["topology"]["async"]["files"] == ["src/messaging/orders.listener.ts"]
     assert payload["topology"]["runtime"]["files"] == [
-        "nuxt.config.ts",
         "package.json",
         "src/runtime/runtime.setup.ts",
     ]

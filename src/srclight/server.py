@@ -308,6 +308,7 @@ _DATA_SYSTEMS = ("prisma", "drizzle", "mongoose", "mikroorm")
 _ASYNC_SYSTEMS = ("bullmq", "rabbitmq", "redis")
 _ASYNC_SYSTEM_ALIASES = {"rmq": "rabbitmq"}
 _ASYNC_RESOURCES = {"processor", "consumer", "worker", "queue", "scheduler"}
+_DATA_RESOURCES = {"database", "entity", "model", "repository", "schema", "store"}
 
 
 def _normalize_orientation_token(value: object) -> str:
@@ -430,7 +431,7 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
             or kind in {"module", "config"}
             or "/bootstrap/" in path
         )
-        is_data = framework in _DATA_SYSTEMS
+        is_data = framework in _DATA_SYSTEMS or resource in _DATA_RESOURCES
         is_async = (
             kind in {"queue_processor", "microservice_handler", "scheduled_job"}
             or resource in _ASYNC_RESOURCES
@@ -459,8 +460,9 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
 
         if is_data and path:
             _append(representative_files["data"], path)
-            _append(data_systems, framework)
-            _append(signals, framework)
+            if framework in _DATA_SYSTEMS:
+                _append(data_systems, framework)
+                _append(signals, framework)
 
         if is_async and path:
             _append(representative_files["async"], path)
@@ -496,6 +498,13 @@ def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[
     symbol_rows: list[dict[str, object]] = []
     entrypoint_paths = {"src/main.ts", "src/main.js", "main.ts", "main.js", "server.ts"}
 
+    def _summary_tokens(text: object) -> set[str]:
+        return set(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+    def _set_missing(metadata: dict[str, object], key: str, value: str) -> None:
+        if value and not metadata.get(key):
+            metadata[key] = value
+
     for row in file_rows:
         metadata = row.get("metadata") or {}
         if not isinstance(metadata, dict):
@@ -504,9 +513,39 @@ def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[
             metadata = dict(metadata)
 
         file_path = str(row.get("path") or "")
+        summary = str(row.get("summary") or "")
+        tokens = _summary_tokens(summary)
         resource = str(metadata.get("resource") or "").lower()
         if resource == "bootstrap" and file_path in entrypoint_paths:
             metadata.pop("resource", None)
+            resource = ""
+
+        if not metadata.get("framework"):
+            for candidate in _DATA_SYSTEMS + _ASYNC_SYSTEMS + ("nest", "nitro", "nuxt", "vue"):
+                if candidate in tokens:
+                    metadata["framework"] = candidate
+                    break
+        if not metadata.get("transport"):
+            for candidate in _ASYNC_SYSTEMS:
+                if candidate in tokens:
+                    metadata["transport"] = candidate
+                    break
+
+        if not resource:
+            if {"controller", "endpoint"} & tokens:
+                _set_missing(metadata, "resource", "controller")
+            elif "route" in tokens or ("http" in tokens and {"handler", "handlers"} & tokens):
+                _set_missing(metadata, "resource", "route")
+            elif {"database", "schema", "repository", "persistence", "model", "entity", "store"} & tokens:
+                inferred = "repository" if {"repository", "persistence", "store"} & tokens else "database"
+                _set_missing(metadata, "resource", inferred)
+            elif {"worker", "queue", "job", "consumer", "listener", "scheduler", "background", "event"} & tokens:
+                inferred = "consumer" if {"consumer", "listener", "event"} & tokens else "worker"
+                _set_missing(metadata, "resource", inferred)
+            elif {"runtime", "config", "configuration", "module", "environment", "wiring"} & tokens:
+                _set_missing(metadata, "resource", "config")
+            elif {"bootstrap"} & tokens and file_path not in entrypoint_paths:
+                _set_missing(metadata, "resource", "bootstrap")
 
         top_level_symbols = row.get("top_level_symbols") or []
         primary_kind = ""
@@ -526,6 +565,17 @@ def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[
                     "scheduled_job",
                 }:
                     break
+        if not primary_kind:
+            primary_kind = {
+                "controller": "controller",
+                "route": "route",
+                "module": "module",
+                "config": "config",
+                "processor": "queue_processor",
+                "consumer": "microservice_handler",
+                "worker": "scheduled_job",
+                "scheduler": "scheduled_job",
+            }.get(str(metadata.get("resource") or "").lower(), "")
 
         symbol_rows.append({
             "kind": primary_kind,
@@ -794,14 +844,16 @@ def _build_topology(
         route_systems.append("nest_controllers")
     if any(path.startswith(("server/api", "server/routes")) for path in backend_files + (representative_files.get("server") or [])) and "nitro_file_routes" not in route_systems:
         route_systems.append("nitro_file_routes")
+    route_files = _merge_representative_paths(
+        [path for path in representative_files.get("server") or [] if path.startswith(("server/api", "server/routes"))],
+        list(indexed_hints.get("route_files") or []),
+        [path for path in backend_files if path.startswith("src/controllers")],
+        [path for path in backend_files if path.startswith(("server/api", "server/routes"))],
+        limit=3,
+    )
+    if route_files and not route_systems:
+        route_systems = ["generic"]
     if route_systems:
-        route_files = _merge_representative_paths(
-            [path for path in representative_files.get("server") or [] if path.startswith(("server/api", "server/routes"))],
-            list(indexed_hints.get("route_files") or []),
-            [path for path in backend_files if path.startswith("src/controllers")],
-            [path for path in backend_files if path.startswith(("server/api", "server/routes"))],
-            limit=3,
-        )
         topology["routes"] = {
             "systems": route_systems,
             "files": route_files,
@@ -850,6 +902,7 @@ def _build_topology(
 def _route_summary(route_systems: list[str]) -> str:
     """Summarize route systems without implying surfaces we did not detect."""
     labels = {
+        "generic": "generic route handlers",
         "nest_controllers": "Nest controllers",
         "nitro_file_routes": "Nitro file routes",
     }
@@ -931,8 +984,8 @@ def _build_start_here(
         priority = ("config", "backend", "data", "async", "entrypoints", "server", "graphql", "styles", "components")
         category_limits = {"config": 2, "backend": 2}
     else:
-        priority = ("config", "entrypoints", "routes", "components", "composables", "stores", "plugins", "server", "graphql", "styles")
-        category_limits = {}
+        priority = ("config", "entrypoints", "backend", "routes", "data", "async", "components", "composables", "stores", "plugins", "server", "graphql", "styles")
+        category_limits = {"backend": 2}
 
     start_here: list[dict[str, str]] = []
     seen: set[str] = set()
