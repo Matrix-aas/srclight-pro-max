@@ -40,7 +40,7 @@ IndexEvent = dict[str, object]
 IndexEventCallback = Callable[[IndexEvent], None]
 
 # Bump when extraction/query behavior changes such that unchanged files must be re-indexed.
-INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-jsdoc-cleanup-v1"
+INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-jsdoc-cleanup-v2"
 
 
 # Default ignore patterns
@@ -254,7 +254,7 @@ def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
     for line in cleaned_lines:
         if re.fullmatch(r"[-=/*_# ]+", line):
             continue
-        if re.match(r"^(?:todo|fixme|xxx|hack|note)\b", line, flags=re.IGNORECASE):
+        if re.match(r"^(?:todo|fixme)\b", line, flags=re.IGNORECASE):
             continue
         if re.search(r"[A-Za-z0-9]", line):
             return True
@@ -264,14 +264,19 @@ def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
 
 def _extract_js_ts_doc_comment(source_bytes: bytes, node: Node) -> str | None:
     """Extract meaningful doc comments for JS/TS/Vue symbols."""
+    transparent_wrappers = {
+        "export_statement",
+        "lexical_declaration",
+    }
     current: Node | None = node
-    for _ in range(3):
-        if current is None:
-            break
+    while current is not None:
         doc = _extract_doc_comment(source_bytes, current)
         if _is_meaningful_js_ts_doc_comment(doc):
             return doc
-        current = current.parent
+        parent = current.parent
+        if parent is None or parent.type not in transparent_wrappers:
+            break
+        current = parent
 
     return None
 
@@ -4289,7 +4294,10 @@ class Indexer:
 
         for def_node, kind, symbol_name in raw_symbols:
             content_text = def_node.text.decode("utf-8", errors="replace")
-            doc = _extract_js_ts_doc_comment(source, def_node)
+            if lang in {"javascript", "typescript", "tsx"}:
+                doc = _extract_js_ts_doc_comment(source, def_node)
+            else:
+                doc = _extract_doc_comment(source, def_node)
             sig = _extract_signature(source, def_node, lang)
             metadata = None
 

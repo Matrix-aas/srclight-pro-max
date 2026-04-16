@@ -193,7 +193,88 @@ def test_indexer_build_change_forces_full_reindex(db, sample_project, monkeypatc
 
 def test_indexer_build_id_marks_wave2_async_extractor_version():
     """Wave 2 async extractor changes should produce a distinct build id suffix."""
-    assert INDEXER_BUILD_ID.endswith("jsdoc-cleanup-v1")
+    assert INDEXER_BUILD_ID.endswith("jsdoc-cleanup-v2")
+
+
+def test_index_csharp_doc_comments_do_not_leak_to_methods(db, tmp_path):
+    """Non-JS extraction should keep class comments off child methods."""
+    project = tmp_path / "csharp-docs"
+    project.mkdir()
+
+    (project / "Example.cs").write_text(
+        '''\
+/// Class docs should stay on the class.
+public class Example
+{
+    public int Method()
+    {
+        return 1;
+    }
+}
+'''
+    )
+
+    config = IndexConfig(root=project)
+    indexer = Indexer(db, config)
+    indexer.index(project)
+
+    syms = {sym.name: sym for sym in db.symbols_in_file("Example.cs")}
+
+    assert "Class docs should stay on the class." in (syms["Example"].doc_comment or "")
+    assert syms["Method"].doc_comment is None
+
+
+def test_index_typescript_class_method_does_not_inherit_class_doc(db, tmp_path):
+    """JS/TS doc lookup should not leak class docs onto child methods."""
+    project = tmp_path / "ts-class-docs"
+    project.mkdir()
+
+    (project / "example.ts").write_text(
+        '''\
+/** Class docs should stay on the class. */
+class Example {
+  method() {
+    return 1;
+  }
+}
+'''
+    )
+
+    config = IndexConfig(root=project)
+    indexer = Indexer(db, config)
+    indexer.index(project)
+
+    syms = {sym.name: sym for sym in db.symbols_in_file("example.ts")}
+
+    assert "Class docs should stay on the class." in (syms["Example"].doc_comment or "")
+    assert syms["method"].doc_comment is None
+
+
+def test_index_typescript_exported_wrapper_doc_comments_are_preserved(db, tmp_path):
+    """Exported JS/TS declarations should keep wrapper-level doc comments."""
+    project = tmp_path / "ts-export-docs"
+    project.mkdir()
+
+    (project / "example.ts").write_text(
+        '''\
+/**
+ * Wrapper-level export docs should remain attached.
+ */
+export function wrappedValue() {
+  return 1;
+}
+'''
+    )
+
+    config = IndexConfig(root=project)
+    indexer = Indexer(db, config)
+    indexer.index(project)
+
+    syms = {sym.name: sym for sym in db.symbols_in_file("example.ts")}
+
+    assert "Wrapper-level export docs should remain attached." in (
+        syms["wrappedValue"].doc_comment or ""
+    )
 
 
 def test_local_microservice_decorator_wrappers_reuse_file_scope_scan(monkeypatch):
