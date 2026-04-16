@@ -192,8 +192,8 @@ def test_indexer_build_change_forces_full_reindex(db, sample_project, monkeypatc
 
 
 def test_indexer_build_id_marks_wave2_async_extractor_version():
-    """Wave 2 async extractor changes should produce a distinct build id suffix."""
-    assert INDEXER_BUILD_ID.endswith("jsdoc-cleanup-v3")
+    """Vue metadata changes should produce a distinct build id suffix."""
+    assert INDEXER_BUILD_ID.endswith("vue-normalized-metadata-v1")
 
 
 def test_index_csharp_doc_comments_do_not_leak_to_methods(db, tmp_path):
@@ -854,6 +854,47 @@ const update = useUpdateMeMutation()
 </script>
 ''')
 
+    (src / "NormalizedSignals.vue").write_text('''\
+<template>
+  <BaseCard :class="$style.card">
+    <template #header>
+      {{ msg }}
+    </template>
+  </BaseCard>
+</template>
+
+<script setup lang="ts">
+const props = defineProps<{ msg: string }>()
+const emit = defineEmits<{ save: [] }>()
+const route = useRoute()
+const authStore = useAuthStore()
+
+const catalogQuery = gql`
+  query GetCatalog {
+    catalog {
+      id
+    }
+  }
+`
+
+const saveCartMutation = gql`
+  mutation SaveCart {
+    saveCart {
+      id
+    }
+  }
+`
+
+await navigateTo('/checkout')
+</script>
+
+<style lang="postcss" module scoped>
+.card {
+  color: var(--accent-color);
+}
+</style>
+''')
+
     (src / "DocCommentCleanup.vue").write_text('''\
 <template><div /></template>
 
@@ -923,8 +964,8 @@ def test_index_vue_script_setup_ts_offsets_lines(db, vue_project):
     indexer = Indexer(db, config)
     stats = indexer.index(vue_project)
 
-    assert stats.files_scanned == 21
-    assert stats.files_indexed == 21
+    assert stats.files_scanned == 22
+    assert stats.files_indexed == 22
     assert stats.symbols_extracted > 0
     assert stats.errors == 0
 
@@ -1231,6 +1272,90 @@ def test_search_finds_vue_observed_nuxt_use_component_anchor(db, vue_project):
     assert results
     assert results[0]["name"] == "ObservedNuxtUses"
     assert results[0]["kind"] == "component"
+
+
+def test_index_vue_normalized_metadata_and_file_summary_are_persisted(db, vue_project):
+    """Vue component anchors should expose normalized metadata and file summaries."""
+    config = IndexConfig(root=vue_project)
+    indexer = Indexer(db, config)
+    indexer.index(vue_project)
+
+    syms = db.symbols_in_file("NormalizedSignals.vue")
+    component = next(s for s in syms if s.kind == "component")
+
+    assert component.metadata is not None
+    assert component.metadata["framework"] == "vue"
+    assert component.metadata["resource"] == "component"
+    assert component.metadata["props"] == ["msg"]
+    assert component.metadata["emits"] == ["save"]
+    assert component.metadata["slots"] == ["header"]
+    assert component.metadata["composables_used"] == ["useRoute"]
+    assert component.metadata["stores_used"] == ["useAuthStore"]
+    assert component.metadata["graphql_ops_used"] == ["mutation SaveCart", "query GetCatalog"]
+    assert component.metadata["routes_used"] == ["/checkout"]
+    assert component.metadata["css_modules"] == ["card"]
+    assert component.metadata["scoped_styles"] == ["scoped"]
+    assert component.metadata["template"]["components"] == ["BaseCard"]
+    assert component.metadata["style"]["flags"] == ["module", "scoped"]
+
+    file_summary = db.get_file_summary("NormalizedSignals.vue")
+    assert file_summary is not None
+    assert file_summary["summary"]
+    assert file_summary["metadata"] is not None
+    assert file_summary["metadata"]["framework"] == "vue"
+    assert file_summary["metadata"]["resource"] == "component"
+    assert file_summary["metadata"]["props"] == ["msg"]
+    assert file_summary["metadata"]["css_modules"] == ["card"]
+
+
+def test_index_vue_reindex_clears_stale_file_summary_when_signals_disappear(db, tmp_path):
+    """Vue file summaries should be removed once a file no longer has Vue signals."""
+    project = tmp_path / "vue-stale-summary"
+    project.mkdir()
+    file_path = project / "SignalCleanup.vue"
+    file_path.write_text('''\
+<template>
+  <BaseCard :class="$style.card">
+    <template #header>
+      {{ msg }}
+    </template>
+  </BaseCard>
+</template>
+
+<script setup lang="ts">
+const props = defineProps<{ msg: string }>()
+const emit = defineEmits<{ save: [] }>()
+</script>
+
+<style lang="postcss" module scoped>
+.card {
+  color: var(--accent-color);
+}
+</style>
+''')
+
+    config = IndexConfig(root=project)
+    indexer = Indexer(db, config)
+    indexer.index(project)
+
+    initial_summary = db.get_file_summary("SignalCleanup.vue")
+    assert initial_summary is not None
+    assert initial_summary["summary"] is not None
+    assert initial_summary["metadata"]["framework"] == "vue"
+
+    file_path.write_text('''\
+<template>
+  <div />
+</template>
+''')
+
+    indexer.index(project)
+
+    cleared_summary = db.get_file_summary("SignalCleanup.vue")
+    assert cleared_summary is not None
+    assert cleared_summary["summary"] is None
+    assert cleared_summary["metadata"] in (None, {})
+    assert all(sym.kind != "component" for sym in db.symbols_in_file("SignalCleanup.vue"))
 
 
 def test_index_vue_ignores_string_and_inline_comment_false_positives(db, vue_project):

@@ -189,6 +189,22 @@ def prepare_embedding_text(symbol: dict) -> str:
                 if isinstance(values, list) and values:
                     metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
 
+        if framework == "vue" and resource == "component":
+            for key, label in (
+                ("props", "props"),
+                ("emits", "emits"),
+                ("slots", "slots"),
+                ("composables_used", "composables"),
+                ("stores_used", "stores"),
+                ("graphql_ops_used", "graphql ops"),
+                ("routes_used", "routes"),
+                ("css_modules", "css modules"),
+                ("scoped_styles", "scoped styles"),
+            ):
+                values = metadata.get(key)
+                if isinstance(values, list) and values:
+                    metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+
         for key, label in (
             ("entity_name", "entity"),
             ("table_name", "table"),

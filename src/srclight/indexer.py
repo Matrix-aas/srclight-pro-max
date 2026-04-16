@@ -40,7 +40,7 @@ IndexEvent = dict[str, object]
 IndexEventCallback = Callable[[IndexEvent], None]
 
 # Bump when extraction/query behavior changes such that unchanged files must be re-indexed.
-INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-jsdoc-cleanup-v3"
+INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-vue-normalized-metadata-v1"
 
 
 # Default ignore patterns
@@ -3509,6 +3509,8 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
     fetch_paths: list[str] = []
     page_meta_keys: list[str] = []
     page_meta_values: list[str] = []
+    props: list[str] = []
+    emits: list[str] = []
 
     for match in script_re.finditer(text):
         attrs = match.group(1)
@@ -3529,6 +3531,8 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
         code_only = re.sub(r"\bgql\s*`.*?`", " ", cleaned, flags=re.DOTALL)
         code_only = re.sub(r"`[^`]*`", " ", code_only, flags=re.DOTALL)
         code_only = re.sub(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", " ", code_only)
+        props.extend(_extract_vue_macro_keys(cleaned, "defineProps"))
+        emits.extend(_extract_vue_macro_keys(cleaned, "defineEmits"))
         macros.extend(
             re.findall(
                 r"\b(defineProps|defineEmits|defineExpose|defineSlots|definePageMeta|defineModel|defineOptions)\s*(?:<[^()]+>)?\s*\(",
@@ -3587,11 +3591,30 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
         "fetch_paths": _unique_sorted(fetch_paths),
         "page_meta_keys": _unique_sorted(page_meta_keys),
         "page_meta_values": _unique_sorted(page_meta_values),
+        "props": _unique_sorted(props),
+        "emits": _unique_sorted(emits),
     }
 
     if any(signals.values()):
         return signals
     return None
+
+
+def _extract_vue_macro_keys(text: str, macro_name: str) -> list[str]:
+    """Extract obvious string/object keys from Vue macro calls."""
+    keys: list[str] = []
+
+    for body in re.findall(rf"\b{re.escape(macro_name)}\s*<\s*\{{(.*?)\}}\s*>\s*\(", text, re.DOTALL):
+        keys.extend(
+            key
+            for key in re.findall(r"\b([A-Za-z_][\w-]*)\s*:", body)
+            if key not in {"type", "readonly"}
+        )
+
+    for body in re.findall(rf"\b{re.escape(macro_name)}\s*\(\s*\[(.*?)\]\s*\)", text, re.DOTALL):
+        keys.extend(value for value in re.findall(r"['\"]([^'\"]+)['\"]", body) if value)
+
+    return _unique_sorted(keys)
 
 
 def _build_vue_component_summary(
@@ -3719,6 +3742,52 @@ def _build_vue_component_summary(
     return " | ".join(signature_parts), " ".join(doc_parts)
 
 
+def _build_vue_component_metadata(
+    template_signals: dict[str, list[str]] | None,
+    style_signals: dict[str, list[str]] | None,
+    script_signals: dict[str, list[str]] | None,
+) -> dict[str, object]:
+    """Build flattened Vue component metadata while preserving signal buckets."""
+    metadata: dict[str, object] = {
+        "framework": "vue",
+        "resource": "component",
+        "template": template_signals or {},
+        "style": style_signals or {},
+        "script": script_signals or {},
+    }
+
+    if template_signals:
+        metadata["slots"] = template_signals["slots"]
+        metadata["css_modules"] = _unique_sorted(
+            template_signals["module_refs"] + template_signals["classes"]
+        )
+    else:
+        metadata["slots"] = []
+        metadata["css_modules"] = []
+
+    if style_signals:
+        metadata["scoped_styles"] = ["scoped"] if "scoped" in style_signals["flags"] else []
+    else:
+        metadata["scoped_styles"] = []
+
+    if script_signals:
+        metadata["props"] = script_signals["props"]
+        metadata["emits"] = script_signals["emits"]
+        metadata["composables_used"] = script_signals["composables"]
+        metadata["stores_used"] = script_signals["stores"]
+        metadata["graphql_ops_used"] = script_signals["graphql_ops"]
+        metadata["routes_used"] = script_signals["navigate_paths"]
+    else:
+        metadata["props"] = []
+        metadata["emits"] = []
+        metadata["composables_used"] = []
+        metadata["stores_used"] = []
+        metadata["graphql_ops_used"] = []
+        metadata["routes_used"] = []
+
+    return metadata
+
+
 class Indexer:
     """Indexes a codebase into a Srclight database."""
 
@@ -3786,11 +3855,7 @@ class Indexer:
             signature, doc = _build_vue_component_summary(
                 component_name, template_signals, style_signals, script_signals,
             )
-            metadata = {
-                "template": template_signals or {},
-                "style": style_signals or {},
-                "script": script_signals or {},
-            }
+            metadata = _build_vue_component_metadata(template_signals, style_signals, script_signals)
             body_h = hashlib.sha256(
                 json.dumps(metadata, sort_keys=True).encode("utf-8")
             ).hexdigest()[:16]
@@ -3811,7 +3876,10 @@ class Indexer:
                 metadata=metadata,
             )
             self.db.insert_symbol(sym, rel_path)
+            self.db.update_file_summary(rel_path, summary=doc, metadata=metadata)
             count += 1
+        else:
+            self.db.update_file_summary(rel_path, summary=None, metadata=None)
 
         candidates = []
         for match in script_re.finditer(text):

@@ -164,6 +164,40 @@ def test_prepare_embedding_text_vue_script_hint_summary():
     assert "dashboard" in text
 
 
+def test_prepare_embedding_text_vue_normalized_metadata():
+    sym = {
+        "name": "NormalizedSignals",
+        "qualified_name": "NormalizedSignals",
+        "signature": "component NormalizedSignals",
+        "metadata": {
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "emits": ["save"],
+            "slots": ["header"],
+            "composables_used": ["useAuthStore", "useRoute"],
+            "stores_used": ["useAuthStore"],
+            "graphql_ops_used": ["mutation SaveCart", "query GetCatalog"],
+            "routes_used": ["/checkout"],
+            "css_modules": ["card"],
+            "scoped_styles": ["scoped"],
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "vue component" in text
+    assert "props: msg" in text
+    assert "emits: save" in text
+    assert "slots: header" in text
+    assert "composables: useAuthStore, useRoute" in text
+    assert "stores: useAuthStore" in text
+    assert "graphql ops: mutation SaveCart, query GetCatalog" in text
+    assert "routes: /checkout" in text
+    assert "css modules: card" in text
+    assert "scoped styles: scoped" in text
+
+
 def test_prepare_embedding_text_mongoose_schema_metadata():
     sym = {
         "name": "UserSchema",
