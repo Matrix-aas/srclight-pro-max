@@ -53,15 +53,23 @@ Srclight builds a local code intelligence layer on top of your repository:
 Instead of doing twenty random `rg` calls and reading half the repo just to find a feature entrypoint, agents can use structured tools like:
 
 - `codebase_map()`
+- `list_files()`
+- `get_file_summary()`
 - `search_symbols()`
 - `hybrid_search()`
 - `get_symbol()`
+- `get_signature()`
 - `get_callers()`
 - `get_callees()`
 - `get_dependents()`
+- `get_community()`
+- `get_communities()`
+- `get_execution_flows()`
 - `detect_changes()`
 - `recent_changes()`
 - `git_hotspots()`
+
+For file navigation, the usual low-token path is `list_files()` to find candidates, `get_file_summary()` to get a fast brief, and `symbols_in_file()` when you want the file outline before opening anything. Graph tools stay summary-first by default; pass `verbose=true` only when you need detailed community membership or step-by-step flow traces. `get_community()` also has file-aware fallback behavior, so a miss can still point you to the nearest symbol or a useful file candidate.
 
 ## Architecture
 
