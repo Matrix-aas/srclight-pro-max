@@ -648,23 +648,23 @@ def _merge_indexed_representative_files(
         return merged
 
     merged["backend"] = _merge_representative_paths(
-        merged.get("backend", []),
         list(indexed_files.get("backend") or []),
+        merged.get("backend", []),
         limit=3,
     )
     merged["data"] = _merge_representative_paths(
-        merged.get("data", []),
         list(indexed_files.get("data") or []),
+        merged.get("data", []),
         limit=3,
     )
     merged["async"] = _merge_representative_paths(
-        merged.get("async", []),
         list(indexed_files.get("async") or []),
+        merged.get("async", []),
         limit=3,
     )
     merged["config"] = _merge_representative_paths(
-        merged.get("config", []),
         list(indexed_files.get("config") or []),
+        merged.get("config", []),
         limit=4,
     )
     return merged
@@ -845,8 +845,8 @@ def _build_topology(
     if any(path.startswith(("server/api", "server/routes")) for path in backend_files + (representative_files.get("server") or [])) and "nitro_file_routes" not in route_systems:
         route_systems.append("nitro_file_routes")
     route_files = _merge_representative_paths(
-        [path for path in representative_files.get("server") or [] if path.startswith(("server/api", "server/routes"))],
         list(indexed_hints.get("route_files") or []),
+        [path for path in representative_files.get("server") or [] if path.startswith(("server/api", "server/routes"))],
         [path for path in backend_files if path.startswith("src/controllers")],
         [path for path in backend_files if path.startswith(("server/api", "server/routes"))],
         limit=3,

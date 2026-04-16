@@ -106,6 +106,14 @@ def _build_project_sidecar(project_dir: Path, vector: list[float]) -> None:
         db.close()
 
 
+def _reset_single_repo_server_state(monkeypatch, repo_root: Path, db: Database | None = None) -> None:
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_repo_root", repo_root)
+    monkeypatch.setattr(server, "_db_path", repo_root / ".srclight" / "index.db")
+    monkeypatch.setattr(server, "_db", db)
+    monkeypatch.setattr(server, "_vector_cache", None)
+
+
 def _store_workspace_communities_and_flows(project_dir: Path) -> None:
     from srclight.community import detect_communities, trace_execution_flows
 
@@ -862,15 +870,15 @@ def test_workspace_db_codebase_map_orients_fullstack_backend_async_project(tmp_p
 
     assert payload["framework_hints"]["app_type"] == "fullstack"
     assert payload["representative_files"]["backend"] == [
-        "server/api/health.get.ts",
         "src/main.ts",
         "src/controllers/users.controller.ts",
+        "server/api/health.get.ts",
     ]
     assert payload["topology"]["backend"] == {
         "files": [
-            "server/api/health.get.ts",
             "src/main.ts",
             "src/controllers/users.controller.ts",
+            "server/api/health.get.ts",
         ],
         "summary": "Primary backend entrypoints, HTTP surfaces, and server modules.",
     }
@@ -1036,18 +1044,18 @@ def test_workspace_db_codebase_map_keeps_fullstack_backend_entrypoints_with_two_
 
     assert payload["framework_hints"]["app_type"] == "fullstack"
     assert payload["representative_files"]["backend"] == [
-        "server/api/health.get.ts",
         "src/main.ts",
         "src/controllers/users.controller.ts",
+        "server/api/health.get.ts",
     ]
     assert payload["topology"]["routes"]["files"] == [
+        "src/controllers/users.controller.ts",
         "server/api/health.get.ts",
         "server/routes/api/[...slug].ts",
-        "src/controllers/users.controller.ts",
     ]
     assert any(item["path"] == "src/main.ts" for item in payload["start_here"])
-    assert payload["start_here"][0]["path"] == "nuxt.config.ts"
-    assert sum(1 for item in payload["start_here"] if item["path"].startswith("server/")) == 1
+    assert payload["start_here"][0]["path"] == "src/modules/app.module.ts"
+    assert sum(1 for item in payload["start_here"] if item["path"].startswith("server/")) == 0
 
 
 def test_workspace_db_codebase_map_distinguishes_route_systems_and_generic_layers(tmp_path, ws_dir):
@@ -1189,15 +1197,15 @@ def test_workspace_db_codebase_map_uses_indexed_metadata_for_unconventional_back
         payload = wdb.codebase_map(project="fullstack")
 
     assert payload["representative_files"]["backend"] == [
-        "server/api/health.get.ts",
         "src/main.ts",
         "src/http/orders.controller.ts",
+        "server/api/health.get.ts",
     ]
     assert payload["topology"]["routes"]["systems"] == ["nest_controllers", "nitro_file_routes"]
     assert payload["topology"]["routes"]["files"] == [
+        "src/http/orders.controller.ts",
         "server/api/health.get.ts",
         "server/routes/api/[...slug].ts",
-        "src/http/orders.controller.ts",
     ]
     assert payload["topology"]["data"]["systems"] == ["mongoose"]
     assert payload["topology"]["data"]["files"] == ["src/persistence/user.model.ts"]
@@ -1208,11 +1216,11 @@ def test_workspace_db_codebase_map_uses_indexed_metadata_for_unconventional_back
     ]
     assert payload["topology"]["runtime"]["files"] == [
         "nuxt.config.ts",
-        "package.json",
         "src/bootstrap/runtime.module.ts",
+        "src/bootstrap/cache.module.ts",
     ]
     assert any(item["path"] == "src/main.ts" for item in payload["start_here"])
-    assert sum(1 for item in payload["start_here"] if item["path"].startswith("server/")) == 1
+    assert any(item["path"] == "src/http/orders.controller.ts" for item in payload["start_here"])
 
 
 def test_workspace_db_codebase_map_uses_indexed_file_summaries_for_orientation(
@@ -1420,6 +1428,236 @@ def test_workspace_db_codebase_map_keeps_generic_unconventional_route_surfaces_d
         "src/runtime/runtime.setup.ts",
     ]
     assert "src/transport/orders.endpoint.ts" in start_paths
+
+
+def test_single_repo_codebase_map_prefers_indexed_backend_hints_over_heuristic_slots(
+    tmp_path, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "single-repo-indexed-priority", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "OrdersEndpoint",
+            "kind": "class",
+            "path": "src/transport/orders.endpoint.ts",
+            "signature": "class OrdersEndpoint",
+            "content": "orders endpoint",
+        },
+    ])
+
+    (project_dir / ".git").mkdir()
+    (project_dir / "server/api").mkdir(parents=True)
+    (project_dir / "src/controllers").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/transport").mkdir(parents=True, exist_ok=True)
+
+    (project_dir / "package.json").write_text(json.dumps({"dependencies": {}}))
+    (project_dir / "server/api/health.get.ts").write_text("export default defineEventHandler(() => 'ok')\n")
+    (project_dir / "src/controllers/legacy.controller.ts").write_text("export class LegacyController {}\n")
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/transport/orders.endpoint.ts").write_text("export class OrdersEndpoint {}\n")
+
+    db = Database(project_dir / ".srclight" / "index.db")
+    db.open()
+    try:
+        db.update_file_summary(
+            "src/main.ts",
+            summary="Application bootstrap entrypoint.",
+            metadata=None,
+        )
+        db.update_file_summary(
+            "src/transport/orders.endpoint.ts",
+            summary="Orders HTTP route handlers and transport entrypoints.",
+            metadata=None,
+        )
+        db.commit()
+
+        monkeypatch.chdir(project_dir)
+        _reset_single_repo_server_state(monkeypatch, project_dir, db)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_read_index_signal", lambda repo_root: None)
+
+        payload = json.loads(server.codebase_map())
+    finally:
+        db.close()
+
+    assert payload["mode"] == "single"
+    assert payload["representative_files"]["backend"] == [
+        "src/main.ts",
+        "src/transport/orders.endpoint.ts",
+        "server/api/health.get.ts",
+    ]
+
+
+def test_single_repo_codebase_map_uses_summary_only_orientation_hints(
+    tmp_path, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "single-repo-summary-oriented", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "OrdersRoutes",
+            "kind": "class",
+            "path": "src/http/orders.routes.ts",
+            "signature": "class OrdersRoutes",
+            "content": "orders route surface",
+        },
+        {
+            "name": "RuntimeConfig",
+            "kind": "class",
+            "path": "src/runtime/runtime.config.ts",
+            "signature": "class RuntimeConfig",
+            "content": "runtime env wiring",
+        },
+        {
+            "name": "EmailWorker",
+            "kind": "class",
+            "path": "src/queue/email.worker.ts",
+            "signature": "class EmailWorker",
+            "content": "async queue handler",
+        },
+    ])
+
+    (project_dir / ".git").mkdir()
+    (project_dir / "src/http").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/runtime").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/queue").mkdir(parents=True, exist_ok=True)
+    (project_dir / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "@nestjs/core": "^11.0.0",
+            "bullmq": "^5.0.0",
+        },
+    }))
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/http/orders.routes.ts").write_text("export class OrdersRoutes {}\n")
+    (project_dir / "src/runtime/runtime.config.ts").write_text("export class RuntimeConfig {}\n")
+    (project_dir / "src/queue/email.worker.ts").write_text("export class EmailWorker {}\n")
+
+    db = Database(project_dir / ".srclight" / "index.db")
+    db.open()
+    try:
+        db.update_file_summary(
+            "src/main.ts",
+            summary="Application bootstrap entrypoint.",
+            metadata={"framework": "nest", "resource": "bootstrap"},
+        )
+        db.update_file_summary(
+            "src/http/orders.routes.ts",
+            summary="Orders HTTP routes and transport handlers.",
+            metadata=None,
+        )
+        db.update_file_summary(
+            "src/runtime/runtime.config.ts",
+            summary="Runtime configuration and module wiring.",
+            metadata=None,
+        )
+        db.update_file_summary(
+            "src/queue/email.worker.ts",
+            summary="Background email worker.",
+            metadata=None,
+        )
+        db.commit()
+
+        monkeypatch.chdir(project_dir)
+        _reset_single_repo_server_state(monkeypatch, project_dir, db)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_read_index_signal", lambda repo_root: None)
+
+        payload = json.loads(server.codebase_map())
+    finally:
+        db.close()
+
+    start_paths = [item["path"] for item in payload["start_here"]]
+
+    assert payload["mode"] == "single"
+    assert "src/http/orders.routes.ts" in payload["representative_files"]["backend"]
+    assert "src/runtime/runtime.config.ts" in payload["representative_files"]["config"]
+    assert "src/queue/email.worker.ts" in payload["representative_files"]["async"]
+    assert "src/http/orders.routes.ts" in start_paths
+    assert payload["topology"]["routes"]["files"] == ["src/http/orders.routes.ts"]
+    assert payload["topology"]["runtime"]["files"] == [
+        "package.json",
+        "src/runtime/runtime.config.ts",
+    ]
+    assert payload["topology"]["async"]["files"] == ["src/queue/email.worker.ts"]
+
+
+def test_single_repo_codebase_map_keeps_generic_route_fallback_from_indexed_hints(
+    tmp_path, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "single-repo-generic-route", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "OrdersEndpoint",
+            "kind": "class",
+            "path": "src/transport/orders.endpoint.ts",
+            "signature": "class OrdersEndpoint",
+            "content": "orders transport handler",
+        },
+        {
+            "name": "RuntimeSetup",
+            "kind": "class",
+            "path": "src/runtime/runtime.setup.ts",
+            "signature": "class RuntimeSetup",
+            "content": "runtime setup",
+        },
+    ])
+
+    (project_dir / ".git").mkdir()
+    (project_dir / "src/transport").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/runtime").mkdir(parents=True, exist_ok=True)
+    (project_dir / "package.json").write_text(json.dumps({"dependencies": {}}))
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/transport/orders.endpoint.ts").write_text("export class OrdersEndpoint {}\n")
+    (project_dir / "src/runtime/runtime.setup.ts").write_text("export class RuntimeSetup {}\n")
+
+    db = Database(project_dir / ".srclight" / "index.db")
+    db.open()
+    try:
+        db.update_file_summary(
+            "src/main.ts",
+            summary="Application bootstrap entrypoint.",
+            metadata=None,
+        )
+        db.update_file_summary(
+            "src/transport/orders.endpoint.ts",
+            summary="Orders HTTP route handlers and transport entrypoints.",
+            metadata=None,
+        )
+        db.update_file_summary(
+            "src/runtime/runtime.setup.ts",
+            summary="Runtime module and environment setup.",
+            metadata=None,
+        )
+        db.commit()
+
+        monkeypatch.chdir(project_dir)
+        _reset_single_repo_server_state(monkeypatch, project_dir, db)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_read_index_signal", lambda repo_root: None)
+
+        payload = json.loads(server.codebase_map())
+    finally:
+        db.close()
+
+    assert payload["mode"] == "single"
+    assert payload["topology"]["routes"]["systems"] == ["generic"]
+    assert payload["topology"]["routes"]["files"] == ["src/transport/orders.endpoint.ts"]
 
 
 def test_workspace_project_scoped_miss_recovery_strings_include_project(
