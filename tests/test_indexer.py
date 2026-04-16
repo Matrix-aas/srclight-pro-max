@@ -193,7 +193,7 @@ def test_indexer_build_change_forces_full_reindex(db, sample_project, monkeypatc
 
 def test_indexer_build_id_marks_wave2_async_extractor_version():
     """Vue metadata changes should produce a distinct build id suffix."""
-    assert INDEXER_BUILD_ID.endswith("vue-normalized-metadata-v4")
+    assert INDEXER_BUILD_ID.endswith("vue-normalized-metadata-v6")
 
 
 def test_index_csharp_doc_comments_do_not_leak_to_methods(db, tmp_path):

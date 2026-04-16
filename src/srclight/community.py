@@ -454,26 +454,59 @@ def compute_impact(
                 is_entry_point = True
 
     # Risk scoring
+    symbol = db.get_symbol_by_id(symbol_id)
+    symbol_kind = str(symbol.kind or "") if symbol is not None else ""
+    symbol_resource = ""
+    if symbol is not None and isinstance(symbol.metadata, dict):
+        symbol_resource = str(symbol.metadata.get("resource") or "")
     n_direct = len(direct_ids)
     n_comm_crossings = len(affected_comms)
     high_leverage_kinds = {"component", "controller", "route_handler", "router"}
     medium_leverage_kinds = {"module", "plugin", "resolver", "service"}
+    entrypoint_anchor_kinds = high_leverage_kinds | medium_leverage_kinds
+    entrypoint_anchor_resources = {"bootstrap", "controller", "route_handler", "router", "module"}
+    non_ownership_direct = [
+        item for item in direct if str(item.get("edge_type") or "") != "ownership"
+    ]
+    non_ownership_transitive = [
+        item for item in transitive if str(item.get("edge_type") or "") != "ownership"
+    ]
     weighted_direct = 0
     direct_kinds: set[str] = set()
+    high_leverage_ownership = False
     for item in direct:
         kind = str(item["symbol"].kind or "")
+        edge_type = str(item.get("edge_type") or "")
         direct_kinds.add(kind)
-        if kind in high_leverage_kinds:
+        if edge_type == "ownership":
+            if kind in high_leverage_kinds:
+                high_leverage_ownership = True
+            if kind in high_leverage_kinds:
+                weighted_direct += 2
+            else:
+                weighted_direct += 1
+        elif kind in high_leverage_kinds:
             weighted_direct += 5
         elif kind in medium_leverage_kinds:
             weighted_direct += 3
         else:
             weighted_direct += 1
 
-    if n_direct > 25 or is_entry_point:
+    anchored_entrypoint = is_entry_point and (
+        bool(non_ownership_direct)
+        or bool(non_ownership_transitive)
+        or symbol_kind in entrypoint_anchor_kinds
+        or symbol_resource in entrypoint_anchor_resources
+    )
+
+    if n_direct > 25 or anchored_entrypoint:
         risk = "CRITICAL"
+    elif high_leverage_ownership and symbol_kind in {"class", "component", "controller", "service"}:
+        risk = "HIGH"
     elif n_direct > 10 or n_comm_crossings >= 2 or weighted_direct >= 5:
         risk = "HIGH"
+    elif is_entry_point and (n_comm_crossings >= 1 or len(affected_flow_labels) > 1):
+        risk = "MEDIUM"
     elif n_direct > 3 or n_comm_crossings >= 1 or weighted_direct >= 3:
         risk = "MEDIUM"
     else:

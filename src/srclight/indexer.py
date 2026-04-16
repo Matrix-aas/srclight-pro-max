@@ -40,7 +40,7 @@ IndexEvent = dict[str, object]
 IndexEventCallback = Callable[[IndexEvent], None]
 
 # Bump when extraction/query behavior changes such that unchanged files must be re-indexed.
-INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-vue-normalized-metadata-v4"
+INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-vue-normalized-metadata-v6"
 
 
 # Default ignore patterns
@@ -3439,9 +3439,37 @@ def _vue_script_is_usable(attrs: str) -> bool:
     return True
 
 
+def _extract_vue_top_level_blocks(text: str, tag_name: str) -> list[str]:
+    """Return bodies for outermost Vue blocks, preserving nested same-name tags."""
+    tag_re = re.compile(rf"<(/?){re.escape(tag_name)}\b[^>]*>", re.IGNORECASE)
+    bodies: list[str] = []
+    depth = 0
+    body_start: int | None = None
+
+    for match in tag_re.finditer(text):
+        tag_text = match.group(0)
+        is_close = bool(match.group(1))
+        is_self_closing = tag_text.rstrip().endswith("/>")
+
+        if not is_close:
+            if depth == 0:
+                body_start = match.end()
+            if not is_self_closing:
+                depth += 1
+            continue
+
+        if depth == 0:
+            continue
+        depth -= 1
+        if depth == 0 and body_start is not None:
+            bodies.append(text[body_start:match.start()])
+            body_start = None
+
+    return bodies
+
+
 def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
     """Extract high-value Vue template signals for search/embeddings."""
-    template_re = re.compile(r"<template\b[^>]*>(.*?)</template>", re.DOTALL | re.IGNORECASE)
     special_tags = {
         "client-only", "component", "keep-alive", "nuxt-layout", "nuxt-link",
         "nuxt-page", "router-link", "slot", "suspense", "teleport",
@@ -3457,9 +3485,10 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
     slots: list[str] = []
     component_refs: list[str] = []
     handler_refs: list[str] = []
+    expression_refs: list[str] = []
 
-    for match in template_re.finditer(text):
-        inner = re.sub(r"<!--.*?-->", " ", match.group(1), flags=re.DOTALL)
+    for body in _extract_vue_top_level_blocks(text, "template"):
+        inner = re.sub(r"<!--.*?-->", " ", body, flags=re.DOTALL)
 
         for tag in re.findall(r"<([A-Za-z][\w.-]*)\b", inner):
             lower = tag.lower()
@@ -3488,11 +3517,17 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
             handler_match = re.match(r"\s*([A-Za-z_$][\w$]*)\s*(?:\(|$)", handler_expr.strip())
             if handler_match:
                 handler_refs.append(handler_match.group(1))
+            expression_refs.extend(_extract_vue_expression_refs(handler_expr))
         bindings.extend(
             name
             for name in re.findall(r"(?:\:|v-bind:)([\w:-]+)", inner)
             if name
         )
+        for _, binding_expr in re.findall(r"(?:\:[\w:.-]+|v-bind:[\w:.-]+)\s*=\s*(['\"])(.*?)\1", inner, re.DOTALL):
+            expression_refs.extend(_extract_vue_expression_refs(binding_expr))
+
+        for interpolation in re.findall(r"\{\{(.*?)\}\}", inner, re.DOTALL):
+            expression_refs.extend(_extract_vue_expression_refs(interpolation))
 
         for _, class_value in re.findall(r"(?<!:)\bclass\s*=\s*(['\"])(.*?)\1", inner, re.DOTALL):
             classes.extend(token for token in re.split(r"\s+", class_value.strip()) if token)
@@ -3516,11 +3551,31 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
         "slots": _unique_sorted(slots),
         "component_refs": _unique_sorted(component_refs),
         "handler_refs": _unique_sorted(handler_refs),
+        "expression_refs": _unique_sorted(expression_refs),
     }
 
     if any(signals.values()):
         return signals
     return None
+
+
+def _extract_vue_expression_refs(expression: str) -> list[str]:
+    """Extract likely local identifier references from a Vue template expression."""
+    masked = _mask_js_strings_and_comments(expression)
+    keywords = {
+        "as", "async", "await", "break", "case", "catch", "class", "const", "continue",
+        "default", "delete", "do", "else", "false", "finally", "for", "function", "if",
+        "import", "in", "instanceof", "let", "new", "null", "of", "return", "switch",
+        "this", "throw", "true", "try", "typeof", "undefined", "var", "void", "while",
+        "with", "yield",
+    }
+    ignored = {"Math", "Number", "Object", "String", "Array", "JSON", "Date", "Promise", "$event", "$style"}
+    refs = {
+        name
+        for name in re.findall(r"(?<![\w$.])([A-Za-z_$][\w$]*)\b", masked)
+        if name not in keywords and name not in ignored
+    }
+    return _unique_sorted(list(refs))
 
 
 def _has_meaningful_vue_template_signals(signals: dict[str, list[str]] | None) -> bool:
@@ -3699,6 +3754,7 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
     emits: list[str] = []
     template_refs: list[str] = []
     constructed_classes: list[str] = []
+    local_refs: list[str] = []
 
     for match in script_re.finditer(text):
         attrs = match.group(1)
@@ -3768,6 +3824,7 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
             )
             if class_name and class_name not in ignored_constructor_names
         )
+        local_refs.extend(_extract_vue_script_local_refs(code_only))
 
         if {"useFetch", "useLazyFetch"} & called_helpers:
             fetch_paths.extend(
@@ -3799,11 +3856,27 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
         "emits": _unique_sorted(emits),
         "template_refs": _unique_sorted(template_refs),
         "constructed_classes": _unique_sorted(constructed_classes),
+        "local_refs": _unique_sorted(local_refs),
     }
 
     if any(signals.values()):
         return signals
     return None
+
+
+def _extract_vue_script_local_refs(code_only: str) -> list[str]:
+    """Return locally declared identifiers that are referenced elsewhere in the script."""
+    masked = _mask_js_strings_and_comments(code_only)
+    declared = {
+        *re.findall(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b", masked),
+        *re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b", masked),
+        *re.findall(r"\bclass\s+([A-Za-z_$][\w$]*)\b", masked),
+    }
+    refs = []
+    for name in declared:
+        if len(re.findall(rf"(?<![\w$]){re.escape(name)}(?![\w$])", masked)) > 1:
+            refs.append(name)
+    return _unique_sorted(refs)
 
 
 def _extract_vue_macro_keys(text: str, macro_name: str) -> list[str]:
@@ -4470,6 +4543,7 @@ def _build_vue_component_metadata(
     metadata["slots"] = template_signals["slots"] if template_signals else []
     metadata["component_refs"] = template_signals["component_refs"] if template_signals else []
     metadata["template_handlers"] = template_signals["handler_refs"] if template_signals else []
+    metadata["template_expression_refs"] = template_signals["expression_refs"] if template_signals else []
 
     css_modules: list[str] = []
     if style_signals and "module" in style_signals["flags"]:
@@ -4492,6 +4566,9 @@ def _build_vue_component_metadata(
         metadata["routes_used"] = script_signals["navigate_paths"]
         metadata["template_refs"] = script_signals["template_refs"]
         metadata["constructed_classes"] = script_signals["constructed_classes"]
+        metadata["local_refs"] = _unique_sorted(
+            list(script_signals["local_refs"]) + list(metadata["template_expression_refs"])
+        )
     else:
         metadata["props"] = []
         metadata["emits"] = []
@@ -4501,6 +4578,7 @@ def _build_vue_component_metadata(
         metadata["routes_used"] = []
         metadata["template_refs"] = []
         metadata["constructed_classes"] = []
+        metadata["local_refs"] = list(metadata["template_expression_refs"])
 
     ref_targets: list[str] = []
     template_ref_names = set(metadata["template_refs"])
@@ -6367,6 +6445,11 @@ class Indexer:
                 for name in template_ref_targets:
                     for target in _resolve_targets(name, source=symbol, preferred_kinds={"component"}):
                         _add_edge(symbol, target, "component_template_ref")
+
+                local_ref_names = _metadata_names(metadata, ("local_refs", "template_expression_refs"))
+                for name in local_ref_names:
+                    for target in _resolve_targets(name, source=symbol, preferred_kinds={"function", "method"}):
+                        _add_edge(symbol, target, "component_local_ref")
 
         return len(created_edges)
 

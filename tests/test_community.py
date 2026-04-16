@@ -324,6 +324,98 @@ def test_compute_impact_higher_risk_for_bridge(db):
     assert len(result["affected_flows"]) >= 1
 
 
+def test_compute_impact_does_not_mark_generic_flow_entrypoint_critical_without_dependents(db):
+    from srclight.community import compute_impact
+
+    file_id = db.upsert_file(FileRecord(
+        path="app/components/ProfilePage.vue",
+        content_hash="profile",
+        mtime=1.0,
+        language="vue",
+        size=100,
+        line_count=20,
+    ))
+    fetch_me = db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="function",
+        name="fetchMe",
+        qualified_name="ProfilePage.fetchMe",
+        start_line=1,
+        end_line=5,
+        content="function fetchMe() {}",
+        line_count=5,
+    ), "app/components/ProfilePage.vue")
+    db.commit()
+
+    result = compute_impact(
+        db,
+        fetch_me,
+        {},
+        [{
+            "label": "fetchMe -> fetchMe",
+            "entry_symbol_id": fetch_me,
+            "steps": [{"symbol_id": fetch_me}],
+        }],
+    )
+
+    assert result["direct_dependents"] == 0
+    assert result["risk"] != "CRITICAL"
+
+
+def test_compute_impact_does_not_escalate_component_owned_helper_to_critical(db):
+    from srclight.community import compute_impact
+
+    file_id = db.upsert_file(FileRecord(
+        path="app/components/ProfilePage.vue",
+        content_hash="profile",
+        mtime=1.0,
+        language="vue",
+        size=100,
+        line_count=20,
+    ))
+    component_id = db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="component",
+        name="ProfilePage",
+        qualified_name="ProfilePage",
+        start_line=1,
+        end_line=20,
+        content="",
+        line_count=20,
+    ), "app/components/ProfilePage.vue")
+    fetch_me = db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="function",
+        name="fetchMe",
+        qualified_name="ProfilePage.fetchMe",
+        start_line=5,
+        end_line=9,
+        content="function fetchMe() {}",
+        line_count=5,
+    ), "app/components/ProfilePage.vue")
+    db.insert_edge(EdgeRecord(
+        source_id=component_id,
+        target_id=fetch_me,
+        edge_type="ownership",
+        confidence=0.98,
+    ))
+    db.commit()
+
+    result = compute_impact(
+        db,
+        fetch_me,
+        {},
+        [{
+            "label": "fetchMe -> getItem",
+            "entry_symbol_id": fetch_me,
+            "steps": [{"symbol_id": fetch_me}, {"symbol_id": component_id}],
+        }],
+    )
+
+    assert result["direct_dependents"] == 1
+    assert result["risk"] != "CRITICAL"
+
+
 def test_schema_v5_migration(tmp_path):
     """DB should expose community/flow tables on the current schema version."""
     db_path = tmp_path / "migrate.db"

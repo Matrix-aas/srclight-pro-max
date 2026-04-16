@@ -586,6 +586,21 @@ def test_search_symbols_preserves_source_while_adding_rank_hints(monkeypatch, db
     assert payload[0]["match_reasons"]
 
 
+def test_search_symbols_empty_result_does_not_echo_same_query_as_search_suggestion(monkeypatch, db):
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    query = "non existent symbol with spaces"
+    payload = json.loads(server.search_symbols(query))
+
+    assert payload["result_count"] == 0
+    assert "hybrid_search" in payload["hint"]
+    assert all(
+        f'search_symbols("{query}")' not in suggestion
+        for suggestion in payload.get("suggestions", [])
+    )
+
+
 def test_get_communities_summary_first_by_default(monkeypatch, db):
     _store_server_flow_graph(db)
 
@@ -1283,6 +1298,85 @@ function showDisclaimerModal() {
     assert "showDisclaimerModal" not in dead_names
 
 
+def test_vue_script_setup_local_refs_are_not_marked_dead(db, tmp_path):
+    project = tmp_path / "vue-script-refs"
+    project.mkdir()
+    (project / "ProfilePage.vue").write_text("""\
+<template>
+  <section :class="codingNameStyleDependsSelected()">
+    <button @click="emitLoadPage">Load</button>
+    <span>{{ isAuthor() }}</span>
+  </section>
+</template>
+
+<script setup lang="ts">
+import { onMounted } from 'vue'
+
+function fetchMe() {
+  return true
+}
+
+const emitLoadPage = () => true
+
+function codingNameStyleDependsSelected() {
+  return 'selected'
+}
+
+function isAuthor() {
+  return true
+}
+
+usePagination({ loadPage: emitLoadPage, isAuthor })
+onMounted(fetchMe)
+</script>
+""")
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    dead_names = {symbol.name for symbol in db.get_dead_symbols(kind="function")}
+    assert "fetchMe" not in dead_names
+    assert "emitLoadPage" not in dead_names
+    assert "codingNameStyleDependsSelected" not in dead_names
+    assert "isAuthor" not in dead_names
+
+
+def test_vue_nested_template_handlers_are_not_marked_dead(db, tmp_path):
+    project = tmp_path / "vue-nested-template-refs"
+    project.mkdir()
+    (project / "CommentsPage.vue").write_text("""\
+<template>
+  <wrapper-card>
+    <template #header>
+      <span>{{ title }}</span>
+    </template>
+
+    <comment-editor @keydown="onCommentInputKeydown" />
+    <comments-modal
+      @deleted="onCommentDeleted"
+      @posted="onCommentPosted"
+    />
+  </wrapper-card>
+</template>
+
+<script setup lang="ts">
+const title = 'Comments'
+
+const onCommentInputKeydown = () => true
+const onCommentPosted = () => true
+const onCommentDeleted = () => true
+</script>
+""")
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    dead_names = {symbol.name for symbol in db.get_dead_symbols(kind="function")}
+    assert "onCommentInputKeydown" not in dead_names
+    assert "onCommentPosted" not in dead_names
+    assert "onCommentDeleted" not in dead_names
+
+
 def test_semantic_search_filters_low_similarity_results(monkeypatch):
     class FakeDB:
         def embedding_stats(self):
@@ -1572,7 +1666,7 @@ class TestEdges:
         assert callee_types["Payload"] == "uses_type"
 
     def test_server_dedup_keeps_same_symbol_with_multiple_edge_types(self):
-        """Server dedup should not collapse different edge types for one symbol name."""
+        """Server dedup should collapse one symbol into one entry with aggregated edge types."""
         symbol = SymbolRecord(
             file_id=1,
             kind="interface",
@@ -1589,7 +1683,133 @@ class TestEdges:
         ]
 
         deduped = server._dedup_edges(edges)
-        assert {edge["edge_type"] for edge in deduped} == {"calls", "uses_type"}
+        assert len(deduped) == 1
+        assert deduped[0]["edge_type"] == "uses_type"
+        assert deduped[0]["edge_types"] == ["calls", "uses_type"]
+
+
+def test_get_callees_keeps_same_name_targets_separate_and_aggregates_edge_types(monkeypatch, db):
+    caller_file = db.upsert_file(FileRecord(
+        path="apps/backend/src/services/coding.service.ts",
+        content_hash="caller",
+        mtime=1.0,
+        language="typescript",
+        size=200,
+        line_count=20,
+    ))
+    file_a = db.upsert_file(FileRecord(
+        path="apps/backend/src/services/block.service.ts",
+        content_hash="a",
+        mtime=1.0,
+        language="typescript",
+        size=200,
+        line_count=20,
+    ))
+    file_b = db.upsert_file(FileRecord(
+        path="apps/backend/src/services/coding.service.ts",
+        content_hash="b",
+        mtime=1.0,
+        language="typescript",
+        size=200,
+        line_count=20,
+    ))
+
+    caller = db.insert_symbol(SymbolRecord(
+        file_id=caller_file,
+        kind="method",
+        name="loadCoding",
+        qualified_name="CodingService.loadCoding",
+        start_line=1,
+        end_line=8,
+        content="loadCoding",
+        line_count=8,
+    ), "apps/backend/src/services/coding.service.ts")
+    find_one_a = db.insert_symbol(SymbolRecord(
+        file_id=file_a,
+        kind="method",
+        name="findOne",
+        qualified_name="BlockService.findOne",
+        start_line=11,
+        end_line=18,
+        content="findOne",
+        line_count=8,
+    ), "apps/backend/src/services/block.service.ts")
+    find_one_b = db.insert_symbol(SymbolRecord(
+        file_id=file_b,
+        kind="method",
+        name="findOne",
+        qualified_name="CodingService.findOne",
+        start_line=16,
+        end_line=24,
+        content="findOne",
+        line_count=9,
+    ), "apps/backend/src/services/coding.service.ts")
+    coding_document = db.insert_symbol(SymbolRecord(
+        file_id=file_b,
+        kind="interface",
+        name="CodingDocument",
+        qualified_name="CodingDocument",
+        start_line=30,
+        end_line=34,
+        content="interface CodingDocument {}",
+        line_count=5,
+    ), "apps/backend/src/services/coding.service.ts")
+
+    db.insert_edge(EdgeRecord(source_id=caller, target_id=find_one_a, edge_type="calls", confidence=0.8))
+    db.insert_edge(EdgeRecord(source_id=caller, target_id=find_one_b, edge_type="calls", confidence=0.9))
+    db.insert_edge(EdgeRecord(source_id=caller, target_id=coding_document, edge_type="ownership", confidence=0.98))
+    db.insert_edge(EdgeRecord(source_id=caller, target_id=coding_document, edge_type="uses_type", confidence=0.9))
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_callees("loadCoding"))
+
+    find_ones = [item for item in payload["callees"] if item["name"] == "findOne"]
+    coding_docs = [item for item in payload["callees"] if item["name"] == "CodingDocument"]
+
+    assert len(find_ones) == 2
+    assert {item["qualified_name"] for item in find_ones} == {
+        "BlockService.findOne",
+        "CodingService.findOne",
+    }
+    assert len(coding_docs) == 1
+    assert coding_docs[0]["edge_types"] == ["ownership", "uses_type"]
+
+
+def test_get_symbol_compacts_high_frequency_names(monkeypatch, db):
+    file_id = db.upsert_file(FileRecord(
+        path="apps/backend/src/services/example.ts",
+        content_hash="constructors",
+        mtime=1.0,
+        language="typescript",
+        size=200,
+        line_count=200,
+    ))
+    for index in range(10):
+        db.insert_symbol(SymbolRecord(
+            file_id=file_id,
+            kind="method",
+            name="constructor",
+            qualified_name=f"Service{index}.constructor",
+            signature=f"constructor(private readonly dep{index}: Dep{index})",
+            start_line=index * 10 + 1,
+            end_line=index * 10 + 3,
+            content=f"constructor(private readonly dep{index}: Dep{index}) {{}}",
+            line_count=3,
+        ), "apps/backend/src/services/example.ts")
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_symbol("constructor"))
+
+    assert payload["match_count"] == 10
+    assert payload["compact"] is True
+    assert "hint" in payload
+    assert all("content" not in item for item in payload["symbols"])
 
 
 # --- 3. C++ template name extraction ---

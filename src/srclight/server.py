@@ -1872,7 +1872,7 @@ def search_symbols(
             "hint": f"No keyword matches. Try {_tool_call('hybrid_search', query, project=project)} for semantic matching.",
         }
         tokenized = tokenized_query_hint(query)
-        if tokenized:
+        if tokenized and tokenized.strip().lower() != query.strip().lower():
             payload["suggestions"] = [
                 f"Try {_tool_call('search_symbols', tokenized, project=project)} for tokenized identifier search",
                 f"Try {_tool_call('hybrid_search', tokenized, project=project)} for concept + keyword search",
@@ -1885,6 +1885,10 @@ def search_symbols(
             suggestions = _symbol_name_suggestions(query, project=project)
             if suggestions:
                 payload["did_you_mean"] = suggestions
+            payload["suggestions"] = [
+                f"Try {_tool_call('hybrid_search', query, project=project)} for concept + keyword search",
+                f"Try {_tool_call('semantic_search', query, project=project)} for embedding-first search",
+            ]
         return json.dumps(payload, indent=2)
 
     return json.dumps([_shape_search_result(result) for result in results], indent=2)
@@ -1904,12 +1908,32 @@ def get_symbol(name: str, project: str | None = None) -> str:
         name: Symbol name (e.g., 'Dictionary', 'lookup', 'main')
         project: Optional project filter (workspace mode only)
     """
+    compact_threshold = 8
     _record_query()
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         results = wdb.get_symbol(name, project=project)
         if not results:
             return _symbol_not_found_error(name, project)
+        if len(results) > compact_threshold:
+            return json.dumps({
+                "match_count": len(results),
+                "compact": True,
+                "hint": "Too many exact matches. Use get_signature(), symbols_in_file(), or search by qualified name/file.",
+                "symbols": [
+                    {
+                        "project": r.get("project"),
+                        "name": r.get("name"),
+                        "qualified_name": r.get("qualified_name"),
+                        "kind": r.get("kind"),
+                        "signature": r.get("signature"),
+                        "file": r.get("file"),
+                        "start_line": r.get("start_line"),
+                        "doc_comment": r.get("doc_comment"),
+                    }
+                    for r in results
+                ],
+            }, indent=2)
         if len(results) == 1:
             return json.dumps(results[0], indent=2)
         return json.dumps({"match_count": len(results), "symbols": results}, indent=2)
@@ -1918,6 +1942,17 @@ def get_symbol(name: str, project: str | None = None) -> str:
     symbols = db.get_symbols_by_name(name)
     if not symbols:
         return _symbol_not_found_error(name)
+
+    if len(symbols) > compact_threshold:
+        return json.dumps({
+            "match_count": len(symbols),
+            "compact": True,
+            "hint": "Too many exact matches. Use get_signature(), symbols_in_file(), or search by qualified name/file.",
+            "symbols": [
+                _symbol_to_dict(sym)
+                for sym in symbols
+            ],
+        }, indent=2)
 
     if len(symbols) == 1:
         sym = symbols[0]
@@ -2218,36 +2253,44 @@ def api_surface(
 
 
 def _dedup_edges(edges: list[dict]) -> list[dict]:
-    """Deduplicate edges by symbol name and edge type."""
-    by_key: dict[tuple[str, str], dict] = {}
+    """Deduplicate edges by symbol identity while aggregating edge types."""
+    by_key: dict[tuple[object, str, str, int | None, str], dict] = {}
     for c in edges:
         s = c["symbol"]
         name = s.name
+        qualified_name = s.qualified_name
         edge_type = c["edge_type"]
         confidence = c["confidence"]
+        key = (
+            getattr(s, "id", None),
+            qualified_name or "",
+            s.file_path or "",
+            s.start_line,
+            s.kind or "",
+        )
         entry = {
             "name": name,
+            "qualified_name": qualified_name,
             "kind": s.kind,
             "file": s.file_path,
             "line": s.start_line,
             "edge_type": edge_type,
             "confidence": confidence,
         }
-        key = (name, edge_type)
         if key not in by_key:
             by_key[key] = entry
-            by_key[key]["_locations"] = [(s.file_path, s.start_line)]
+            by_key[key]["_edge_types"] = {edge_type}
         else:
-            by_key[key]["_locations"].append((s.file_path, s.start_line))
             if confidence > by_key[key]["confidence"]:
                 by_key[key].update(entry)
-                by_key[key]["_locations"] = by_key[key]["_locations"]
+            by_key[key]["_edge_types"].add(edge_type)
 
     result = []
     for entry in by_key.values():
-        locations = entry.pop("_locations")
-        if len(locations) > 1:
-            entry["locations"] = [{"file": file_path, "line": line} for file_path, line in locations]
+        edge_types = sorted(entry.pop("_edge_types"))
+        entry["edge_types"] = edge_types
+        if entry["edge_type"] not in edge_types:
+            entry["edge_type"] = edge_types[0]
         result.append(entry)
 
     result.sort(key=lambda r: (
