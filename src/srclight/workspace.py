@@ -411,12 +411,15 @@ class WorkspaceDB:
         results: list[dict[str, Any]] = []
 
         for entry in self._iter_entries(project_filter=project):
+            remaining = limit - len(results)
+            if remaining <= 0:
+                break
             try:
                 with self._open_project_db(entry) as db:
                     project_files = db.list_files(
                         path_prefix=path_prefix,
                         recursive=recursive,
-                        limit=limit,
+                        limit=remaining,
                     )
                     for item in project_files:
                         results.append({"project": entry.name, **item})

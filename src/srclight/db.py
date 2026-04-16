@@ -243,6 +243,14 @@ def _normalized_token_phrase(text: str) -> str:
     """Normalize arbitrary text into a comparable token phrase."""
     return " ".join(re.findall(r"[A-Za-z0-9]+", (text or "").lower())).strip()
 
+
+def _escape_like_literal(value: str) -> str:
+    """Escape SQL LIKE metacharacters so path prefixes are treated literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+_UNSET = object()
+
 SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
@@ -646,43 +654,55 @@ class Database:
             FROM files
         """
         if normalized_prefix:
-            query += " WHERE path LIKE ? COLLATE NOCASE"
-            params.append(f"{normalized_prefix}/%")
-        query += " ORDER BY path"
+            escaped_prefix = _escape_like_literal(normalized_prefix)
+            query += " WHERE path LIKE ? ESCAPE '\\' COLLATE NOCASE"
+            params.append(f"{escaped_prefix}/%")
+            if not recursive:
+                query += " AND path NOT LIKE ? ESCAPE '\\' COLLATE NOCASE"
+                params.append(f"{escaped_prefix}/%/%")
+        elif not recursive:
+            query += " WHERE path NOT LIKE '%/%'"
+
+        query += " ORDER BY path LIMIT ?"
+        params.append(limit)
 
         rows = self.conn.execute(query, params).fetchall()
         files: list[dict[str, Any]] = []
-        prefix_with_sep = f"{normalized_prefix}/" if normalized_prefix else ""
         for row in rows:
-            path = row["path"]
-            if normalized_prefix and not recursive:
-                suffix = path[len(prefix_with_sep):]
-                if "/" in suffix:
-                    continue
             files.append({
-                "path": path,
+                "path": row["path"],
                 "language": row["language"],
                 "size": row["size"],
                 "line_count": row["line_count"],
                 "summary": row["summary"],
             })
-            if len(files) >= limit:
-                break
         return files
 
     def update_file_summary(
         self,
         path: str,
         *,
-        summary: str | None = None,
-        metadata: dict | None = None,
+        summary: str | None | object = _UNSET,
+        metadata: dict | None | object = _UNSET,
     ) -> None:
         """Persist lightweight summary fields for an indexed file."""
         assert self.conn is not None
-        metadata_json = json.dumps(metadata) if metadata is not None else None
+        updates: list[str] = []
+        params: list[Any] = []
+
+        if summary is not _UNSET:
+            updates.append("summary = ?")
+            params.append(summary)
+        if metadata is not _UNSET:
+            updates.append("metadata = ?")
+            params.append(json.dumps(metadata) if metadata is not None else None)
+        if not updates:
+            return
+
+        params.append(path)
         self.conn.execute(
-            "UPDATE files SET summary = ?, metadata = ? WHERE path = ?",
-            (summary, metadata_json, path),
+            f"UPDATE files SET {', '.join(updates)} WHERE path = ?",
+            params,
         )
 
     def get_file_summary(self, path: str) -> dict[str, Any] | None:

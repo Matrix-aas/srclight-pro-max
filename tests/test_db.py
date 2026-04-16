@@ -139,6 +139,48 @@ def test_list_files_filters_by_prefix_and_recursion(db):
     assert [item["path"] for item in level] == ["shared/src/domain/level/nested.ts"]
 
 
+def test_list_files_treats_like_metacharacters_in_prefix_as_literals(db):
+    """Underscore and percent in path_prefix are matched literally."""
+    for path in [
+        "shared/src/domain_100%/exact.ts",
+        "shared/src/domainA100x/wrong.ts",
+        "shared/src/domain_100x/also-wrong.ts",
+    ]:
+        db.upsert_file(FileRecord(
+            path=path,
+            content_hash=path,
+            mtime=1000.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        ))
+    db.commit()
+
+    results = db.list_files(path_prefix="shared/src/domain_100%", recursive=True)
+    assert [item["path"] for item in results] == ["shared/src/domain_100%/exact.ts"]
+
+
+def test_list_files_non_recursive_excludes_nested_descendants_in_sql(db):
+    """Non-recursive listing returns only immediate children under the prefix."""
+    for path in [
+        "shared/src/domain/direct.ts",
+        "shared/src/domain/level/nested.ts",
+        "shared/src/domain/level/deeper/more.ts",
+    ]:
+        db.upsert_file(FileRecord(
+            path=path,
+            content_hash=path,
+            mtime=1000.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        ))
+    db.commit()
+
+    shallow = db.list_files(path_prefix="shared/src/domain", recursive=False, limit=10)
+    assert [item["path"] for item in shallow] == ["shared/src/domain/direct.ts"]
+
+
 def test_update_and_get_file_summary(db):
     """File summaries persist lightweight metadata and expose file TOC data."""
     file_id = db.upsert_file(FileRecord(
@@ -180,6 +222,41 @@ def test_update_and_get_file_summary(db):
     assert summary["summary"] == "Renders the account profile card shell."
     assert summary["metadata"] == {"framework": "vue", "tags": ["ui", "profile"]}
     assert summary["top_level_symbols"][0]["name"] == "ProfileCard"
+
+
+def test_update_file_summary_preserves_untouched_field_on_partial_update(db):
+    """Partial file-summary updates do not null the omitted field."""
+    path = "client/src/components/ProfileCard.vue"
+    db.upsert_file(FileRecord(
+        path=path,
+        content_hash="profile-card",
+        mtime=1000.0,
+        language="vue",
+        size=240,
+        line_count=20,
+    ))
+    db.update_file_summary(
+        path,
+        summary="Original summary.",
+        metadata={"framework": "vue", "tags": ["profile"]},
+    )
+    db.commit()
+
+    db.update_file_summary(path, summary="Updated summary only.")
+    db.commit()
+
+    updated = db.get_file(path)
+    assert updated is not None
+    assert updated.summary == "Updated summary only."
+    assert updated.metadata == {"framework": "vue", "tags": ["profile"]}
+
+    db.update_file_summary(path, metadata={"framework": "vue", "tags": ["card"]})
+    db.commit()
+
+    updated_again = db.get_file(path)
+    assert updated_again is not None
+    assert updated_again.summary == "Updated summary only."
+    assert updated_again.metadata == {"framework": "vue", "tags": ["card"]}
 
 
 def test_upsert_file_preserves_existing_summary_metadata_when_incoming_values_are_none(db):

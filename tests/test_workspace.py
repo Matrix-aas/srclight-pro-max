@@ -760,6 +760,52 @@ def test_workspace_server_file_tools_keep_project_scope(tmp_path, ws_dir, monkey
         assert summary["top_level_symbols"][0]["name"] == "ProfileCard"
 
 
+def test_workspace_list_files_respects_global_limit_across_projects(tmp_path, ws_dir):
+    alpha = _create_indexed_project(tmp_path, "alpha", [
+        {
+            "name": "AlphaOne",
+            "kind": "class",
+            "path": "shared/src/domain/alpha-one.ts",
+            "signature": "class AlphaOne",
+            "content": "export class AlphaOne {}",
+        },
+        {
+            "name": "AlphaTwo",
+            "kind": "class",
+            "path": "shared/src/domain/alpha-two.ts",
+            "signature": "class AlphaTwo",
+            "content": "export class AlphaTwo {}",
+        },
+    ])
+    beta = _create_indexed_project(tmp_path, "beta", [
+        {
+            "name": "BetaOne",
+            "kind": "class",
+            "path": "shared/src/domain/beta-one.ts",
+            "signature": "class BetaOne",
+            "content": "export class BetaOne {}",
+        },
+    ])
+
+    config = WorkspaceConfig(name="workspace-file-limit")
+    config.add_project("alpha", str(alpha))
+    config.add_project("beta", str(beta))
+
+    with WorkspaceDB(config) as wdb:
+        files = wdb.list_files(
+            path_prefix="shared/src/domain",
+            recursive=True,
+            limit=2,
+        )
+
+    assert len(files) == 2
+    assert [item["project"] for item in files] == ["alpha", "alpha"]
+    assert [item["path"] for item in files] == [
+        "shared/src/domain/alpha-one.ts",
+        "shared/src/domain/alpha-two.ts",
+    ]
+
+
 def test_workspace_db_codebase_map_orients_fullstack_backend_async_project(tmp_path, ws_dir):
     project_dir = _create_indexed_project(tmp_path, "fullstack", [
         {
