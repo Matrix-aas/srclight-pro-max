@@ -885,8 +885,8 @@ def _build_topology(
         }
 
     runtime_files = _merge_representative_paths(
-        [path for path in representative_files.get("config", []) if path in {"nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs", "package.json", "nest-cli.json"}],
         list(indexed_hints.get("runtime_files") or []),
+        [path for path in representative_files.get("config", []) if path in {"nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs", "package.json", "nest-cli.json"}],
         _collect_repo_files(root, ("src/config", "config"), limit=2, allowed_suffixes=(".ts", ".js", ".json", ".yaml", ".yml")),
         limit=3,
     )

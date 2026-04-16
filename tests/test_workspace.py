@@ -1215,9 +1215,9 @@ def test_workspace_db_codebase_map_uses_indexed_metadata_for_unconventional_back
         "src/bootstrap/cache.module.ts",
     ]
     assert payload["topology"]["runtime"]["files"] == [
-        "nuxt.config.ts",
         "src/bootstrap/runtime.module.ts",
         "src/bootstrap/cache.module.ts",
+        "src/main.ts",
     ]
     assert any(item["path"] == "src/main.ts" for item in payload["start_here"])
     assert any(item["path"] == "src/http/orders.controller.ts" for item in payload["start_here"])
@@ -1313,8 +1313,8 @@ def test_workspace_db_codebase_map_uses_indexed_file_summaries_for_orientation(
     assert "src/http/orders.routes.ts" in start_paths
     assert payload["topology"]["routes"]["files"] == ["src/http/orders.routes.ts"]
     assert payload["topology"]["runtime"]["files"] == [
-        "package.json",
         "src/runtime/runtime.config.ts",
+        "package.json",
     ]
     assert payload["topology"]["async"]["files"] == ["src/queue/email.worker.ts"]
 
@@ -1424,8 +1424,8 @@ def test_workspace_db_codebase_map_keeps_generic_unconventional_route_surfaces_d
     assert payload["topology"]["data"]["files"] == ["src/persistence/user.store.ts"]
     assert payload["topology"]["async"]["files"] == ["src/messaging/orders.listener.ts"]
     assert payload["topology"]["runtime"]["files"] == [
-        "package.json",
         "src/runtime/runtime.setup.ts",
+        "package.json",
     ]
     assert "src/transport/orders.endpoint.ts" in start_paths
 
@@ -1585,8 +1585,8 @@ def test_single_repo_codebase_map_uses_summary_only_orientation_hints(
     assert "src/http/orders.routes.ts" in start_paths
     assert payload["topology"]["routes"]["files"] == ["src/http/orders.routes.ts"]
     assert payload["topology"]["runtime"]["files"] == [
-        "package.json",
         "src/runtime/runtime.config.ts",
+        "package.json",
     ]
     assert payload["topology"]["async"]["files"] == ["src/queue/email.worker.ts"]
 
@@ -1658,6 +1658,105 @@ def test_single_repo_codebase_map_keeps_generic_route_fallback_from_indexed_hint
     assert payload["mode"] == "single"
     assert payload["topology"]["routes"]["systems"] == ["generic"]
     assert payload["topology"]["routes"]["files"] == ["src/transport/orders.endpoint.ts"]
+
+
+def test_workspace_db_codebase_map_prefers_indexed_runtime_hints_over_filled_heuristic_slots(
+    tmp_path, ws_dir
+):
+    project_dir = _create_indexed_project(tmp_path, "runtime-priority", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "RuntimeModule",
+            "kind": "class",
+            "path": "src/bootstrap/runtime.module.ts",
+            "signature": "class RuntimeModule",
+            "content": "runtime module env wiring",
+            "metadata": {"framework": "nest", "resource": "module"},
+        },
+    ])
+
+    (project_dir / "src/bootstrap").mkdir(parents=True, exist_ok=True)
+    (project_dir / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "@nestjs/core": "^11.0.0",
+            "nuxt": "^4.0.0",
+        },
+    }))
+    (project_dir / "nuxt.config.ts").write_text("export default defineNuxtConfig({})\n")
+    (project_dir / "nest-cli.json").write_text("{}\n")
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/bootstrap/runtime.module.ts").write_text("export class RuntimeModule {}\n")
+
+    config = WorkspaceConfig(name="runtime-priority-workspace")
+    config.add_project("runtime-priority", str(project_dir))
+
+    with WorkspaceDB(config) as wdb:
+        payload = wdb.codebase_map(project="runtime-priority")
+
+    assert payload["topology"]["runtime"]["files"] == [
+        "src/bootstrap/runtime.module.ts",
+        "nuxt.config.ts",
+        "nest-cli.json",
+    ]
+
+
+def test_single_repo_codebase_map_prefers_indexed_runtime_hints_over_filled_heuristic_slots(
+    tmp_path, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "single-runtime-priority", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "RuntimeModule",
+            "kind": "class",
+            "path": "src/bootstrap/runtime.module.ts",
+            "signature": "class RuntimeModule",
+            "content": "runtime module env wiring",
+            "metadata": {"framework": "nest", "resource": "module"},
+        },
+    ])
+
+    (project_dir / ".git").mkdir()
+    (project_dir / "src/bootstrap").mkdir(parents=True, exist_ok=True)
+    (project_dir / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "@nestjs/core": "^11.0.0",
+            "nuxt": "^4.0.0",
+        },
+    }))
+    (project_dir / "nuxt.config.ts").write_text("export default defineNuxtConfig({})\n")
+    (project_dir / "nest-cli.json").write_text("{}\n")
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/bootstrap/runtime.module.ts").write_text("export class RuntimeModule {}\n")
+
+    db = Database(project_dir / ".srclight" / "index.db")
+    db.open()
+    try:
+        monkeypatch.chdir(project_dir)
+        _reset_single_repo_server_state(monkeypatch, project_dir, db)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_read_index_signal", lambda repo_root: None)
+
+        payload = json.loads(server.codebase_map())
+    finally:
+        db.close()
+
+    assert payload["topology"]["runtime"]["files"] == [
+        "src/bootstrap/runtime.module.ts",
+        "nuxt.config.ts",
+        "nest-cli.json",
+    ]
 
 
 def test_workspace_project_scoped_miss_recovery_strings_include_project(
