@@ -206,6 +206,7 @@ def _score_symbol_candidate(sym: SymbolRecord, candidate: str) -> int:
     qualified = (sym.qualified_name or "").lower()
     candidate_lower = candidate.lower()
     last_segment = candidate_lower.split(".")[-1]
+    file_path = (sym.file_path or "").lower()
     score = 0
     if qualified == candidate_lower:
         score += 120
@@ -217,6 +218,8 @@ def _score_symbol_candidate(sym: SymbolRecord, candidate: str) -> int:
         score += 20
     if sym.kind in {"method", "function", "route_handler", "service", "controller"}:
         score += 10
+    if file_path.endswith((".md", ".mdx", ".rst", ".txt")) or "/docs/" in file_path:
+        score -= 25
     return score
 
 
@@ -240,13 +243,18 @@ def _seed_symbols(
             if existing is None or score > existing[0]:
                 scored[sym.id] = (score, sym, f"matched identifier '{candidate}'")
 
-    if not scored:
-        for score, sym, reason in _hybrid_seed_candidates(db, task, seed_limit):
-            if sym.id is None:
-                continue
-            existing = scored.get(sym.id)
-            if existing is None or score > existing[0]:
-                scored[sym.id] = (score, sym, reason)
+    for index, (score, sym, reason) in enumerate(_hybrid_seed_candidates(db, task, seed_limit)):
+        if sym.id is None:
+            continue
+        hybrid_score = score
+        if scored:
+            # Exact identifier hits should still dominate, but hybrid seeds should
+            # enrich the packet with adjacent feature surfaces instead of being
+            # dropped entirely when a single literal match exists.
+            hybrid_score = max(score - seed_limit * 5 - index, 1)
+        existing = scored.get(sym.id)
+        if existing is None or hybrid_score > existing[0]:
+            scored[sym.id] = (hybrid_score, sym, reason)
 
     ranked = sorted(
         scored.values(),
@@ -473,10 +481,20 @@ def build_task_context(
 
     why_these_results = []
     if seeds:
-        why_these_results.append(
-            "Primary symbols were chosen from exact identifier matches "
-            "found in the task text."
-        )
+        if any(
+            "hybrid search" in str(seed.get("reason") or "")
+            or "semantic search" in str(seed.get("reason") or "")
+            for seed in seeds
+        ):
+            why_these_results.append(
+                "Primary symbols blend literal identifier hits with hybrid retrieval "
+                "so natural-language tasks still surface the right feature area."
+            )
+        else:
+            why_these_results.append(
+                "Primary symbols were chosen from exact identifier matches "
+                "found in the task text."
+            )
     if call_chain:
         why_these_results.append(
             "Call-chain entries show nearby callers/callees that frame "

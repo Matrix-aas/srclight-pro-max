@@ -2605,17 +2605,16 @@ class Database:
                 layer=layer,
                 verbose=verbose,
             )
-            label, keywords = recomputed.get(
-                community["id"],
-                (community["label"], community["keywords"]),
-            )
+            summary = recomputed.get(community["id"], {})
             results.append(
                 {
                     "id": community["id"],
-                    "label": label,
+                    "label": summary.get("label", community["label"]),
                     "member_count": community["member_count"],
                     "cohesion": community["cohesion"],
-                    "keywords": keywords,
+                    "keywords": summary.get("keywords", community["keywords"]),
+                    "scope_hint": summary.get("scope_hint"),
+                    "dominant_kinds": summary.get("dominant_kinds", []),
                     "truncated": member_limit is not None and community["member_count"] > len(members),
                     "member_limit_applied": member_limit,
                     "members": members,
@@ -2629,47 +2628,55 @@ class Database:
         *,
         path_prefix: str | None = None,
         layer: str | None = None,
-    ) -> dict[int, tuple[str, list[str]]]:
+    ) -> dict[int, dict[str, Any]]:
         """Recompute community labels/keywords from the filtered member subset."""
-        if not communities or (not path_prefix and not layer):
+        if not communities:
             return {}
 
         assert self.conn is not None
-        from .community import _extract_keywords, _label_community, _tokenize_name
+        from .community import _tokenize_name, _tokenize_path, summarize_community_members
 
         filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
         community_ids = [int(community["id"]) for community in communities]
         placeholders = ",".join("?" for _ in community_ids)
         rows = self.conn.execute(
-            f"""SELECT sc.community_id, s.name
+            f"""SELECT sc.community_id, s.name, s.kind, f.path AS file_path
                 FROM symbol_communities sc
                 JOIN symbols s ON sc.symbol_id = s.id
                 JOIN files f ON s.file_id = f.id
                 WHERE sc.community_id IN ({placeholders})"""
             + filter_sql
             + """
-                ORDER BY sc.community_id, s.name""",
+                ORDER BY sc.community_id, f.path, s.name""",
             [*community_ids, *filter_params],
         ).fetchall()
 
-        names_by_community: dict[int, list[str]] = {community_id: [] for community_id in community_ids}
+        members_by_community: dict[int, list[dict[str, Any]]] = {community_id: [] for community_id in community_ids}
         global_freq = Counter()
         for row in rows:
             community_id = int(row["community_id"])
             name = str(row["name"] or "").strip()
-            if not name:
+            file_path = str(row["file_path"] or "").strip()
+            kind = str(row["kind"] or "").strip()
+            if not name and not file_path:
                 continue
-            names_by_community.setdefault(community_id, []).append(name)
-            global_freq.update(set(_tokenize_name(name)))
+            member = {
+                "name": name,
+                "kind": kind,
+                "file_path": file_path,
+            }
+            members_by_community.setdefault(community_id, []).append(member)
+            global_freq.update(set(_tokenize_name(name)) | set(_tokenize_path(file_path)))
 
-        n_communities = max(len([names for names in names_by_community.values() if names]), 1)
-        recomputed: dict[int, tuple[str, list[str]]] = {}
-        for community_id, names in names_by_community.items():
-            if not names:
+        n_communities = max(len([members for members in members_by_community.values() if members]), 1)
+        recomputed: dict[int, dict[str, Any]] = {}
+        for community_id, members in members_by_community.items():
+            if not members:
                 continue
-            recomputed[community_id] = (
-                _label_community(names, global_freq, n_communities),
-                _extract_keywords(names, global_freq, n_communities),
+            recomputed[community_id] = summarize_community_members(
+                members,
+                global_freq=global_freq,
+                n_communities=n_communities,
             )
         return recomputed
 
@@ -3143,7 +3150,7 @@ class Database:
         candidates.append(f"{dotted}.py")
         candidates.append(f"{dotted}/__init__.py")
         candidates.append(name)
-        for ext in (".js", ".ts", ".jsx", ".tsx"):
+        for ext in (".js", ".ts", ".jsx", ".tsx", ".vue", ".mjs", ".mts"):
             candidates.append(f"{name}{ext}")
             candidates.append(f"{dotted}{ext}")
 

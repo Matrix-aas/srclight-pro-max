@@ -15,6 +15,7 @@ import logging
 import math
 import re
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from .db import Database
@@ -177,6 +178,151 @@ def _extract_keywords(
         scored[token] = tf * idf
 
     return sorted(scored, key=scored.get, reverse=True)[:5]
+
+
+_GENERIC_PATH_TOKENS = {
+    "src",
+    "app",
+    "apps",
+    "client",
+    "server",
+    "shared",
+    "lib",
+    "libs",
+    "packages",
+    "package",
+    "components",
+    "component",
+    "views",
+    "view",
+    "features",
+    "feature",
+    "services",
+    "service",
+    "routes",
+    "route",
+    "stores",
+    "store",
+    "tests",
+    "__tests__",
+    "test",
+    "types",
+}
+
+
+def _tokenize_path(path: str) -> list[str]:
+    """Extract useful semantic tokens from a file path."""
+    tokens: list[str] = []
+    file_path = Path(path)
+    for part in (*file_path.parts[:-1], file_path.stem):
+        lowered = part.lower()
+        if lowered in _GENERIC_PATH_TOKENS:
+            continue
+        tokens.extend(
+            token
+            for token in _tokenize_name(part)
+            if token not in _GENERIC_PATH_TOKENS
+        )
+    return tokens
+
+
+def _scope_hint_from_path(path: str) -> str | None:
+    """Return a compact directory scope hint for a community member."""
+    parts = [part for part in Path(path).parts[:-1] if part]
+    if not parts:
+        return None
+    if len(parts) >= 3 and parts[1].lower() in {"src", "app"}:
+        return "/".join(parts[:3])
+    if len(parts) >= 2:
+        return "/".join(parts[:2])
+    return parts[0]
+
+
+def summarize_community_members(
+    members: list[dict[str, Any]],
+    *,
+    global_freq: Counter,
+    n_communities: int,
+) -> dict[str, Any]:
+    """Build richer labels/keywords from member names, paths, and kinds."""
+    name_freq = Counter()
+    path_freq = Counter()
+    kind_freq = Counter()
+    scope_freq = Counter()
+
+    for member in members:
+        name = str(member.get("name") or "")
+        file_path = str(member.get("file_path") or "")
+        kind = str(member.get("kind") or "")
+        name_freq.update(_tokenize_name(name))
+        path_freq.update(_tokenize_path(file_path))
+        if kind:
+            kind_freq[kind] += 1
+        scope = _scope_hint_from_path(file_path)
+        if scope:
+            scope_freq[scope] += 1
+
+    scored: dict[str, float] = {}
+    name_scored: dict[str, float] = {}
+    path_scored: dict[str, float] = {}
+    for token, count in name_freq.items():
+        if len(token) <= 1:
+            continue
+        tf = count / max(len(members), 1)
+        df = global_freq.get(token, 1)
+        idf = math.log(max(n_communities, 2) / max(df, 1)) + 1
+        weighted = tf * idf
+        name_scored[token] = name_scored.get(token, 0.0) + weighted
+        scored[token] = scored.get(token, 0.0) + weighted
+    for token, count in path_freq.items():
+        if len(token) <= 1:
+            continue
+        tf = count / max(len(members), 1)
+        df = global_freq.get(token, 1)
+        idf = math.log(max(n_communities, 2) / max(df, 1)) + 1
+        weighted = tf * idf * 1.35
+        path_scored[token] = path_scored.get(token, 0.0) + weighted
+        scored[token] = scored.get(token, 0.0) + weighted
+
+    ordered_tokens = [
+        token
+        for token, _score in sorted(scored.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    ordered_name_tokens = [
+        token
+        for token, _score in sorted(name_scored.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    top_path_token = next(
+        (
+            token
+            for token, _score in sorted(path_scored.items(), key=lambda item: (-item[1], item[0]))
+            if token not in _GENERIC_PATH_TOKENS
+        ),
+        None,
+    )
+    label_tokens: list[str] = []
+    if top_path_token and len(members) > 1 and (
+        len(ordered_tokens) < 2
+        or path_scored.get(top_path_token, 0.0) > scored.get(ordered_tokens[0], 0.0) * 1.25
+    ):
+        label_tokens.append(top_path_token)
+    for token in ordered_name_tokens:
+        if token in label_tokens:
+            continue
+        label_tokens.append(token)
+        if len(label_tokens) >= 3:
+            break
+    scope_hint = scope_freq.most_common(1)[0][0] if scope_freq else None
+    if not label_tokens and scope_hint:
+        label_tokens = [token for token in _tokenize_path(scope_hint)[:3]]
+    label = " ".join(label_tokens).title() if label_tokens else "unnamed"
+
+    return {
+        "label": label,
+        "keywords": ordered_tokens[:5],
+        "scope_hint": scope_hint,
+        "dominant_kinds": [kind for kind, _count in kind_freq.most_common(3)],
+    }
 
 
 def _community_cohesion(members: set[int], G) -> float:

@@ -11,6 +11,7 @@ import difflib
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import sqlite3
@@ -241,6 +242,106 @@ def _load_package_manifest(root: Path) -> dict:
         return {}
 
 
+def _workspace_package_manifest_paths(root: Path) -> list[Path]:
+    """Discover package.json files from workspace config and common app roots."""
+    manifest_paths: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path) -> None:
+        if path in seen or not path.is_file():
+            return
+        seen.add(path)
+        manifest_paths.append(path)
+
+    root_manifest_path = root / "package.json"
+    _add(root_manifest_path)
+
+    root_manifest = _load_package_manifest(root)
+    workspaces = root_manifest.get("workspaces")
+    patterns: list[str] = []
+    if isinstance(workspaces, list):
+        patterns.extend(pattern for pattern in workspaces if isinstance(pattern, str))
+    elif isinstance(workspaces, dict):
+        packages = workspaces.get("packages")
+        if isinstance(packages, list):
+            patterns.extend(pattern for pattern in packages if isinstance(pattern, str))
+
+    for pattern in patterns:
+        for package_json in root.glob(posixpath.join(pattern, "package.json")):
+            _add(package_json)
+
+    for candidate in (
+        "app/package.json",
+        "client/package.json",
+        "frontend/package.json",
+        "web/package.json",
+        "server/package.json",
+        "backend/package.json",
+        "api/package.json",
+    ):
+        _add(root / candidate)
+
+    return manifest_paths
+
+
+def _workspace_package_roots(root: Path) -> list[Path]:
+    """Return unique workspace package roots below the repository root."""
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for manifest_path in _workspace_package_manifest_paths(root):
+        package_root = manifest_path.parent
+        if package_root == root or package_root in seen:
+            continue
+        seen.add(package_root)
+        roots.append(package_root)
+    return roots
+
+
+def _load_package_manifests(root: Path) -> list[dict]:
+    """Load root + likely workspace package manifests for framework detection."""
+    manifests: list[dict] = []
+    for path in _workspace_package_manifest_paths(root):
+        try:
+            parsed = json.loads(path.read_text())
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            manifests.append(parsed)
+    return manifests
+
+
+def _classify_workspace_package_roots(root: Path) -> dict[str, list[str]]:
+    """Classify workspace package roots into frontend/backend/generic buckets."""
+    roles: dict[str, list[str]] = {"frontend": [], "backend": [], "generic": []}
+    frontend_deps = {
+        "vue", "nuxt", "vite", "pinia", "three", "react", "next", "svelte", "solid-js",
+    }
+    backend_deps = {
+        "@nestjs/core", "elysia", "express", "fastify", "hono", "koa", "@hono/node-server",
+    }
+    for manifest_path in _workspace_package_manifest_paths(root):
+        package_root = manifest_path.parent
+        if package_root == root:
+            continue
+        relative_root = package_root.relative_to(root).as_posix()
+        lowered_parts = {part.lower() for part in Path(relative_root).parts}
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except Exception:
+            manifest = {}
+        dependencies = _package_dependency_names(manifest) if isinstance(manifest, dict) else set()
+        is_frontend = bool(dependencies & frontend_deps) or bool(lowered_parts & {"client", "frontend", "web", "ui"})
+        is_backend = bool(dependencies & backend_deps) or bool(lowered_parts & {"server", "backend", "api", "worker"})
+
+        if is_frontend and not is_backend:
+            roles["frontend"].append(relative_root)
+        elif is_backend and not is_frontend:
+            roles["backend"].append(relative_root)
+        else:
+            roles["generic"].append(relative_root)
+    return roles
+
+
 def _package_dependency_names(manifest: dict) -> set[str]:
     """Collect dependency names across common package.json sections."""
     names: set[str] = set()
@@ -248,6 +349,14 @@ def _package_dependency_names(manifest: dict) -> set[str]:
         values = manifest.get(field)
         if isinstance(values, dict):
             names.update(values.keys())
+    return names
+
+
+def _package_dependency_names_from_manifests(manifests: list[dict]) -> set[str]:
+    """Collect dependency names across multiple package manifests."""
+    names: set[str] = set()
+    for manifest in manifests:
+        names.update(_package_dependency_names(manifest))
     return names
 
 
@@ -262,6 +371,13 @@ def _scan_framework_signals_in_files(root: Path, file_paths: list[str]) -> set[s
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        lowered = text.lower()
+        if path.suffix.lower() == ".vue" or "<template" in lowered or re.search(r"\bfrom\s*['\"]vue['\"]", text):
+            signals.add("vue")
+        if re.search(r"\bfrom\s*['\"]three['\"]", text) or re.search(r"\bnew\s+THREE\.", text):
+            signals.add("three")
+        if re.search(r"\bfrom\s*['\"]vite['\"]", text) or "defineconfig(" in lowered:
+            signals.add("vite")
         if "elysia" in text.lower() and (
             re.search(r"\bnew\s+Elysia\s*\(", text)
             or re.search(r"\bfrom\s*['\"]elysia['\"]", text)
@@ -337,7 +453,7 @@ def _large_subsystem_summaries_from_counts(
     candidates = [
         (directory, count)
         for directory, count in counts.items()
-        if count >= min_files and directory.count("/") >= 1
+        if count >= min_files
     ]
     candidates.sort(key=lambda item: (-item[0].count("/"), -item[1], item[0]))
 
@@ -376,6 +492,9 @@ def _collect_repo_files(
             relative = path.relative_to(root).as_posix()
             if relative in seen:
                 continue
+            lowered = relative.lower()
+            if "/__tests__/" in lowered or "/tests/" in lowered or lowered.endswith((".test.ts", ".test.js", ".spec.ts", ".spec.js", ".spec.vue", ".test.vue")):
+                continue
             if suffixes and path.suffix.lower() not in suffixes:
                 continue
             seen.add(relative)
@@ -412,6 +531,53 @@ def _merge_representative_paths(*groups: list[str], limit: int) -> list[str]:
     return results
 
 
+def _workspace_candidate_paths(package_roots: list[str], relative_paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Expand a set of relative paths under discovered workspace package roots."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for package_root in package_roots:
+        for relative_path in relative_paths:
+            path = f"{package_root}/{relative_path}".strip("/")
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            expanded.append(path)
+    return tuple(expanded)
+
+
+def _workspace_candidate_dirs(package_roots: list[str], relative_dirs: tuple[str, ...]) -> tuple[str, ...]:
+    """Expand representative source directories under workspace package roots."""
+    return _workspace_candidate_paths(package_roots, relative_dirs)
+
+
+def _is_frontend_path(path: str) -> bool:
+    """Best-effort classification for frontend-oriented files."""
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return False
+    if path.endswith(".vue"):
+        return True
+    if parts[0] in {"app", "client", "frontend", "web", "ui"}:
+        return True
+    return any(
+        marker in parts
+        for marker in ("pages", "views", "components", "composables", "hooks", "stores", "router", "render", "renderers", "renderer")
+    )
+
+
+def _is_backend_path(path: str) -> bool:
+    """Best-effort classification for backend-oriented files."""
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return False
+    if parts[0] in {"server", "backend", "api", "worker"}:
+        return True
+    return any(
+        marker in parts
+        for marker in ("controllers", "modules", "routes", "http", "transport", "messaging", "queues", "jobs", "workers")
+    )
+
+
 _DATA_SYSTEMS = ("prisma", "drizzle", "mongoose", "mikroorm")
 _ASYNC_SYSTEMS = ("bullmq", "rabbitmq", "redis")
 _ASYNC_SYSTEM_ALIASES = {"rmq": "rabbitmq"}
@@ -438,18 +604,31 @@ def _infer_app_type(
     manifest_present: bool,
 ) -> str:
     """Infer the primary app type from representative files and merged signals."""
-    has_frontend = "nuxt" in signals or "vue" in signals
-    has_backend = (
+    has_frontend = (
+        "nuxt" in signals
+        or "vue" in signals
+        or "vite" in signals
+        or bool(representative_files.get("frontend"))
+        or bool(representative_files.get("components"))
+        or bool(representative_files.get("renderers"))
+        or any(_is_frontend_path(path) for path in representative_files.get("entrypoints", []))
+    )
+    has_explicit_backend = (
         "nest" in signals
+        or "elysia" in signals
         or bool(representative_files.get("data"))
         or bool(representative_files.get("async"))
         or any(
-            path.startswith(("src/main", "src/controllers", "src/modules", "src/http"))
+            path.startswith(("src/main", "src/controllers", "src/modules", "src/http", "src/routes"))
+            or (
+                _is_backend_path(path)
+                and not path.startswith(("server/api", "server/routes", "server/plugins", "server/middleware"))
+            )
             for path in representative_files.get("backend", [])
         )
     )
 
-    if has_frontend and has_backend:
+    if has_frontend and has_explicit_backend:
         return "fullstack"
     if "nuxt" in signals:
         return "nuxt"
@@ -465,10 +644,12 @@ def _infer_app_type(
 def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str, object]:
     """Summarize indexed symbol metadata into orientation hints."""
     representative_files = {
+        "frontend": [],
         "backend": [],
         "data": [],
         "async": [],
         "config": [],
+        "renderers": [],
     }
     route_systems: list[str] = []
     route_files: list[str] = []
@@ -476,6 +657,7 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
     async_systems: list[str] = []
     runtime_files: list[str] = []
     signals: list[str] = []
+    frontend_priorities: dict[str, int] = {}
     backend_priorities: dict[str, int] = {}
     async_priorities: dict[str, int] = {}
     runtime_priorities: dict[str, int] = {}
@@ -540,6 +722,13 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
             or kind in {"module", "config"}
             or "/bootstrap/" in path
         )
+        is_frontend = (
+            framework in {"nuxt", "vue", "vite", "three"}
+            or kind == "component"
+            or resource in {"component", "renderer", "store", "composable"}
+            or (resource == "route" and _is_frontend_path(path))
+            or _is_frontend_path(path)
+        )
         is_data = framework in _DATA_SYSTEMS or resource in _DATA_RESOURCES
         is_async = (
             kind in {"queue_processor", "microservice_handler", "scheduled_job"}
@@ -548,10 +737,23 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
         )
 
         if path in {"src/main.ts", "src/main.js", "main.ts", "main.js", "server.ts"} or resource == "bootstrap":
-            _append(representative_files["backend"], path)
-            _priority_update(backend_priorities, path, 0)
+            target_bucket = "frontend" if is_frontend else "backend"
+            target_priorities = frontend_priorities if is_frontend else backend_priorities
+            _append(representative_files[target_bucket], path)
+            _priority_update(target_priorities, path, 0)
+            if framework in {"nuxt", "vue", "vite", "three"}:
+                _append(signals, framework)
 
-        if is_route_surface:
+        if is_frontend and path:
+            _append(representative_files["frontend"], path)
+            _priority_update(frontend_priorities, path, 1 if kind == "component" else 0)
+            if resource == "renderer" or framework == "three" or _is_frontend_path(path) and "render" in path:
+                _append(representative_files["renderers"], path)
+            for token in (framework, transport):
+                if token in {"nuxt", "vue", "vite", "three"}:
+                    _append(signals, token)
+
+        if is_route_surface and not is_frontend:
             _append(representative_files["backend"], path)
             _append(route_files, path)
             _priority_update(backend_priorities, path, 1)
@@ -593,10 +795,12 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
     return {
         "signals": signals,
         "representative_files": {
+            "frontend": _ordered_paths(representative_files["frontend"], frontend_priorities),
             "backend": _ordered_paths(representative_files["backend"], backend_priorities),
             "data": representative_files["data"],
             "async": _ordered_paths(representative_files["async"], async_priorities),
             "config": _ordered_paths(representative_files["config"], runtime_priorities),
+            "renderers": representative_files["renderers"],
         },
         "route_systems": route_systems,
         "route_files": route_files,
@@ -634,7 +838,7 @@ def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[
             resource = ""
 
         if not metadata.get("framework"):
-            for candidate in _DATA_SYSTEMS + _ASYNC_SYSTEMS + ("nest", "nitro", "nuxt", "vue"):
+            for candidate in _DATA_SYSTEMS + _ASYNC_SYSTEMS + ("nest", "nitro", "nuxt", "vue", "vite", "three", "elysia"):
                 if candidate in tokens:
                     metadata["framework"] = candidate
                     break
@@ -657,6 +861,8 @@ def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[
                 _set_missing(metadata, "resource", inferred)
             elif {"runtime", "config", "configuration", "module", "environment", "wiring"} & tokens:
                 _set_missing(metadata, "resource", "config")
+            elif {"renderer", "render", "scene", "canvas", "webgl"} & tokens:
+                _set_missing(metadata, "resource", "renderer")
             elif {"bootstrap"} & tokens and file_path not in entrypoint_paths:
                 _set_missing(metadata, "resource", "bootstrap")
 
@@ -688,6 +894,7 @@ def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[
                 "consumer": "microservice_handler",
                 "worker": "scheduled_job",
                 "scheduler": "scheduled_job",
+                "renderer": "class",
             }.get(str(metadata.get("resource") or "").lower(), "")
 
         symbol_rows.append({
@@ -710,10 +917,12 @@ def _merge_orientation_hints(*hint_sets: dict[str, object] | None) -> dict[str, 
     merged: dict[str, object] = {
         "signals": [],
         "representative_files": {
+            "frontend": [],
             "backend": [],
             "data": [],
             "async": [],
             "config": [],
+            "renderers": [],
         },
         "route_systems": [],
         "route_files": [],
@@ -735,7 +944,7 @@ def _merge_orientation_hints(*hint_sets: dict[str, object] | None) -> dict[str, 
         _extend_unique(merged["signals"], list(hints.get("signals") or []))
         representative_files = hints.get("representative_files")
         if isinstance(representative_files, dict):
-            for category, limit in (("backend", 3), ("data", 3), ("async", 3), ("config", 4)):
+            for category, limit in (("frontend", 4), ("backend", 3), ("data", 3), ("async", 3), ("config", 4), ("renderers", 3)):
                 bucket = merged["representative_files"].setdefault(category, [])
                 _extend_unique(bucket, list(representative_files.get(category) or []), limit=limit)
         _extend_unique(merged["route_systems"], list(hints.get("route_systems") or []))
@@ -760,6 +969,11 @@ def _merge_indexed_representative_files(
     if not isinstance(indexed_files, dict):
         return merged
 
+    merged["frontend"] = _merge_representative_paths(
+        list(indexed_files.get("frontend") or []),
+        merged.get("frontend", []),
+        limit=4,
+    )
     merged["backend"] = _merge_representative_paths(
         list(indexed_files.get("backend") or []),
         merged.get("backend", []),
@@ -776,9 +990,14 @@ def _merge_indexed_representative_files(
         limit=3,
     )
     merged["config"] = _merge_representative_paths(
-        list(indexed_files.get("config") or []),
         merged.get("config", []),
+        list(indexed_files.get("config") or []),
         limit=4,
+    )
+    merged["renderers"] = _merge_representative_paths(
+        list(indexed_files.get("renderers") or []),
+        merged.get("renderers", []),
+        limit=3,
     )
     return merged
 
@@ -786,29 +1005,70 @@ def _merge_indexed_representative_files(
 def _find_representative_files(root: Path) -> dict[str, list[str]]:
     """Collect high-signal files that help agents orient quickly."""
     representative_files: dict[str, list[str]] = {}
+    workspace_roots = [path.relative_to(root).as_posix() for path in _workspace_package_roots(root)]
+    workspace_roles = _classify_workspace_package_roots(root)
+    frontend_workspace_roots = tuple(workspace_roles["frontend"] + workspace_roles["generic"])
+    backend_workspace_roots = tuple(workspace_roles["backend"] + workspace_roles["generic"])
 
-    config_files = _collect_existing_paths(root, (
+    config_candidates = (
         "nuxt.config.ts",
         "nuxt.config.js",
         "nuxt.config.mjs",
         "vite.config.ts",
         "vite.config.js",
+        "vite.config.mts",
+        "vite.config.mjs",
         "nest-cli.json",
         "tsconfig.json",
         "package.json",
-    ), limit=4)
+    ) + _workspace_candidate_paths(
+        workspace_roots,
+        (
+            "nuxt.config.ts",
+            "nuxt.config.js",
+            "nuxt.config.mjs",
+            "vite.config.ts",
+            "vite.config.js",
+            "vite.config.mts",
+            "vite.config.mjs",
+            "nest-cli.json",
+            "tsconfig.json",
+            "package.json",
+        ),
+    )
+    config_files = _collect_existing_paths(root, config_candidates, limit=4)
     if config_files:
         representative_files["config"] = config_files
 
-    entrypoints = _collect_existing_paths(root, (
-        "app.vue",
+    entrypoint_candidates = (
         "src/main.ts",
         "src/main.js",
+        "src/main.tsx",
         "main.ts",
         "main.js",
         "server.ts",
-        "src/main.tsx",
-    ), limit=3)
+        "app.vue",
+    ) + _workspace_candidate_paths(
+        frontend_workspace_roots or tuple(workspace_roots),
+        (
+            "src/main.ts",
+            "src/main.js",
+            "src/main.tsx",
+            "src/App.vue",
+            "app.vue",
+            "main.ts",
+            "main.js",
+            "server.ts",
+        ),
+    ) + (
+        "client/src/main.ts",
+        "client/src/main.js",
+        "frontend/src/main.ts",
+        "frontend/src/main.js",
+        "client/src/App.vue",
+        "frontend/src/App.vue",
+    )
+    entrypoints = _collect_existing_paths(root, entrypoint_candidates, limit=3)
     if entrypoints:
         representative_files["entrypoints"] = entrypoints
 
@@ -822,9 +1082,36 @@ def _find_representative_files(root: Path) -> dict[str, list[str]]:
         representative_files["docs"] = docs
 
     backend = _merge_representative_paths(
-        _collect_repo_files(root, ("server/api", "server/routes", "api"), limit=1, allowed_suffixes=(".ts", ".js", ".mjs")),
+        _collect_repo_files(
+            root,
+            (
+                "server/api",
+                "server/routes",
+                "api",
+                * _workspace_candidate_dirs(backend_workspace_roots or tuple(workspace_roots), ("server/api", "server/routes", "api")),
+            ),
+            limit=1,
+            allowed_suffixes=(".ts", ".js", ".mjs"),
+        ),
         _collect_existing_paths(root, ("src/main.ts", "src/main.js", "server.ts", "main.ts", "main.js"), limit=1),
-        _collect_repo_files(root, ("src/controllers", "src/modules", "src/server", "src/http", "src/routes"), limit=1, allowed_suffixes=(".ts", ".js")),
+        _collect_existing_paths(
+            root,
+            _workspace_candidate_paths(backend_workspace_roots or tuple(workspace_roots), ("src/main.ts", "src/main.js", "server.ts", "main.ts", "main.js")),
+            limit=1,
+        ),
+        _collect_repo_files(
+            root,
+            (
+                "src/controllers",
+                "src/modules",
+                "src/server",
+                "src/http",
+                "src/routes",
+                * _workspace_candidate_dirs(backend_workspace_roots or tuple(workspace_roots), ("src/controllers", "src/modules", "src/server", "src/http", "src/routes")),
+            ),
+            limit=1,
+            allowed_suffixes=(".ts", ".js"),
+        ),
         limit=3,
     )
     if backend:
@@ -834,7 +1121,20 @@ def _find_representative_files(root: Path) -> dict[str, list[str]]:
         _collect_existing_paths(root, ("prisma/schema.prisma",), limit=1),
         _collect_repo_files(
             root,
-            ("prisma", "src/db", "db", "src/database", "database", "src/entities", "src/models", "src/repositories"),
+            (
+                "prisma",
+                "src/db",
+                "db",
+                "src/database",
+                "database",
+                "src/entities",
+                "src/models",
+                "src/repositories",
+                * _workspace_candidate_dirs(
+                    tuple(workspace_roots),
+                    ("prisma", "src/db", "db", "src/database", "database", "src/entities", "src/models", "src/repositories"),
+                ),
+            ),
             limit=3,
             allowed_suffixes=(".prisma", ".sql", ".ts", ".js"),
         ),
@@ -845,7 +1145,22 @@ def _find_representative_files(root: Path) -> dict[str, list[str]]:
 
     async_files = _collect_repo_files(
         root,
-        ("src/queues", "queues", "src/workers", "workers", "src/jobs", "jobs", "src/events", "events", "src/consumers", "consumers"),
+        (
+            "src/queues",
+            "queues",
+            "src/workers",
+            "workers",
+            "src/jobs",
+            "jobs",
+            "src/events",
+            "events",
+            "src/consumers",
+            "consumers",
+            * _workspace_candidate_dirs(
+                backend_workspace_roots or tuple(workspace_roots),
+                ("src/queues", "queues", "src/workers", "workers", "src/jobs", "jobs", "src/events", "events", "src/consumers", "consumers"),
+            ),
+        ),
         limit=3,
         allowed_suffixes=(".ts", ".js", ".mjs"),
     )
@@ -853,19 +1168,160 @@ def _find_representative_files(root: Path) -> dict[str, list[str]]:
         representative_files["async"] = async_files
 
     category_specs = (
-        ("routes", ("app/pages", "pages", "src/pages", "app/router", "src/router"), (".vue", ".ts", ".js"), 3),
-        ("components", ("app/components", "components", "src/components"), (".vue", ".ts", ".js"), 3),
-        ("composables", ("app/composables", "composables", "src/composables", "hooks", "src/hooks"), (".ts", ".js", ".vue"), 3),
-        ("stores", ("app/stores", "stores", "src/stores"), (".ts", ".js"), 3),
-        ("plugins", ("app/plugins", "plugins", "src/plugins"), (".ts", ".js"), 3),
-        ("server", ("server", "server/api", "api", "src/server"), (".ts", ".js", ".mjs"), 3),
-        ("graphql", ("app/graphql", "graphql", "src/graphql"), (".gql", ".graphql", ".ts", ".js"), 3),
-        ("styles", ("app/assets", "assets", "styles", "src/styles"), (".css", ".pcss", ".postcss", ".scss", ".sass", ".less"), 3),
+        (
+            "routes",
+            (
+                "app/pages",
+                "pages",
+                "src/pages",
+                "src/views",
+                "client/src/pages",
+                "client/src/views",
+                "frontend/src/pages",
+                "frontend/src/views",
+                "app/router",
+                "src/router",
+                "client/src/router",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("src/pages", "src/views", "app/pages", "app/router", "src/router")),
+            ),
+            (".vue", ".ts", ".js"),
+            3,
+        ),
+        (
+            "components",
+            (
+                "app/components",
+                "components",
+                "src/components",
+                "client/src/components",
+                "frontend/src/components",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("app/components", "components", "src/components")),
+            ),
+            (".vue", ".ts", ".js"),
+            3,
+        ),
+        (
+            "renderers",
+            (
+                "render",
+                "renderer",
+                "renderers",
+                "src/render",
+                "src/renderer",
+                "src/renderers",
+                "client/src/render",
+                "client/src/renderer",
+                "client/src/renderers",
+                "frontend/src/render",
+                "frontend/src/renderer",
+                "frontend/src/renderers",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("render", "renderer", "renderers", "src/render", "src/renderer", "src/renderers")),
+            ),
+            (".ts", ".js", ".tsx", ".jsx"),
+            3,
+        ),
+        (
+            "composables",
+            (
+                "app/composables",
+                "composables",
+                "src/composables",
+                "hooks",
+                "src/hooks",
+                "client/src/composables",
+                "client/src/hooks",
+                "frontend/src/composables",
+                "frontend/src/hooks",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("app/composables", "composables", "src/composables", "hooks", "src/hooks")),
+            ),
+            (".ts", ".js", ".vue"),
+            3,
+        ),
+        (
+            "stores",
+            (
+                "app/stores",
+                "stores",
+                "src/stores",
+                "src/store",
+                "client/src/stores",
+                "client/src/store",
+                "frontend/src/stores",
+                "frontend/src/store",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("app/stores", "stores", "src/stores", "src/store")),
+            ),
+            (".ts", ".js"),
+            3,
+        ),
+        (
+            "plugins",
+            (
+                "app/plugins",
+                "plugins",
+                "src/plugins",
+                "client/src/plugins",
+                "frontend/src/plugins",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("app/plugins", "plugins", "src/plugins")),
+            ),
+            (".ts", ".js"),
+            3,
+        ),
+        (
+            "server",
+            (
+                "server",
+                "server/api",
+                "api",
+                "src/server",
+                * _workspace_candidate_dirs(backend_workspace_roots or tuple(workspace_roots), ("server", "server/api", "api", "src/server")),
+            ),
+            (".ts", ".js", ".mjs"),
+            3,
+        ),
+        (
+            "graphql",
+            (
+                "app/graphql",
+                "graphql",
+                "src/graphql",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("app/graphql", "graphql", "src/graphql")),
+            ),
+            (".gql", ".graphql", ".ts", ".js"),
+            3,
+        ),
+        (
+            "styles",
+            (
+                "app/assets",
+                "assets",
+                "styles",
+                "src/styles",
+                "client/src/styles",
+                "client/src/assets",
+                "frontend/src/styles",
+                "frontend/src/assets",
+                * _workspace_candidate_dirs(frontend_workspace_roots or tuple(workspace_roots), ("app/assets", "assets", "styles", "src/styles", "src/assets")),
+            ),
+            (".css", ".pcss", ".postcss", ".scss", ".sass", ".less"),
+            3,
+        ),
     )
     for category, relative_dirs, suffixes, limit in category_specs:
         files = _collect_repo_files(root, relative_dirs, limit=limit, allowed_suffixes=suffixes)
         if files:
             representative_files[category] = files
+
+    frontend = _merge_representative_paths(
+        [path for path in representative_files.get("entrypoints", []) if _is_frontend_path(path)],
+        representative_files.get("routes", []),
+        representative_files.get("components", []),
+        representative_files.get("renderers", []),
+        representative_files.get("stores", []),
+        representative_files.get("composables", []),
+        limit=4,
+    )
+    if frontend:
+        representative_files["frontend"] = frontend
 
     return representative_files
 
@@ -877,20 +1333,30 @@ def _detect_framework_hints(
     extra_signals: set[str] | None = None,
 ) -> dict[str, object]:
     """Infer the dominant framework/runtime signals from repo layout + package.json."""
-    manifest = _load_package_manifest(root)
-    dependencies = _package_dependency_names(manifest)
+    manifests = _load_package_manifests(root)
+    dependencies = _package_dependency_names_from_manifests(manifests)
     signals: set[str] = set(extra_signals or [])
 
-    if "nuxt" in dependencies or any(path.startswith("nuxt.config.") for path in representative_files.get("config", [])):
+    if "nuxt" in dependencies or any(Path(path).name.startswith("nuxt.config.") for path in representative_files.get("config", [])):
         signals.add("nuxt")
+    if "vite" in dependencies or any(Path(path).name.startswith("vite.config.") for path in representative_files.get("config", [])):
+        signals.add("vite")
     if (
         "vue" in dependencies
         or "nuxt" in signals
+        or "vite" in signals
         or bool(representative_files.get("components"))
         or bool(representative_files.get("routes"))
+        or bool(representative_files.get("frontend"))
         or "app.vue" in representative_files.get("entrypoints", [])
+        or any(path.endswith(".vue") for path in representative_files.get("frontend", []))
     ):
         signals.add("vue")
+    if (
+        "three" in dependencies
+        or bool(representative_files.get("renderers"))
+    ):
+        signals.add("three")
     if (
         "graphql" in dependencies
         or "@apollo/client" in dependencies
@@ -911,13 +1377,19 @@ def _detect_framework_hints(
         signals.add("postcss")
     if (
         "@nestjs/core" in dependencies
-        or "nest-cli.json" in representative_files.get("config", [])
+        or any(Path(path).name == "nest-cli.json" for path in representative_files.get("config", []))
     ):
         signals.add("nest")
     if "elysia" in dependencies:
         signals.add("elysia")
     if representative_files.get("server") and "nuxt" in signals:
         signals.add("nitro")
+    if "drizzle-orm" in dependencies:
+        signals.add("drizzle")
+    if "mongoose" in dependencies:
+        signals.add("mongoose")
+    if any(name.startswith("@mikro-orm/") or name == "mikro-orm" for name in dependencies):
+        signals.add("mikroorm")
     if (
         "@prisma/client" in dependencies
         or "prisma" in dependencies
@@ -934,13 +1406,16 @@ def _detect_framework_hints(
                 dict.fromkeys(
                     (representative_files.get("backend") or [])
                     + (representative_files.get("server") or [])
+                    + (representative_files.get("frontend") or [])
+                    + (representative_files.get("renderers") or [])
+                    + representative_files.get("entrypoints", [])
                 )
             ),
         )
     )
 
     return {
-        "app_type": _infer_app_type(representative_files, signals, manifest_present=bool(manifest)),
+        "app_type": _infer_app_type(representative_files, signals, manifest_present=bool(manifests)),
         "signals": sorted(signals),
     }
 
@@ -959,6 +1434,21 @@ def _build_topology(
     signals = set(framework_hints.get("signals") or [])
     indexed_hints = indexed_hints or {}
     topology: dict[str, dict[str, object]] = {}
+
+    frontend_files = _merge_representative_paths(
+        [path for path in representative_files.get("entrypoints", []) if _is_frontend_path(path)],
+        representative_files.get("routes", []),
+        representative_files.get("components", []),
+        representative_files.get("renderers", []),
+        representative_files.get("stores", []),
+        representative_files.get("composables", []),
+        limit=4,
+    )
+    if frontend_files:
+        topology["frontend"] = {
+            "files": frontend_files,
+            "summary": "Primary client entrypoints, routes, rendering surfaces, and reusable UI modules.",
+        }
 
     backend_files = representative_files.get("backend") or representative_files.get("server") or []
     if backend_files:
@@ -1102,6 +1592,9 @@ def _start_here_reason(category: str, app_type: str) -> str:
         "components": {
             "default": "Reusable UI building blocks.",
         },
+        "renderers": {
+            "default": "Rendering, scene, or view-model surfaces that drive client behavior.",
+        },
         "composables": {
             "default": "Shared frontend behavior and stateful logic.",
         },
@@ -1144,25 +1637,66 @@ def _build_start_here(
 ) -> list[dict[str, str]]:
     """Build a small ordered entrypoint list for repo orientation."""
     app_type = str(framework_hints.get("app_type") or "codebase")
+    signals = set(str(item) for item in framework_hints.get("signals") or [])
+    has_module_runtime_config = any(
+        path.endswith((".module.ts", ".module.js"))
+        or "/runtime/" in path
+        or "/bootstrap/" in path
+        or path.endswith((".config.ts", ".config.js"))
+        for path in representative_files.get("config", [])
+    )
     if app_type == "fullstack":
-        priority = ("config", "backend", "routes", "data", "async", "entrypoints", "server", "stores", "composables", "plugins", "graphql", "styles", "components")
-        category_limits = {"backend": 2}
+        if "nest" in signals and has_module_runtime_config:
+            priority = ("config", "backend", "data", "async", "entrypoints", "routes", "renderers", "components", "stores", "composables", "plugins", "graphql", "styles")
+            category_limits = {"backend": 2, "routes": 1, "renderers": 1}
+        else:
+            priority = ("config", "entrypoints", "routes", "backend", "renderers", "data", "async", "components", "stores", "composables", "plugins", "graphql", "styles", "server")
+            category_limits = {"backend": 1, "routes": 1, "renderers": 1}
     elif app_type == "nuxt":
-        priority = ("config", "entrypoints", "routes", "stores", "composables", "plugins", "server", "graphql", "styles", "components")
+        priority = ("config", "entrypoints", "routes", "renderers", "stores", "composables", "plugins", "server", "graphql", "styles", "components")
         category_limits = {}
+    elif app_type == "vue":
+        priority = ("config", "entrypoints", "routes", "renderers", "components", "stores", "composables", "plugins", "styles", "backend", "data", "async", "server")
+        category_limits = {"routes": 1, "renderers": 1}
     elif app_type == "nest":
         priority = ("config", "backend", "data", "async", "entrypoints", "server", "graphql", "styles", "components")
         category_limits = {"config": 2, "backend": 2}
     else:
-        priority = ("config", "entrypoints", "backend", "routes", "data", "async", "components", "composables", "stores", "plugins", "server", "graphql", "styles")
+        priority = ("config", "entrypoints", "routes", "renderers", "backend", "data", "async", "components", "composables", "stores", "plugins", "server", "graphql", "styles")
         category_limits = {"backend": 2}
 
     start_here: list[dict[str, str]] = []
     seen: set[str] = set()
     for category in priority:
-        files = representative_files.get(category) or []
+        files = list(representative_files.get(category) or [])
         if not files:
             continue
+        if category == "config":
+            def _config_rank(path: str) -> tuple[int, str]:
+                name = Path(path).name
+                if "nest" in signals and (
+                    path.endswith((".module.ts", ".module.js"))
+                    or "/runtime/" in path
+                    or "/bootstrap/" in path
+                    or (
+                        path.endswith((".config.ts", ".config.js"))
+                        and not name.startswith(("nuxt.config.", "vite.config."))
+                    )
+                ):
+                    return (0, path)
+                if name.startswith("nuxt.config."):
+                    return (1, path)
+                if name.startswith("vite.config."):
+                    return (2, path)
+                if name == "nest-cli.json":
+                    return (3, path)
+                if name == "package.json":
+                    return (4, path)
+                if name == "tsconfig.json":
+                    return (5, path)
+                return (10, path)
+
+            files.sort(key=_config_rank)
         for path in files[:category_limits.get(category, 1)]:
             if path in seen:
                 continue
@@ -1209,10 +1743,32 @@ def _build_repo_brief(
 ) -> str:
     """Build a compact AI-oriented repo summary."""
     app_type = str(framework_hints.get("app_type") or "codebase")
-    signals = list(framework_hints.get("signals") or [])
+    preferred_signal_order = {
+        "nuxt": 0,
+        "vue": 1,
+        "vite": 2,
+        "three": 3,
+        "pinia": 4,
+        "graphql": 5,
+        "nest": 6,
+        "nitro": 7,
+        "elysia": 8,
+        "drizzle": 9,
+        "prisma": 10,
+        "mongoose": 11,
+        "mikroorm": 12,
+        "bullmq": 13,
+        "rabbitmq": 14,
+        "redis": 15,
+        "postcss": 16,
+    }
+    signals = sorted(
+        list(framework_hints.get("signals") or []),
+        key=lambda signal: (preferred_signal_order.get(signal, len(preferred_signal_order)), signal),
+    )
     label = "unindexed" if not indexed else "indexed"
     app_label = app_type.upper() if app_type == "nuxt" else app_type
-    signal_text = f" with {', '.join(signals[:4])} signals" if signals else ""
+    signal_text = f" with {', '.join(signals[:5])} signals" if signals else ""
     start_paths = ", ".join(item["path"] for item in start_here[:4])
     start_text = f" Start with {start_paths}." if start_paths else ""
     subsystem_text = ""
@@ -1262,6 +1818,39 @@ def _bootstrap_codebase_map_result(
             "Use setup_guide() if the user needs setup help.",
         ],
     }
+
+
+def _limit_count_mapping(values: dict[str, int], *, limit: int, minimum_value: int = 1) -> dict[str, int]:
+    """Keep the highest-signal count entries in a stable order."""
+    items = [
+        (key, int(value))
+        for key, value in values.items()
+        if int(value) >= minimum_value
+    ]
+    items.sort(key=lambda item: (-item[1], item[0]))
+    return dict(items[:limit])
+
+
+def _compact_directory_summary(
+    directories: list[dict[str, object]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, object]], bool]:
+    """Trim directory summaries for default codebase_map responses."""
+    if len(directories) <= limit:
+        return directories, False
+
+    scored = sorted(
+        directories,
+        key=lambda item: (
+            -int(item.get("files") or 0),
+            -int(item.get("symbols") or 0),
+            str(item.get("path") or ""),
+        ),
+    )
+    selected = scored[:limit]
+    selected.sort(key=lambda item: str(item.get("path") or ""))
+    return selected, True
 
 
 def _get_workspace_db():
@@ -1707,7 +2296,7 @@ def _workspace_project_not_found_error(project: str | None) -> str | None:
 
 
 @mcp.tool()
-def codebase_map(project: str | None = None) -> str:
+def codebase_map(project: str | None = None, verbose: bool = False) -> str:
     """Get a complete overview of the indexed codebase.
 
     Returns project stats, language breakdown, symbol counts by kind,
@@ -1723,7 +2312,12 @@ def codebase_map(project: str | None = None) -> str:
     if _is_workspace_mode():
         wdb = _get_workspace_db()
         try:
-            result = wdb.codebase_map(project=project)
+            try:
+                result = wdb.codebase_map(project=project, verbose=verbose)
+            except TypeError as exc:
+                if "verbose" not in str(exc):
+                    raise
+                result = wdb.codebase_map(project=project)
         except LookupError:
             if project is None:
                 raise
@@ -1791,10 +2385,19 @@ def codebase_map(project: str | None = None) -> str:
         indexed_hints=indexed_hints,
         mode="single",
     )
+    directory_summary = db.directory_summary(max_depth=2)
+    hotspot_files = db.hotspot_files(limit=10 if verbose else 5)
+    compact_directories, directories_truncated = _compact_directory_summary(
+        directory_summary,
+        limit=12 if not verbose else len(directory_summary),
+    )
+    languages = stats["languages"] if verbose else _limit_count_mapping(stats["languages"], limit=10)
+    symbol_kinds = stats["symbol_kinds"] if verbose else _limit_count_mapping(stats["symbol_kinds"], limit=12)
 
     result = {
         "mode": "single",
         "repo_root": str(_repo_root),
+        "compact": not verbose,
         "index": {
             "status": "ready" if stats["files"] > 0 else "empty",
             "db_path": str(_db_path),
@@ -1813,11 +2416,14 @@ def codebase_map(project: str | None = None) -> str:
         "representative_files": representative_files,
         "topology": topology,
         "start_here": start_here,
-        "languages": stats["languages"],
-        "symbol_kinds": stats["symbol_kinds"],
-        "directories": db.directory_summary(max_depth=2),
-        "hotspot_files": db.hotspot_files(limit=10),
+        "languages": languages,
+        "symbol_kinds": symbol_kinds,
+        "directories": compact_directories,
+        "hotspot_files": hotspot_files,
     }
+    if not verbose:
+        result["directories_truncated"] = directories_truncated
+        result["hotspot_files_truncated"] = stats["files"] > len(hotspot_files)
 
     if state:
         result["index"]["last_commit"] = state.get("last_commit")
@@ -1832,7 +2438,7 @@ def codebase_map(project: str | None = None) -> str:
         start_here,
         indexed=True,
         large_subsystems=_large_subsystem_summaries_from_directory_summary(
-            result["directories"],
+            directory_summary,
         ),
     )
 
@@ -2361,6 +2967,9 @@ def _resolve_graph_symbol(
 ):
     symbols = db.get_symbols_by_name(symbol_name, limit=25)
     exact = [sym for sym in symbols if sym.name == symbol_name]
+    if not exact:
+        lowered = symbol_name.lower()
+        exact = [sym for sym in symbols if (sym.name or "").lower() == lowered]
     if not exact:
         return None, _symbol_not_found_error(symbol_name, project)
     if len(exact) > 1:
@@ -3109,7 +3718,22 @@ def _find_imports_in_repo(db: Database, repo_root: Path, path: str, language: st
     except OSError as e:
         return {"error": f"Cannot read file: {e}"}
 
-    raw_imports = _extract_imports(content, language)
+    extract_language = language
+    if language == "vue":
+        full_content = content
+        script_blocks = re.findall(
+            r"<script\b[^>]*>(.*?)</script>",
+            content,
+            re.IGNORECASE | re.DOTALL,
+        )
+        content = "\n".join(script_blocks)
+        extract_language = (
+            "typescript"
+            if re.search(r"<script\b[^>]*lang=['\"]ts['\"]", full_content, re.IGNORECASE)
+            else "javascript"
+        )
+
+    raw_imports = _extract_imports(content, extract_language)
     imports = []
     resolved_count = 0
     for imp in raw_imports:
@@ -3616,7 +4240,7 @@ def find_imports(path: str, project: str | None = None) -> str:
             if not file_rec:
                 return json.dumps({"error": f"File '{path}' not found in project '{project}'"})
             language = file_rec.language
-            if not language or language not in IMPORT_PATTERNS:
+            if not language or (language not in IMPORT_PATTERNS and language != "vue"):
                 return json.dumps({
                     "file": path,
                     "language": language,
@@ -3638,7 +4262,7 @@ def find_imports(path: str, project: str | None = None) -> str:
         return json.dumps({"error": f"File '{path}' not found in index"})
 
     language = file_rec.language
-    if not language or language not in IMPORT_PATTERNS:
+    if not language or (language not in IMPORT_PATTERNS and language != "vue"):
         return json.dumps({
             "file": path,
             "language": language,

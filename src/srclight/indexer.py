@@ -881,7 +881,7 @@ def _parse_jsonc(text: str) -> dict[str, object] | None:
 
 def _ordered_import_candidate_paths(base_path: str, specifier: str) -> list[str]:
     """Return likely TS/JS file paths for an import specifier base path."""
-    if any(specifier.endswith(ext) for ext in (".ts", ".tsx", ".js", ".jsx")):
+    if any(specifier.endswith(ext) for ext in (".ts", ".tsx", ".js", ".jsx", ".vue", ".mts", ".mjs")):
         return [base_path]
 
     return [
@@ -889,10 +889,16 @@ def _ordered_import_candidate_paths(base_path: str, specifier: str) -> list[str]
         f"{base_path}.tsx",
         f"{base_path}.js",
         f"{base_path}.jsx",
+        f"{base_path}.vue",
+        f"{base_path}.mts",
+        f"{base_path}.mjs",
         posixpath.join(base_path, "index.ts"),
         posixpath.join(base_path, "index.tsx"),
         posixpath.join(base_path, "index.js"),
         posixpath.join(base_path, "index.jsx"),
+        posixpath.join(base_path, "index.vue"),
+        posixpath.join(base_path, "index.mts"),
+        posixpath.join(base_path, "index.mjs"),
     ]
 
 
@@ -916,7 +922,7 @@ def _tsconfig_alias_rules(root_path_str: str) -> tuple[tuple[str, str, bool, tup
     root_path = Path(root_path_str)
 
     def _find_config_path(start_path: Path) -> Path | None:
-        for candidate_name in ("tsconfig.json", "jsconfig.json"):
+        for candidate_name in ("tsconfig.json", "jsconfig.json", "tsconfig.app.json", "tsconfig.base.json"):
             candidate_path = start_path / candidate_name
             if candidate_path.is_file():
                 return candidate_path
@@ -992,35 +998,59 @@ def _tsconfig_alias_rules(root_path_str: str) -> tuple[tuple[str, str, bool, tup
 
         compiler_options = parsed.get("compilerOptions")
         if not isinstance(compiler_options, dict):
-            return rules, effective_base_root, has_effective_base_url
-
-        raw_paths = compiler_options.get("paths")
-        if not isinstance(raw_paths, dict):
-            base_url = compiler_options.get("baseUrl")
-            if isinstance(base_url, str) and base_url.strip():
-                effective_base_root = posixpath.normpath(posixpath.join(config_dir, base_url))
-                has_effective_base_url = True
-            return rules, effective_base_root, has_effective_base_url
+            compiler_options = {}
 
         base_url = compiler_options.get("baseUrl")
         if isinstance(base_url, str) and base_url.strip():
             effective_base_root = posixpath.normpath(posixpath.join(config_dir, base_url))
             has_effective_base_url = True
 
-        base_root = effective_base_root if has_effective_base_url else config_dir
+        raw_paths = compiler_options.get("paths")
+        if isinstance(raw_paths, dict):
+            base_root = effective_base_root if has_effective_base_url else config_dir
 
-        for pattern, targets in raw_paths.items():
-            if not isinstance(pattern, str) or pattern.count("*") > 1:
-                continue
-            target_list = tuple(item for item in targets if isinstance(item, str)) if isinstance(targets, list) else ()
-            if not target_list:
-                continue
-            has_wildcard = "*" in pattern
-            if has_wildcard:
-                prefix, suffix = pattern.split("*", 1)
-            else:
-                prefix, suffix = pattern, ""
-            rules[(prefix, suffix, has_wildcard)] = (prefix, suffix, has_wildcard, target_list, base_root)
+            for pattern, targets in raw_paths.items():
+                if not isinstance(pattern, str) or pattern.count("*") > 1:
+                    continue
+                target_list = tuple(item for item in targets if isinstance(item, str)) if isinstance(targets, list) else ()
+                if not target_list:
+                    continue
+                has_wildcard = "*" in pattern
+                if has_wildcard:
+                    prefix, suffix = pattern.split("*", 1)
+                else:
+                    prefix, suffix = pattern, ""
+                rules[(prefix, suffix, has_wildcard)] = (prefix, suffix, has_wildcard, target_list, base_root)
+
+        references = parsed.get("references")
+        if isinstance(references, list):
+            for reference in references:
+                if not isinstance(reference, dict):
+                    continue
+                ref_path = reference.get("path")
+                if not isinstance(ref_path, str) or not ref_path.strip():
+                    continue
+                reference_root = config_path.parent / ref_path
+                reference_candidates: list[Path] = []
+                if reference_root.is_file():
+                    reference_candidates.append(reference_root)
+                else:
+                    reference_candidates.extend([
+                        reference_root / "tsconfig.json",
+                        reference_root / "jsconfig.json",
+                        reference_root.with_suffix(".json"),
+                        reference_root.with_suffix(".jsonc"),
+                    ])
+                for reference_candidate in reference_candidates:
+                    if not reference_candidate.is_file():
+                        continue
+                    child_rules, child_base_root, child_has_effective_base_url = _load_alias_rules(reference_candidate, seen)
+                    for key, value in child_rules.items():
+                        rules.setdefault(key, value)
+                    if not has_effective_base_url and child_has_effective_base_url:
+                        effective_base_root = child_base_root
+                        has_effective_base_url = True
+                    break
 
         return rules, effective_base_root, has_effective_base_url
 

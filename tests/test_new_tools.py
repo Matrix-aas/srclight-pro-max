@@ -736,6 +736,121 @@ import { SharedDto } from '@repo/shared';
         assert files["@/entities/coding/coding.schema"] == "apps/backend/src/entities/coding/coding.schema.ts"
         assert files["@repo/shared"] == "packages/shared/src/index.ts"
 
+    def test_server_find_imports_resolves_aliases_from_referenced_tsconfig(self, db, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        client_dir = repo / "client"
+        views_dir = client_dir / "src/views"
+        config_dir = client_dir / "src/config"
+        domain_dir = client_dir / "src/domain"
+        stores_dir = client_dir / "src/stores"
+        server_config_dir = repo / "server/src/config"
+        views_dir.mkdir(parents=True)
+        config_dir.mkdir(parents=True)
+        domain_dir.mkdir(parents=True)
+        stores_dir.mkdir(parents=True)
+        server_config_dir.mkdir(parents=True)
+
+        (client_dir / "tsconfig.json").write_text(
+            """\
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" }
+  ]
+}
+"""
+        )
+        (client_dir / "tsconfig.app.json").write_text(
+            """\
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+"""
+        )
+        (views_dir / "SoloView.ts").write_text(
+            """\
+import { gameConfig } from '@/config';
+import { boardDomain } from '@/domain/board';
+import { useAchievementsStore } from '@/stores/useAchievementsStore';
+"""
+        )
+        (config_dir / "index.ts").write_text("export const gameConfig = {};\n")
+        (server_config_dir / "index.ts").write_text("export const serverConfig = {};\n")
+        (domain_dir / "board.ts").write_text("export const boardDomain = {};\n")
+        (stores_dir / "useAchievementsStore.ts").write_text("export const useAchievementsStore = () => ({});\n")
+
+        _insert_file(db, "client/src/views/SoloView.ts", language="typescript")
+        _insert_file(db, "client/src/config/index.ts", language="typescript")
+        _insert_file(db, "server/src/config/index.ts", language="typescript")
+        _insert_file(db, "client/src/domain/board.ts", language="typescript")
+        _insert_file(db, "client/src/stores/useAchievementsStore.ts", language="typescript")
+        db.commit()
+
+        monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_repo_root", repo)
+
+        payload = json.loads(server.find_imports("client/src/views/SoloView.ts"))
+
+        assert payload["resolved_count"] == 3
+        files = {entry["module"]: entry["resolved_to"]["file"] for entry in payload["imports"]}
+        assert files["@/config"] == "client/src/config/index.ts"
+        assert files["@/domain/board"] == "client/src/domain/board.ts"
+        assert files["@/stores/useAchievementsStore"] == "client/src/stores/useAchievementsStore.ts"
+
+    def test_server_find_imports_extracts_vue_script_setup_imports(self, db, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        views_dir = repo / "client/src/views"
+        stores_dir = repo / "client/src/stores"
+        components_dir = repo / "client/src/components"
+        views_dir.mkdir(parents=True)
+        stores_dir.mkdir(parents=True)
+        components_dir.mkdir(parents=True)
+
+        (views_dir / "SoloView.vue").write_text(
+            """\
+<template><div /></template>
+<script setup lang="ts">
+import { useAchievementsStore } from '@/stores/useAchievementsStore'
+import GameBoard from '@/components/GameBoard.vue'
+</script>
+"""
+        )
+        (stores_dir / "useAchievementsStore.ts").write_text("export const useAchievementsStore = () => ({});\n")
+        (components_dir / "GameBoard.vue").write_text("<template><div>Board</div></template>\n")
+        (repo / "client/tsconfig.json").write_text(
+            """\
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+"""
+        )
+
+        _insert_file(db, "client/src/views/SoloView.vue", language="vue")
+        _insert_file(db, "client/src/stores/useAchievementsStore.ts", language="typescript")
+        _insert_file(db, "client/src/components/GameBoard.vue", language="vue")
+        db.commit()
+
+        monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_repo_root", repo)
+
+        payload = json.loads(server.find_imports("client/src/views/SoloView.vue"))
+
+        assert payload["language"] == "vue"
+        assert payload["resolved_count"] == 2
+        resolved_files = {item["module"]: item["resolved_to"]["file"] for item in payload["imports"]}
+        assert resolved_files["@/stores/useAchievementsStore"] == "client/src/stores/useAchievementsStore.ts"
+        assert resolved_files["@/components/GameBoard.vue"] == "client/src/components/GameBoard.vue"
+
 
 class TestFileNavigationTools:
     def test_list_files_returns_db_backed_results(self, db, monkeypatch):
@@ -1158,6 +1273,124 @@ def test_context_for_task_uses_hybrid_seed_fallback_for_natural_language(monkeyp
     assert payload["seeds"]
     assert payload["seeds"][0]["qualified_name"] == "AuthService.refreshSession"
     assert payload["seeds"][0]["reason"] == "matched hybrid search"
+
+
+def test_context_for_task_merges_hybrid_seeds_with_identifier_hits(monkeypatch, db, tmp_path):
+    service_file = _insert_file(
+        db,
+        path="apps/backend/src/auth.service.ts",
+        language="typescript",
+        line_count=120,
+    )
+    helper_file = _insert_file(
+        db,
+        path="apps/backend/src/oauth/register-provider.ts",
+        language="typescript",
+        line_count=80,
+    )
+
+    _insert_symbol(
+        db,
+        service_file,
+        "AuthService",
+        file_path="apps/backend/src/auth.service.ts",
+        kind="class",
+        start_line=1,
+        end_line=40,
+        qualified_name="AuthService",
+        content="class AuthService {}",
+    )
+    register_provider_id = _insert_symbol(
+        db,
+        helper_file,
+        "registerProvider",
+        file_path="apps/backend/src/oauth/register-provider.ts",
+        kind="function",
+        start_line=12,
+        end_line=32,
+        qualified_name="registerProvider",
+        content="registerProvider(provider: OAuthProviderDef) {}",
+    )
+    _insert_symbol(
+        db,
+        helper_file,
+        "OAuthProviderDef",
+        file_path="apps/backend/src/oauth/register-provider.ts",
+        kind="interface",
+        start_line=1,
+        end_line=10,
+        qualified_name="OAuthProviderDef",
+        content="interface OAuthProviderDef { provider: string }",
+    )
+    db.commit()
+
+    hybrid_calls: list[tuple[str, int]] = []
+
+    def _fake_hybrid_seed_candidates(db_obj, task, seed_limit):
+        hybrid_calls.append((task, seed_limit))
+        sym = db_obj.get_symbol_by_id(register_provider_id)
+        return [(28, sym, "matched hybrid search")]
+
+    monkeypatch.setattr(task_context, "_hybrid_seed_candidates", _fake_hybrid_seed_candidates)
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_repo_root", tmp_path)
+
+    payload = json.loads(server.context_for_task("fix OAuth login in AuthService", budget="small"))
+
+    qualified_names = {item["qualified_name"] for item in payload["seeds"]}
+    assert hybrid_calls == [("fix OAuth login in AuthService", 4)]
+    assert "AuthService" in qualified_names
+    assert "registerProvider" in qualified_names
+    assert any("hybrid retrieval" in reason for reason in payload["why_these_results"])
+
+
+def test_context_for_task_prefers_code_symbols_over_docs_for_literal_seed_matches(monkeypatch, db, tmp_path):
+    code_file = _insert_file(
+        db,
+        path="apps/backend/src/oauth/register-provider.ts",
+        language="typescript",
+        line_count=80,
+    )
+    docs_file = _insert_file(
+        db,
+        path="docs/ARCHITECTURE.md",
+        language="markdown",
+        line_count=120,
+    )
+
+    _insert_symbol(
+        db,
+        code_file,
+        "OAuthProviderDef",
+        file_path="apps/backend/src/oauth/register-provider.ts",
+        kind="interface",
+        start_line=1,
+        end_line=10,
+        qualified_name="OAuthProviderDef",
+        content="interface OAuthProviderDef { provider: string }",
+    )
+    _insert_symbol(
+        db,
+        docs_file,
+        "ARCHITECTURE > OAuth provider system",
+        file_path="docs/ARCHITECTURE.md",
+        kind="section",
+        start_line=1,
+        end_line=6,
+        qualified_name="ARCHITECTURE > OAuth provider system",
+        content="OAuth provider system overview",
+    )
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_repo_root", tmp_path)
+
+    payload = json.loads(server.context_for_task("Add OAuth provider for VK login", budget="small"))
+
+    assert payload["seeds"]
+    assert payload["seeds"][0]["qualified_name"] == "OAuthProviderDef"
 
 
 def test_context_for_task_identifier_candidates_skip_generic_task_verbs():

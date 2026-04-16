@@ -940,6 +940,232 @@ def test_codebase_map_enriches_indexed_frontend_repo_with_start_here(tmp_path, m
     assert any(item["path"] == "app/stores/auth.ts" for item in payload["start_here"])
 
 
+def test_codebase_map_balances_frontend_heavy_fullstack_orientation_from_indexed_hints(tmp_path, monkeypatch):
+    repo = tmp_path / "mean-like-app"
+    (repo / ".srclight").mkdir(parents=True)
+    (repo / ".git").mkdir()
+    (repo / "client/src/views").mkdir(parents=True)
+    (repo / "client/src/render").mkdir(parents=True)
+    (repo / "server/src/http").mkdir(parents=True)
+    (repo / "shared/src/db").mkdir(parents=True)
+
+    (repo / "package.json").write_text(json.dumps({
+        "private": True,
+        "workspaces": ["client", "server"],
+    }))
+    (repo / "client/package.json").write_text(json.dumps({
+        "dependencies": {
+            "vue": "^3.5.0",
+            "three": "^0.175.0",
+        },
+        "devDependencies": {
+            "vite": "^6.0.0",
+        },
+    }))
+    (repo / "server/package.json").write_text(json.dumps({
+        "dependencies": {
+            "elysia": "^1.0.0",
+            "drizzle-orm": "^0.40.0",
+        },
+    }))
+    (repo / "vite.config.ts").write_text("export default defineConfig({})\n")
+    (repo / "client/src/main.ts").write_text("createApp(App).mount('#app')\n")
+    (repo / "client/src/views/SoloView.vue").write_text("<template>Solo</template>\n")
+    (repo / "client/src/render/BoardRenderer3D.ts").write_text("export class BoardRenderer3D {}\n")
+    (repo / "server/src/http/auth-link.ts").write_text("export const authLink = () => ({})\n")
+    (repo / "shared/src/db/schema.ts").write_text("export const schema = {};\n")
+    (repo / ".srclight/index.db").write_text("not-empty")
+
+    class _FakeRepoBriefDB:
+        def stats(self):
+            return {
+                "files": 462,
+                "symbols": 1574,
+                "edges": 756,
+                "db_size_mb": 18.4,
+                "languages": {"typescript": 290, "vue": 145},
+                "symbol_kinds": {"function": 500, "component": 120, "class": 90},
+            }
+
+        def get_index_state(self, repo_root):
+            return {
+                "repo_root": repo_root,
+                "last_commit": "abc123",
+                "indexed_at": "2026-04-16T01:00:00Z",
+            }
+
+        def directory_summary(self, max_depth=2):
+            return [
+                {"path": "client", "files": 245, "symbols": 910, "languages": ["typescript", "vue"]},
+                {"path": "server", "files": 133, "symbols": 410, "languages": ["typescript"]},
+                {"path": "shared", "files": 84, "symbols": 254, "languages": ["typescript"]},
+                *[
+                    {"path": f"client/src/feature{i}", "files": i + 1, "symbols": i + 2, "languages": ["typescript"]}
+                    for i in range(12)
+                ],
+            ]
+
+        def hotspot_files(self, limit=10):
+            hotspots = [
+                {"path": "client/src/views/SoloView.vue", "language": "vue", "lines": 180, "symbols": 15},
+                {"path": "client/src/render/BoardRenderer3D.ts", "language": "typescript", "lines": 320, "symbols": 14},
+                {"path": "server/src/http/auth-link.ts", "language": "typescript", "lines": 90, "symbols": 9},
+                {"path": "shared/src/db/schema.ts", "language": "typescript", "lines": 70, "symbols": 6},
+            ]
+            return hotspots[:limit]
+
+        def orientation_files(self, limit=100):
+            return [
+                {
+                    "path": "client/src/main.ts",
+                    "language": "typescript",
+                    "size": 200,
+                    "line_count": 20,
+                    "summary": "Vue 3 + Vite client bootstrap.",
+                    "metadata": {"framework": "vue", "resource": "bootstrap"},
+                    "top_level_symbols": [{"name": "mountApp", "kind": "function"}],
+                },
+                {
+                    "path": "client/src/views/SoloView.vue",
+                    "language": "vue",
+                    "size": 800,
+                    "line_count": 180,
+                    "summary": "Gameplay view with Three scene controls and board renderer.",
+                    "metadata": {"framework": "vue", "resource": "route"},
+                    "top_level_symbols": [{"name": "SoloView", "kind": "component"}],
+                },
+                {
+                    "path": "client/src/render/BoardRenderer3D.ts",
+                    "language": "typescript",
+                    "size": 1200,
+                    "line_count": 320,
+                    "summary": "Three.js renderer for gameplay board scenes.",
+                    "metadata": {"framework": "three", "resource": "renderer"},
+                    "top_level_symbols": [{"name": "BoardRenderer3D", "kind": "class"}],
+                },
+                {
+                    "path": "server/src/http/auth-link.ts",
+                    "language": "typescript",
+                    "size": 300,
+                    "line_count": 90,
+                    "summary": "Elysia auth route handlers.",
+                    "metadata": {"framework": "elysia", "resource": "route", "route_path": "/auth/link", "http_method": "GET"},
+                    "top_level_symbols": [{"name": "authLink", "kind": "route_handler"}],
+                },
+                {
+                    "path": "shared/src/db/schema.ts",
+                    "language": "typescript",
+                    "size": 220,
+                    "line_count": 70,
+                    "summary": "Drizzle schema and persistence metadata.",
+                    "metadata": {"framework": "drizzle", "resource": "schema"},
+                    "top_level_symbols": [{"name": "matchSchema", "kind": "schema"}],
+                },
+            ][:limit]
+
+        def orientation_symbols(self, limit=200):
+            return [
+                {
+                    "kind": "function",
+                    "name": "mountApp",
+                    "signature": "function mountApp()",
+                    "file_path": "client/src/main.ts",
+                    "metadata": {"framework": "vue", "resource": "bootstrap"},
+                },
+                {
+                    "kind": "component",
+                    "name": "SoloView",
+                    "signature": "component SoloView",
+                    "file_path": "client/src/views/SoloView.vue",
+                    "metadata": {"framework": "vue", "resource": "route"},
+                },
+                {
+                    "kind": "class",
+                    "name": "BoardRenderer3D",
+                    "signature": "class BoardRenderer3D",
+                    "file_path": "client/src/render/BoardRenderer3D.ts",
+                    "metadata": {"framework": "three", "resource": "renderer"},
+                },
+                {
+                    "kind": "route_handler",
+                    "name": "authLink",
+                    "signature": "GET /auth/link",
+                    "file_path": "server/src/http/auth-link.ts",
+                    "metadata": {"framework": "elysia", "resource": "route", "route_path": "/auth/link", "http_method": "GET"},
+                },
+                {
+                    "kind": "schema",
+                    "name": "matchSchema",
+                    "signature": "const matchSchema",
+                    "file_path": "shared/src/db/schema.ts",
+                    "metadata": {"framework": "drizzle", "resource": "schema"},
+                },
+            ][:limit]
+
+    _reset_single_repo_server_state(monkeypatch, repo_root=repo)
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeRepoBriefDB())
+    monkeypatch.setattr(server, "_read_index_signal", lambda root: {"timestamp": "2026-04-16T01:02:00Z"})
+
+    payload = json.loads(server.codebase_map())
+
+    signals = set(payload["framework_hints"]["signals"])
+    start_paths = [item["path"] for item in payload["start_here"]]
+
+    assert payload["framework_hints"]["app_type"] == "fullstack"
+    assert {"vue", "vite", "three", "elysia", "drizzle"} <= signals
+    assert "client/src/main.ts" in start_paths
+    assert any(path.startswith("client/src/") for path in start_paths[:4])
+    assert any(path.startswith("server/src/") for path in start_paths[:6])
+    assert "client (245 files)" in payload["brief"]
+    assert payload["topology"]["frontend"]["files"][0] == "client/src/main.ts"
+
+
+def test_codebase_map_uses_workspace_package_roots_for_generic_frontend_backend_discovery(tmp_path, monkeypatch):
+    repo = tmp_path / "workspace-oriented-app"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "apps/web/src/views").mkdir(parents=True)
+    (repo / "apps/api/src/http").mkdir(parents=True)
+    (repo / "packages/shared/src").mkdir(parents=True)
+
+    (repo / "package.json").write_text(json.dumps({
+        "private": True,
+        "workspaces": ["apps/*", "packages/*"],
+    }))
+    (repo / "apps/web/package.json").write_text(json.dumps({
+        "dependencies": {"vue": "^3.5.0"},
+        "devDependencies": {"vite": "^6.0.0"},
+    }))
+    (repo / "apps/api/package.json").write_text(json.dumps({
+        "dependencies": {"elysia": "^1.0.0"},
+    }))
+    (repo / "apps/web/vite.config.ts").write_text("export default defineConfig({})\n")
+    (repo / "apps/web/src/main.ts").write_text("createApp(App).mount('#app')\n")
+    (repo / "apps/web/src/views/HomeView.vue").write_text("<template>Home</template>\n")
+    (repo / "apps/api/src/http/routes.ts").write_text("new Elysia()\n")
+    (repo / "packages/shared/src/index.ts").write_text("export const shared = true;\n")
+
+    monkeypatch.chdir(repo)
+    _reset_single_repo_server_state(monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: (_ for _ in ()).throw(sqlite3.OperationalError("unable to open database file")),
+    )
+
+    payload = json.loads(server.codebase_map())
+
+    signals = set(payload["framework_hints"]["signals"])
+    start_paths = [item["path"] for item in payload["start_here"]]
+
+    assert payload["bootstrap_mode"] == "filesystem_only"
+    assert payload["framework_hints"]["app_type"] == "fullstack"
+    assert {"vue", "vite", "elysia"} <= signals
+    assert "apps/web/src/main.ts" in payload["representative_files"]["entrypoints"]
+    assert "apps/api/src/http/routes.ts" in payload["representative_files"]["backend"]
+    assert "apps/web/src/main.ts" in start_paths
+    assert "apps/api/src/http/routes.ts" in start_paths
+
+
 def test_codebase_map_surfaces_nitro_server_files_for_indexed_and_unindexed_repos(tmp_path, monkeypatch):
     repo = tmp_path / "nuxt-nitro-app"
     (repo / ".git").mkdir(parents=True)

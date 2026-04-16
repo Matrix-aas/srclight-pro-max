@@ -563,6 +563,60 @@ def test_fallback_hint_suggests_tokenized_identifier_search(monkeypatch, db):
     )
 
 
+def test_graph_tools_resolve_case_insensitive_exact_symbol_names(monkeypatch, db):
+    file_id = db.upsert_file(
+        FileRecord(
+            path="shared/src/domain/match.ts",
+            content_hash="shared/src/domain/match.ts",
+            mtime=1.0,
+            language="typescript",
+            size=120,
+            line_count=12,
+        )
+    )
+    match_resolution = db.insert_symbol(
+        SymbolRecord(
+            file_id=file_id,
+            kind="type_alias",
+            name="MatchResolution",
+            qualified_name="shared.MatchResolution",
+            start_line=1,
+            end_line=3,
+            content="export type MatchResolution = 'valid' | 'invalid'",
+            line_count=3,
+        ),
+        "shared/src/domain/match.ts",
+    )
+    matcher = db.insert_symbol(
+        SymbolRecord(
+            file_id=file_id,
+            kind="function",
+            name="resolveMatch",
+            qualified_name="shared.resolveMatch",
+            start_line=5,
+            end_line=10,
+            content="function resolveMatch(): MatchResolution { return 'valid'; }",
+            line_count=6,
+        ),
+        "shared/src/domain/match.ts",
+    )
+    db.insert_edge(EdgeRecord(
+        source_id=matcher,
+        target_id=match_resolution,
+        edge_type="uses_type",
+    ))
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_dependents("matchResolution"))
+
+    assert payload["symbol"] == "matchResolution"
+    assert payload["dependent_count"] == 1
+    assert payload["dependents"][0]["name"] == "resolveMatch"
+
+
 def test_search_symbols_preserves_source_while_adding_rank_hints(monkeypatch, db):
     _insert_search_symbol(
         db,
@@ -715,8 +769,82 @@ def test_get_communities_recomputes_label_and_keywords_for_filtered_members(monk
     assert communities["communities"]
     filtered = communities["communities"][0]
     assert filtered["member_count"] == 2
-    assert filtered["label"] == "Render Scene Sprite"
+    assert filtered["label"].startswith("Render")
     assert filtered["keywords"][:2] == ["render", "scene"]
+    assert filtered["scope_hint"] == "server"
+    assert "function" in filtered["dominant_kinds"]
+
+
+def test_get_communities_recomputes_scope_hints_without_filters(monkeypatch, db):
+    render_file = db.upsert_file(
+        FileRecord(
+            path="client/src/render/three/BoardRenderer3D.ts",
+            content_hash="client/src/render/three/BoardRenderer3D.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    gameplay_file = db.upsert_file(
+        FileRecord(
+            path="client/src/features/game/useGameSession.ts",
+            content_hash="client/src/features/game/useGameSession.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    renderer = db.insert_symbol(
+        SymbolRecord(
+            file_id=render_file,
+            kind="class",
+            name="BoardRenderer3D",
+            qualified_name="client.render.BoardRenderer3D",
+            start_line=1,
+            end_line=10,
+            content="class BoardRenderer3D {}",
+            line_count=10,
+        ),
+        "client/src/render/three/BoardRenderer3D.ts",
+    )
+    use_game_session = db.insert_symbol(
+        SymbolRecord(
+            file_id=gameplay_file,
+            kind="function",
+            name="useGameSession",
+            qualified_name="client.features.useGameSession",
+            start_line=1,
+            end_line=8,
+            content="function useGameSession() {}",
+            line_count=8,
+        ),
+        "client/src/features/game/useGameSession.ts",
+    )
+    db.store_communities([
+        {
+            "id": 0,
+            "label": "unnamed",
+            "symbol_count": 2,
+            "cohesion": 0.1,
+            "keywords": [],
+            "members": [
+                {"id": renderer, "name": "BoardRenderer3D", "qualified_name": "client.render.BoardRenderer3D", "kind": "class"},
+                {"id": use_game_session, "name": "useGameSession", "qualified_name": "client.features.useGameSession", "kind": "function"},
+            ],
+        },
+    ])
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_communities())
+    community = payload["communities"][0]
+
+    assert community["scope_hint"] in {"client/src/render", "client/src/features"}
+    assert any(token in community["keywords"] for token in ("render", "game"))
 
 
 def test_graph_adjacent_tools_surface_ambiguity_for_same_name_symbols(monkeypatch, db):

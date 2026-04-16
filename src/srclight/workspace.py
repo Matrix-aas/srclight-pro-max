@@ -458,7 +458,7 @@ class WorkspaceDB:
             return summaries[0]
         return summaries
 
-    def codebase_map(self, project: str | None = None) -> dict[str, Any]:
+    def codebase_map(self, project: str | None = None, *, verbose: bool = False) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None
 
@@ -574,6 +574,7 @@ class WorkspaceDB:
                     "topology": topology,
                     "start_here": start_here,
                     "brief": _build_repo_brief(framework_hints, start_here, indexed=True),
+                    "compact": not verbose,
                 })
 
         return result
