@@ -534,6 +534,7 @@ Some Claude Code builds still fail to expose MCP tools to custom agents defined 
 2. Run `ToolSearch("srclight")` before the first `mcp__srclight__*` call.
 3. For file navigation, prefer `list_files(...)` to find candidates, `get_file_summary(...)` for a quick brief, and `symbols_in_file(...)` when you need the file outline before opening sections.
 4. For backend repos, prefer `api_surface(...)` when you want the indexed endpoint inventory before opening controllers or routers.
+5. For a concrete coding task, prefer `context_for_task(...)` before assembling 4-5 separate calls by hand.
 5. For raw literal or regex-style checks, prefer `find_pattern(...)` before falling back to Grep.
 6. Install `srclight hook install-agent` if you want Claude Code to deny Grep/Glob and push agents toward srclight-first workflows.
 7. If your client build still blocks MCP in custom agents, use `general-purpose` as the fallback `subagent_type`.
@@ -571,6 +572,7 @@ Task(
   | mcp__srclight__list_files(path_prefix, project) | Find candidate files in an area |
   | mcp__srclight__get_file_summary(path, project) | Quick file brief and top-level symbols |
   | mcp__srclight__api_surface(path_prefix, project) | Indexed HTTP/API endpoint inventory |
+  | mcp__srclight__context_for_task(task, project, budget) | Budget-aware task packet with symbols, files, API, tests, and next steps |
   | mcp__srclight__symbols_in_file(path, project) | Widget/class outline |
   | mcp__srclight__get_callers(symbol, project)    | Consistency checks |
   | mcp__srclight__get_community(symbol, project)   | Ownership / module lookup |
@@ -578,7 +580,7 @@ Task(
   | mcp__srclight__get_execution_flows(project)     | Summary view of execution paths |
   | mcp__srclight__search_symbols(query, project)  | Find exact names |
 
-  Workflow: start with list_files to find the right path, use get_file_summary for a fast brief, call api_surface when you need the backend endpoint inventory, then symbols_in_file only when you need the outline. Keep get_communities and get_execution_flows in summary mode first; pass verbose=true only when you need member-by-member or step-by-step detail. If get_community misses, follow the next_step hint before falling back to Grep.
+  Workflow: start with list_files to find the right path, use get_file_summary for a fast brief, call api_surface when you need the backend endpoint inventory, then symbols_in_file only when you need the outline. If the user already gave you a concrete change request, call context_for_task first and let it pull the seed symbols/files/tests/API surface into one compact packet. Keep get_communities and get_execution_flows in summary mode first; pass verbose=true only when you need member-by-member or step-by-step detail. Use detect_changes(compact=True) when you only need a lightweight impact summary. If get_community misses, follow the next_step hint before falling back to Grep.
   Use get_callers to verify token usage consistency. Use find_pattern for
   raw Color literals, bare EdgeInsets, and other literal pattern violations
   before falling back to Grep.

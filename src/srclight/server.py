@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 from .db import Database, tokenized_query_hint
 from .embeddings import DEFAULT_OLLAMA_EMBED_MODEL
 from .indexer import IndexConfig, Indexer
+from .output_shapes import shape_compact_changed_symbols, shape_compact_symbol_matches
 
 logger = logging.getLogger("srclight.server")
 
@@ -1916,24 +1917,7 @@ def get_symbol(name: str, project: str | None = None) -> str:
         if not results:
             return _symbol_not_found_error(name, project)
         if len(results) > compact_threshold:
-            return json.dumps({
-                "match_count": len(results),
-                "compact": True,
-                "hint": "Too many exact matches. Use get_signature(), symbols_in_file(), or search by qualified name/file.",
-                "symbols": [
-                    {
-                        "project": r.get("project"),
-                        "name": r.get("name"),
-                        "qualified_name": r.get("qualified_name"),
-                        "kind": r.get("kind"),
-                        "signature": r.get("signature"),
-                        "file": r.get("file"),
-                        "start_line": r.get("start_line"),
-                        "doc_comment": r.get("doc_comment"),
-                    }
-                    for r in results
-                ],
-            }, indent=2)
+            return json.dumps(shape_compact_symbol_matches(results), indent=2)
         if len(results) == 1:
             return json.dumps(results[0], indent=2)
         return json.dumps({"match_count": len(results), "symbols": results}, indent=2)
@@ -1944,15 +1928,10 @@ def get_symbol(name: str, project: str | None = None) -> str:
         return _symbol_not_found_error(name)
 
     if len(symbols) > compact_threshold:
-        return json.dumps({
-            "match_count": len(symbols),
-            "compact": True,
-            "hint": "Too many exact matches. Use get_signature(), symbols_in_file(), or search by qualified name/file.",
-            "symbols": [
-                _symbol_to_dict(sym)
-                for sym in symbols
-            ],
-        }, indent=2)
+        return json.dumps(
+            shape_compact_symbol_matches([_symbol_to_dict(sym) for sym in symbols]),
+            indent=2,
+        )
 
     if len(symbols) == 1:
         sym = symbols[0]
@@ -2247,6 +2226,51 @@ def api_surface(
         "endpoint_count": len(endpoints),
         "endpoints": endpoints,
     }, indent=2)
+
+
+@mcp.tool()
+def context_for_task(
+    task: str,
+    project: str | None = None,
+    budget: str = "medium",
+) -> str:
+    """Build a compact task-oriented context packet for the next coding step.
+
+    Args:
+        task: Natural language task description
+        project: Project name in workspace mode
+        budget: One of small, medium, or large
+    """
+    from .task_context import build_task_context
+
+    if budget not in {"small", "medium", "large"}:
+        return json.dumps({
+            "error": f"Unsupported budget '{budget}'",
+            "available_budgets": ["small", "medium", "large"],
+        }, indent=2)
+
+    if _is_workspace_mode():
+        if not project:
+            return _project_required_error("context_for_task")
+        from .workspace import WorkspaceConfig
+        config = WorkspaceConfig.load(_workspace_name)
+        path = config.projects.get(project)
+        if not path:
+            return _project_not_found_error(project)
+        db_path = Path(path) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        db = Database(db_path)
+        db.open()
+        try:
+            payload = build_task_context(db, task, budget=budget)
+        finally:
+            db.close()
+        payload["project"] = project
+        return json.dumps(payload, indent=2)
+
+    payload = build_task_context(_get_db(), task, budget=budget)
+    return json.dumps(payload, indent=2)
 
 
 # --- Tier 2: Graph tools ---
@@ -4404,6 +4428,7 @@ def _reconstruct_flows(db: Database, stored_flows: list[dict]) -> list[dict]:
 def detect_changes(
     ref: str | None = None,
     project: str | None = None,
+    compact: bool = False,
 ) -> str:
     """Detect which symbols were changed and compute their aggregate blast radius.
 
@@ -4507,6 +4532,7 @@ def detect_changes(
         impact = compute_impact(db, sym_info["id"], sym_to_comm, flow_dicts)
         sym_info["risk"] = impact["risk"]
         sym_info["direct_dependents"] = impact["direct_dependents"]
+        sym_info["transitive_dependents"] = impact["transitive_dependents"]
         sym_info["affected_flows"] = impact["affected_flows"]
         symbol_impacts.append(sym_info)
 
@@ -4523,16 +4549,23 @@ def detect_changes(
     # Sort by risk descending
     symbol_impacts.sort(key=lambda s: risk_order.get(s["risk"], 0), reverse=True)
 
+    changed_symbols_payload: list[dict[str, Any]]
+    if compact:
+        changed_symbols_payload = shape_compact_changed_symbols(symbol_impacts)
+    else:
+        changed_symbols_payload = symbol_impacts
+
     return json.dumps({
         "project": project,
         "ref": ref or "HEAD (uncommitted)",
+        "compact": compact,
         "overall_risk": max_risk,
-        "changed_symbol_count": len(symbol_impacts),
+        "changed_symbol_count": len(changed_symbols_payload),
         "total_direct_dependents": total_direct,
         "total_transitive_dependents": total_transitive,
         "communities_affected": len(all_affected_comms),
         "flows_affected": len(all_affected_flows),
-        "changed_symbols": symbol_impacts,
+        "changed_symbols": changed_symbols_payload,
     }, indent=2)
 
 

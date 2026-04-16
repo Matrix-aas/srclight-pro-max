@@ -2231,6 +2231,83 @@ export class CodingModule {}
     assert "SuggestedDescriptionService" in callers
 
 
+def test_member_access_call_edges_distinguish_service_methods_from_model_helpers(db, tmp_path):
+    project = tmp_path / "member-access-project"
+    (project / "server/src/modules/coding").mkdir(parents=True)
+
+    (project / "server/src/modules/coding/block.service.ts").write_text('''\
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class BlockService {
+  findOne() {
+    return { id: 1 };
+  }
+}
+''')
+
+    (project / "server/src/modules/coding/coding.service.ts").write_text('''\
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class CodingService {
+  findOne() {
+    return { id: 1 };
+  }
+
+  loadCoding() {
+    return this.codingModel.findOne({ _id: 1 });
+  }
+}
+''')
+
+    (project / "server/src/modules/coding/suggested-description.service.ts").write_text('''\
+import { Injectable } from '@nestjs/common';
+import { CodingService } from './coding.service';
+
+@Injectable()
+export class SuggestedDescriptionService {
+  constructor(private readonly coding: CodingService) {}
+
+  describe() {
+    return this.coding.findOne();
+  }
+}
+''')
+
+    (project / "server/src/modules/coding/coding.module.ts").write_text('''\
+import { Module } from '@nestjs/common';
+import { BlockService } from './block.service';
+import { CodingService } from './coding.service';
+import { SuggestedDescriptionService } from './suggested-description.service';
+
+@Module({
+  providers: [BlockService, CodingService, SuggestedDescriptionService],
+  exports: [BlockService, CodingService, SuggestedDescriptionService],
+})
+export class CodingModule {}
+''')
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    load_coding = next(
+        sym for sym in db.symbols_in_file("server/src/modules/coding/coding.service.ts")
+        if sym.name == "loadCoding"
+    )
+    describe = next(
+        sym for sym in db.symbols_in_file("server/src/modules/coding/suggested-description.service.ts")
+        if sym.name == "describe"
+    )
+
+    load_callee_names = [item["symbol"].qualified_name or item["symbol"].name for item in db.get_callees(load_coding.id)]
+    describe_callee_names = [item["symbol"].qualified_name or item["symbol"].name for item in db.get_callees(describe.id)]
+
+    assert "BlockService.findOne" not in load_callee_names
+    assert "CodingService.findOne" not in load_callee_names
+    assert "CodingService.findOne" in describe_callee_names
+
+
 def test_monorepo_runtime_boundaries_prevent_cross_app_dependents(monkeypatch, db, tmp_path):
     project = tmp_path / "runtime-boundaries"
     (project / "apps/frontend/src").mkdir(parents=True)

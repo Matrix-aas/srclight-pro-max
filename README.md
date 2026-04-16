@@ -56,6 +56,7 @@ Instead of doing twenty random `rg` calls and reading half the repo just to find
 - `list_files()`
 - `get_file_summary()`
 - `api_surface()`
+- `context_for_task()`
 - `search_symbols()`
 - `hybrid_search()`
 - `get_symbol()`
@@ -70,7 +71,7 @@ Instead of doing twenty random `rg` calls and reading half the repo just to find
 - `recent_changes()`
 - `git_hotspots()`
 
-For file navigation, the usual low-token path is `list_files()` to find candidates, `get_file_summary()` to get a fast brief, and `symbols_in_file()` when you want the file outline before opening anything. When you need backend surface area, `api_surface()` gives you a compact route inventory without grepping controllers and routers by hand. Graph tools stay summary-first by default; pass `verbose=true` only when you need detailed community membership or step-by-step flow traces. `get_community()` also has file-aware fallback behavior, so a miss can still point you to the nearest symbol or a useful file candidate.
+For file navigation, the usual low-token path is `list_files()` to find candidates, `get_file_summary()` to get a fast brief, and `symbols_in_file()` when you want the file outline before opening anything. When you need backend surface area, `api_surface()` gives you a compact route inventory without grepping controllers and routers by hand. If you already know the change you want to make, `context_for_task()` can assemble the task seed, primary symbols/files, nearby API/tests/types, and next steps in one shot. Graph tools stay summary-first by default; pass `verbose=true` only when you need detailed community membership or step-by-step flow traces. `detect_changes(compact=True)` is the cheap impact snapshot when you want blast radius without the full JSON wall. `get_community()` also has file-aware fallback behavior, so a miss can still point you to the nearest symbol or a useful file candidate.
 
 ## Architecture
 

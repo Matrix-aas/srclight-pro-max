@@ -2050,6 +2050,71 @@ def test_workspace_get_execution_flows_supports_verbose_depth_and_filters(
     assert all(step["file_path"].startswith("server/") for step in verbose["flows"][0]["steps"])
 
 
+def test_workspace_context_for_task_requires_project_and_returns_context(
+    tmp_path, ws_dir, monkeypatch
+):
+    project_dir = _create_indexed_project(tmp_path, "taskproj", [
+        {
+            "name": "updateDescription",
+            "kind": "method",
+            "path": "apps/backend/src/coding.service.ts",
+            "signature": "updateDescription(dto: CodingDocument)",
+            "content": "updateDescription dto validate save",
+        },
+        {
+            "name": "patchCodingDescription",
+            "kind": "route_handler",
+            "path": "apps/backend/src/coding.controller.ts",
+            "signature": "PATCH /coding/:id/description",
+            "content": "patchCodingDescription updateDescription",
+            "metadata": {
+                "framework": "nestjs",
+                "resource": "route_handler",
+                "http_method": "PATCH",
+                "route_path": "/coding/:id/description",
+                "route_prefix": "/coding",
+            },
+        },
+    ])
+
+    db_path = project_dir / ".srclight" / "index.db"
+    db = Database(db_path)
+    db.open()
+    try:
+        symbols = {sym.name: sym for sym in db.get_symbols_by_name("updateDescription") + db.get_symbols_by_name("patchCodingDescription")}
+        db.insert_edge(EdgeRecord(
+            source_id=symbols["patchCodingDescription"].id,
+            target_id=symbols["updateDescription"].id,
+            edge_type="calls",
+            confidence=0.9,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    config = WorkspaceConfig(name="workspace-context-task")
+    config.add_project("taskproj", str(project_dir))
+    config.save()
+
+    monkeypatch.setattr(server, "_workspace_name", "workspace-context-task")
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: True)
+
+    missing = json.loads(server.context_for_task("add validation to updateDescription"))
+    payload = json.loads(
+        server.context_for_task(
+            "add validation to updateDescription",
+            project="taskproj",
+            budget="small",
+        )
+    )
+
+    assert "project" in missing["error"]
+    assert payload["project"] == "taskproj"
+    assert payload["budget"] == "small"
+    assert payload["primary_symbols"]
+    assert payload["primary_symbols"][0]["name"] == "updateDescription"
+
+
 def test_workspace_task7_paths_do_not_retain_project_db_handles_over_max_attach(
     tmp_path, ws_dir, monkeypatch
 ):

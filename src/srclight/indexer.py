@@ -587,6 +587,20 @@ def _extract_module_names_from_array(text: str, key: str) -> list[str]:
     return sorted(set(names))
 
 
+def _extract_factory_refs_from_module_providers(text: str) -> list[str]:
+    """Recover named Nest useFactory references from a module providers array."""
+    entries = _extract_object_array_entries(text, "providers")
+    if not entries:
+        return []
+
+    refs: list[str] = []
+    for entry in entries:
+        match = re.search(r"\buseFactory\s*:\s*([A-Za-z_$][\w$]*)\b", entry)
+        if match:
+            refs.append(match.group(1))
+    return sorted(set(refs))
+
+
 def _extract_config_refs_from_module_imports(text: str, local_module_names: set[str]) -> list[str]:
     """Recover config factory identifiers passed through Nest ConfigModule imports."""
     entries = _extract_object_array_entries(text, "imports")
@@ -2377,6 +2391,7 @@ def _build_nest_symbol_overrides(
                 providers = _extract_identifiers_from_array(decorator_text, "providers")
                 controllers = _extract_identifiers_from_array(decorator_text, "controllers")
                 exports = _extract_identifiers_from_array(decorator_text, "exports")
+                factory_refs = _extract_factory_refs_from_module_providers(decorator_text)
                 config_refs = _extract_config_refs_from_module_imports(
                     decorator_text,
                     _local_names_for_import(nest_config_imports, "ConfigModule"),
@@ -2396,6 +2411,7 @@ def _build_nest_symbol_overrides(
                         "providers": providers,
                         "controllers": controllers,
                         "exports": exports,
+                        "factory_refs": factory_refs,
                         "config_refs": config_refs,
                         "mikroorm_root_entities": mikroorm_root_entities,
                         "mikroorm_feature_entities": mikroorm_feature_entities,
@@ -3261,6 +3277,51 @@ def _kind_from_capture(capture_name: str) -> str:
         "view": "view",
     }
     return mapping.get(prefix, "unknown")
+
+
+def _visibility_from_capture(capture_name: str) -> str | None:
+    """Infer symbol visibility from tree-sitter capture names."""
+    prefix = capture_name.split(".")[0]
+    if prefix.startswith("export_"):
+        return "export"
+    return None
+
+
+def _append_raw_symbol(
+    raw_symbols: list[tuple[Node, str, str | None, str | None]],
+    def_node: Node,
+    kind: str,
+    symbol_name: str | None,
+    visibility: str | None,
+) -> None:
+    """Append a raw symbol, merging duplicate export/non-export captures.
+
+    TypeScript export queries can capture both the enclosing export statement
+    and the inner declaration. Treat those as the same logical symbol, prefer
+    the narrower declaration node for content/signature, and preserve export
+    visibility when either capture carries it.
+    """
+    for index, (existing_node, existing_kind, existing_name, existing_visibility) in enumerate(raw_symbols):
+        if existing_kind != kind or existing_name != symbol_name:
+            continue
+        if (
+            existing_node.end_point == def_node.end_point
+            and (
+                existing_node.start_point == def_node.start_point
+                or (
+                    existing_node.start_byte <= def_node.start_byte <= def_node.end_byte <= existing_node.end_byte
+                )
+                or (
+                    def_node.start_byte <= existing_node.start_byte <= existing_node.end_byte <= def_node.end_byte
+                )
+            )
+        ):
+            preferred_node = existing_node
+            if (def_node.end_byte - def_node.start_byte) < (existing_node.end_byte - existing_node.start_byte):
+                preferred_node = def_node
+            raw_symbols[index] = (preferred_node, kind, symbol_name, existing_visibility or visibility)
+            return
+    raw_symbols.append((def_node, kind, symbol_name, visibility))
 
 
 def _get_enclosing_scope(node: Node) -> list[str]:
@@ -4720,16 +4781,18 @@ class Indexer:
             cursor = QueryCursor(query)
             matches = cursor.matches(root)
 
-            raw_symbols: list[tuple[Node, str, str | None]] = []
+            raw_symbols: list[tuple[Node, str, str | None, str | None]] = []
             for _pattern_idx, match_captures in matches:
                 def_node = None
                 symbol_name = None
                 kind = "unknown"
+                visibility = None
 
                 for capture_name, nodes in match_captures.items():
                     if capture_name.endswith(".def") and nodes:
                         def_node = nodes[0]
                         kind = _kind_from_capture(capture_name)
+                        visibility = _visibility_from_capture(capture_name)
                     elif capture_name.endswith(".name") and nodes:
                         symbol_name = nodes[0].text.decode("utf-8", errors="replace")
 
@@ -4739,7 +4802,7 @@ class Indexer:
                 if symbol_name is None and kind == "template":
                     symbol_name = _extract_template_name(def_node)
 
-                raw_symbols.append((def_node, kind, symbol_name))
+                _append_raw_symbol(raw_symbols, def_node, kind, symbol_name, visibility)
 
             if not raw_symbols:
                 continue
@@ -4761,7 +4824,7 @@ class Indexer:
             }
             inserted: list[tuple[int, int, int, str | None]] = []
 
-            for def_node, kind, symbol_name in raw_symbols:
+            for def_node, kind, symbol_name, visibility in raw_symbols:
                 content_text = def_node.text.decode("utf-8", errors="replace")
                 doc = _extract_js_ts_doc_comment(script_bytes, def_node)
                 signature_lang = "typescript" if parse_lang == "tsx" else parse_lang
@@ -5120,17 +5183,19 @@ class Indexer:
         matches = cursor.matches(root)
 
         # First pass: collect all symbol info
-        raw_symbols: list[tuple[Node, str, str | None]] = []  # (def_node, kind, name)
+        raw_symbols: list[tuple[Node, str, str | None, str | None]] = []  # (def_node, kind, name, visibility)
 
         for _pattern_idx, match_captures in matches:
             def_node = None
             symbol_name = None
             kind = "unknown"
+            visibility = None
 
             for capture_name, nodes in match_captures.items():
                 if capture_name.endswith(".def") and nodes:
                     def_node = nodes[0]
                     kind = _kind_from_capture(capture_name)
+                    visibility = _visibility_from_capture(capture_name)
                 elif capture_name.endswith(".name") and nodes:
                     symbol_name = nodes[0].text.decode("utf-8", errors="replace")
 
@@ -5141,7 +5206,7 @@ class Indexer:
             if symbol_name is None and kind == "template":
                 symbol_name = _extract_template_name(def_node)
 
-            raw_symbols.append((def_node, kind, symbol_name))
+            _append_raw_symbol(raw_symbols, def_node, kind, symbol_name, visibility)
 
         # Second pass: insert symbols and track parent-child relationships
         # Track container symbols (classes, structs, namespaces) by their byte ranges
@@ -5165,7 +5230,7 @@ class Indexer:
         inserted_names: set[str] = set()
         count = 0
 
-        for def_node, kind, symbol_name in raw_symbols:
+        for def_node, kind, symbol_name, visibility in raw_symbols:
             content_text = def_node.text.decode("utf-8", errors="replace")
             if lang in {"javascript", "typescript", "tsx"}:
                 doc = _extract_js_ts_doc_comment(source, def_node)
@@ -5219,6 +5284,7 @@ class Indexer:
                 name=symbol_name,
                 qualified_name=qualified,
                 signature=sig,
+                visibility=visibility,
                 start_line=def_node.start_point[0] + 1,
                 end_line=def_node.end_point[0] + 1,
                 content=content_text,
@@ -5430,7 +5496,7 @@ class Indexer:
         excluded = _doc_languages()
         placeholders = ",".join("?" * len(excluded))
         rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.kind, f.path as file_path
+            f"""SELECT s.id, s.name, s.kind, s.qualified_name, f.path as file_path
                FROM symbols s JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -5440,7 +5506,12 @@ class Indexer:
         symbol_info: dict[int, dict] = {}
         for row in rows:
             name = row["name"]
-            info = {"id": row["id"], "file": row["file_path"], "kind": row["kind"]}
+            info = {
+                "id": row["id"],
+                "file": row["file_path"],
+                "kind": row["kind"],
+                "qualified_name": row["qualified_name"],
+            }
             symbol_info[row["id"]] = info
             if name not in name_to_symbols:
                 name_to_symbols[name] = []
@@ -5555,6 +5626,127 @@ class Indexer:
                 return 0.7
             return 0.5
 
+        ROLE_SUFFIXES = (
+            "service",
+            "controller",
+            "resolver",
+            "guard",
+            "filter",
+            "interceptor",
+            "pipe",
+            "middleware",
+            "module",
+            "repository",
+            "repo",
+            "model",
+            "store",
+            "client",
+            "provider",
+            "gateway",
+            "manager",
+        )
+
+        def _compact_identifier_like(name: str | None) -> str:
+            if not name:
+                return ""
+            spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+            spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+            return re.sub(r"[^a-z0-9]+", "", spaced.lower())
+
+        def _split_role(name: str | None) -> tuple[str, str | None]:
+            if not name:
+                return "", None
+            compact = _compact_identifier_like(name)
+            for suffix in ROLE_SUFFIXES:
+                if compact.endswith(suffix) and len(compact) > len(suffix):
+                    return compact[: -len(suffix)], suffix
+            return compact, None
+
+        def _owner_name(info: dict[str, object]) -> str | None:
+            qualified_name = str(info.get("qualified_name") or "")
+            if "." not in qualified_name:
+                return None
+            owner = qualified_name.rsplit(".", 1)[0]
+            owner = owner.split(">")[-1]
+            owner = owner.split("::")[-1]
+            return owner or None
+
+        def _call_contexts(content: str, ref_name: str) -> tuple[bool, set[str]]:
+            bare_call = re.search(
+                rf"(?<![\w$.]){re.escape(ref_name)}\s*\(",
+                content,
+            ) is not None
+            member_receivers = {
+                match.group("receiver")
+                for match in re.finditer(
+                    rf"(?P<receiver>(?:this\.)?[A-Za-z_$][\w$]*)\s*\.\s*{re.escape(ref_name)}\s*\(",
+                    content,
+                )
+            }
+            return bare_call, member_receivers
+
+        def _receiver_matches_target(receiver: str, target: dict[str, object]) -> bool:
+            owner = _owner_name(target)
+            if not owner:
+                return False
+            receiver_name = receiver.split(".")[-1]
+            receiver_base, receiver_role = _split_role(receiver_name)
+            owner_base, owner_role = _split_role(owner)
+            receiver_compact = _compact_identifier_like(receiver_name)
+            owner_compact = _compact_identifier_like(owner)
+            if receiver_role and owner_role and receiver_role != owner_role:
+                return False
+            if receiver_compact == owner_compact:
+                return True
+            if receiver_base and owner_base and receiver_base == owner_base:
+                return receiver_role is None or owner_role is None or receiver_role == owner_role
+            return False
+
+        def _filter_method_targets(
+            source_info: dict[str, object],
+            targets: list[dict[str, object]],
+            *,
+            ref_name: str,
+            content: str,
+        ) -> list[dict[str, object]]:
+            method_targets = [target for target in targets if target["kind"] == "method"]
+            if not method_targets:
+                return targets
+
+            non_method_targets = [target for target in targets if target["kind"] != "method"]
+            bare_call, member_receivers = _call_contexts(content, ref_name)
+
+            filtered_methods = method_targets
+            if member_receivers:
+                matched = [
+                    target
+                    for target in filtered_methods
+                    if any(_receiver_matches_target(receiver, target) for receiver in member_receivers)
+                ]
+                if matched:
+                    filtered_methods = matched
+                elif not bare_call:
+                    filtered_methods = []
+
+            if bare_call and filtered_methods:
+                source_owner = _owner_name(source_info)
+                if source_owner:
+                    matched = [
+                        target
+                        for target in filtered_methods
+                        if _receiver_matches_target(source_owner, target)
+                    ]
+                    if matched:
+                        filtered_methods = matched
+                    elif len(filtered_methods) > 1:
+                        filtered_methods = []
+                elif len(filtered_methods) > 1:
+                    filtered_methods = []
+            elif len(filtered_methods) > 1 and not member_receivers:
+                filtered_methods = []
+
+            return non_method_targets + filtered_methods
+
         # Scan each symbol's content for references
         edge_count = 0
         MAX_REFS_PER_SYMBOL = 30
@@ -5583,7 +5775,12 @@ class Indexer:
             for ref_name in referenced_names:
                 if refs_for_this >= MAX_REFS_PER_SYMBOL:
                     break
-                targets = filtered_names.get(ref_name, [])
+                targets = _filter_method_targets(
+                    source_info,
+                    filtered_names.get(ref_name, []),
+                    ref_name=ref_name,
+                    content=content,
+                )
                 for target in targets:
                     if target["id"] == source_id:
                         continue
@@ -6292,6 +6489,7 @@ class Indexer:
             controllers = _metadata_names(metadata, ("controllers",))
             providers = _metadata_names(metadata, ("providers",))
             exports = _metadata_names(metadata, ("exports",))
+            factory_refs = _metadata_names(metadata, ("factory_refs",))
             entity_names = _metadata_names(
                 metadata,
                 ("mikroorm_root_entities", "mikroorm_feature_entities", "entity_names"),
@@ -6306,6 +6504,11 @@ class Indexer:
                 target
                 for name in providers
                 for target in _resolve_targets(name, source=module)
+            ]
+            factory_symbols = [
+                target
+                for name in factory_refs
+                for target in _resolve_targets(name, source=module, preferred_kinds={"function", "method"})
             ]
             entity_symbols = [
                 target
@@ -6330,6 +6533,7 @@ class Indexer:
                 "module": module,
                 "controllers": _dedupe(controller_symbols),
                 "providers": _dedupe(provider_symbols),
+                "factories": _dedupe(factory_symbols),
                 "entities": _dedupe(entity_symbols),
                 "imports": _dedupe(imported_module_symbols),
                 "exports": _dedupe(exported_symbols),
@@ -6339,6 +6543,7 @@ class Indexer:
             module = context["module"]
             controller_symbols = context["controllers"]
             provider_symbols = context["providers"]
+            factory_symbols = context["factories"]
             entity_symbols = context["entities"]
             imported_module_symbols = context["imports"]
             exported_symbols = context["exports"]
@@ -6347,6 +6552,8 @@ class Indexer:
                 _add_edge(module, target, "module_controller")
             for target in provider_symbols:
                 _add_edge(module, target, "module_provider")
+            for target in factory_symbols:
+                _add_edge(module, target, "module_factory")
             for target in imported_module_symbols:
                 _add_edge(module, target, "module_import")
             for target in exported_symbols:

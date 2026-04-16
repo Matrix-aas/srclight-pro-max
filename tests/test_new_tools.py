@@ -7,6 +7,7 @@ import pytest
 
 import srclight.server as server
 from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
+from srclight.indexer import IndexConfig, Indexer
 from srclight.server import _extract_imports
 
 
@@ -156,6 +157,61 @@ class TestFindDeadCode:
         dead_names = [d.name for d in dead]
         assert "bootstrap" not in dead_names
         assert "constructor" not in dead_names
+
+    def test_nuxt_auto_imported_exported_composable_not_reported_dead(self, db, tmp_path):
+        project = tmp_path / "nuxt-auto-import"
+        (project / "composables").mkdir(parents=True)
+
+        (project / "nuxt.config.ts").write_text("export default defineNuxtConfig({})\n")
+        (project / "composables" / "use-pagination.ts").write_text("""\
+export function usePagination() {
+  return { page: ref(1) };
+}
+""")
+        (project / "app.vue").write_text("""\
+<script setup lang="ts">
+const { page } = usePagination()
+</script>
+""")
+
+        Indexer(db, IndexConfig(root=project)).index(project)
+
+        dead_names = {symbol.name for symbol in db.get_dead_symbols(kind="function")}
+        use_pagination = db.get_symbol_by_name("usePagination")
+
+        assert use_pagination is not None
+        assert use_pagination.visibility == "export"
+        assert "usePagination" not in dead_names
+
+    def test_nest_use_factory_provider_function_not_reported_dead(self, db, tmp_path):
+        project = tmp_path / "nest-use-factory"
+        src = project / "src"
+        src.mkdir(parents=True)
+
+        (src / "auth.module.ts").write_text("""\
+import { Module } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+
+function buildAuthOptions(config: ConfigService) {
+  return { secret: config.get('AUTH_SECRET') };
+}
+
+@Module({
+  providers: [
+    {
+      provide: 'AUTH_OPTIONS',
+      useFactory: buildAuthOptions,
+      inject: [ConfigService],
+    },
+  ],
+})
+export class AuthModule {}
+""")
+
+        Indexer(db, IndexConfig(root=project)).index(project)
+
+        dead_names = {symbol.name for symbol in db.get_dead_symbols(kind="function")}
+        assert "buildAuthOptions" not in dead_names
 
 
 # --- api_surface tests ---
@@ -885,3 +941,177 @@ def test_get_callees_reports_ambiguous_same_name_symbols(monkeypatch, db):
         "apps/backend/src/block.service.ts",
         "apps/backend/src/coding.service.ts",
     }
+
+
+def test_detect_changes_compact_returns_summary_entries(monkeypatch, db, tmp_path):
+    file_id = _insert_file(
+        db,
+        path="apps/backend/src/coding.service.ts",
+        language="typescript",
+        line_count=80,
+    )
+    _insert_symbol(
+        db,
+        file_id,
+        "updateDescription",
+        file_path="apps/backend/src/coding.service.ts",
+        kind="method",
+        start_line=20,
+        end_line=36,
+        content="updateDescription() { return this.repo.save(); }",
+        qualified_name="CodingService.updateDescription",
+    )
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_resolve_repo_root", lambda project=None: tmp_path)
+
+    import srclight.git as git_mod
+    import srclight.community as community_mod
+
+    monkeypatch.setattr(
+        git_mod,
+        "detect_changes",
+        lambda repo_root, ref=None: [
+            {
+                "file": "apps/backend/src/coding.service.ts",
+                "hunks": [{"new_start": 22, "new_count": 4}],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        community_mod,
+        "compute_impact",
+        lambda db_obj, symbol_id, sym_to_comm, flows: {
+            "risk": "HIGH",
+            "direct_dependents": 3,
+            "transitive_dependents": 6,
+            "affected_communities": [1, 2],
+            "affected_flows": ["controller -> service -> repository"],
+        },
+    )
+
+    payload = json.loads(server.detect_changes(compact=True))
+
+    assert payload["compact"] is True
+    assert payload["changed_symbol_count"] == 1
+    assert payload["changed_symbols"] == [
+        {
+            "name": "updateDescription",
+            "qualified_name": "CodingService.updateDescription",
+            "kind": "method",
+            "file": "apps/backend/src/coding.service.ts",
+            "lines": "20-36",
+            "risk": "HIGH",
+            "direct_dependents": 3,
+            "transitive_dependents": 6,
+            "flows_affected": 1,
+        }
+    ]
+
+
+def test_context_for_task_returns_compact_actionable_context(monkeypatch, db, tmp_path):
+    service_file = _insert_file(
+        db,
+        path="apps/backend/src/coding.service.ts",
+        language="typescript",
+        line_count=120,
+    )
+    controller_file = _insert_file(
+        db,
+        path="apps/backend/src/coding.controller.ts",
+        language="typescript",
+        line_count=80,
+    )
+    types_file = _insert_file(
+        db,
+        path="apps/backend/src/coding.types.ts",
+        language="typescript",
+        line_count=40,
+    )
+    test_file = _insert_file(
+        db,
+        path="apps/backend/test/coding.service.spec.ts",
+        language="typescript",
+        line_count=60,
+    )
+
+    service_id = _insert_symbol(
+        db,
+        service_file,
+        "updateDescription",
+        file_path="apps/backend/src/coding.service.ts",
+        kind="method",
+        start_line=24,
+        end_line=46,
+        qualified_name="CodingService.updateDescription",
+        content="updateDescription(dto: CodingDocument) { return this.repo.save(dto); }",
+    )
+    controller_id = _insert_symbol(
+        db,
+        controller_file,
+        "patchCodingDescription",
+        file_path="apps/backend/src/coding.controller.ts",
+        kind="route_handler",
+        start_line=10,
+        end_line=24,
+        qualified_name="CodingController.patchCodingDescription",
+        signature="PATCH /coding/:id/description",
+        content="patchCodingDescription() { return this.coding.updateDescription(dto); }",
+        metadata={
+            "framework": "nestjs",
+            "resource": "route_handler",
+            "http_method": "PATCH",
+            "route_path": "/coding/:id/description",
+            "route_prefix": "/coding",
+        },
+    )
+    type_id = _insert_symbol(
+        db,
+        types_file,
+        "CodingDocument",
+        file_path="apps/backend/src/coding.types.ts",
+        kind="interface",
+        start_line=1,
+        end_line=8,
+        qualified_name="CodingDocument",
+        content="interface CodingDocument { description: string }",
+    )
+    _insert_symbol(
+        db,
+        test_file,
+        "test_updateDescription",
+        file_path="apps/backend/test/coding.service.spec.ts",
+        kind="function",
+        start_line=5,
+        end_line=18,
+        qualified_name="test_updateDescription",
+        content="test('updateDescription validates payload', () => {})",
+    )
+    db.insert_edge(EdgeRecord(source_id=controller_id, target_id=service_id, edge_type="calls", confidence=0.9))
+    db.insert_edge(EdgeRecord(source_id=service_id, target_id=type_id, edge_type="uses_type", confidence=0.95))
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_repo_root", tmp_path)
+
+    payload = json.loads(server.context_for_task("add validation to CodingService.updateDescription", budget="small"))
+
+    assert payload["task"] == "add validation to CodingService.updateDescription"
+    assert payload["budget"] == "small"
+    assert payload["seeds"]
+    assert payload["primary_symbols"]
+    assert payload["primary_symbols"][0]["qualified_name"] == "CodingService.updateDescription"
+    assert payload["primary_files"]
+    assert payload["primary_files"][0]["file"] == "apps/backend/src/coding.service.ts"
+    assert payload["related_api"]
+    assert payload["related_api"][0]["path"] == "/coding/:id/description"
+    assert payload["related_tests"]
+    assert payload["related_tests"][0]["file"] == "apps/backend/test/coding.service.spec.ts"
+    assert payload["data_types"]
+    assert payload["data_types"][0]["name"] == "CodingDocument"
+    assert payload["call_chain"]
+    assert payload["next_steps"]
+    assert payload["why_these_results"]
