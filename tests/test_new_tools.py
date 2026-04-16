@@ -967,8 +967,8 @@ def test_detect_changes_compact_returns_summary_entries(monkeypatch, db, tmp_pat
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_resolve_repo_root", lambda project=None: tmp_path)
 
-    import srclight.git as git_mod
     import srclight.community as community_mod
+    import srclight.git as git_mod
 
     monkeypatch.setattr(
         git_mod,

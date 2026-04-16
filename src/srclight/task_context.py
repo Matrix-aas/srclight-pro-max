@@ -67,7 +67,10 @@ def _identifier_candidates(task: str) -> list[str]:
         for part in parts:
             _add(part)
 
-    for value in re.findall(r"\b(?:use[A-Z][A-Za-z0-9_$]*|[A-Z][A-Za-z0-9_$]*|[a-z]+[A-Z][A-Za-z0-9_$]*)\b", task):
+    for value in re.findall(
+        r"\b(?:use[A-Z][A-Za-z0-9_$]*|[A-Z][A-Za-z0-9_$]*|[a-z]+[A-Z][A-Za-z0-9_$]*)\b",
+        task,
+    ):
         _add(value)
 
     hint = tokenized_query_hint(task)
@@ -146,7 +149,11 @@ def _score_symbol_candidate(sym: SymbolRecord, candidate: str) -> int:
     return score
 
 
-def _seed_symbols(db: Database, task: str, seed_limit: int) -> tuple[list[dict[str, Any]], list[SymbolRecord]]:
+def _seed_symbols(
+    db: Database,
+    task: str,
+    seed_limit: int,
+) -> tuple[list[dict[str, Any]], list[SymbolRecord]]:
     candidates = _identifier_candidates(task)
     scored: dict[int, tuple[int, SymbolRecord, str]] = {}
 
@@ -173,7 +180,10 @@ def _seed_symbols(db: Database, task: str, seed_limit: int) -> tuple[list[dict[s
                 scored[sym.id] = (25, sym, "matched keyword search")
                 break
 
-    ranked = sorted(scored.values(), key=lambda item: (-item[0], item[1].file_path or "", item[1].start_line))
+    ranked = sorted(
+        scored.values(),
+        key=lambda item: (-item[0], item[1].file_path or "", item[1].start_line),
+    )
     selected_symbols = [sym for _score, sym, _reason in ranked[:seed_limit]]
     seeds = [
         {
@@ -236,7 +246,12 @@ def _call_chain(db: Database, symbols: list[SymbolRecord], limit: int) -> list[d
         if sym.id is None:
             continue
         for entry in _dedup_graph_entries(db.get_callers(sym.id), "caller"):
-            key = (entry["direction"], entry["qualified_name"] or "", entry["file"] or "", entry["line"])
+            key = (
+                entry["direction"],
+                entry["qualified_name"] or "",
+                entry["file"] or "",
+                entry["line"],
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -244,7 +259,12 @@ def _call_chain(db: Database, symbols: list[SymbolRecord], limit: int) -> list[d
             if len(chain) >= limit:
                 return chain
         for entry in _dedup_graph_entries(db.get_callees(sym.id), "callee"):
-            key = (entry["direction"], entry["qualified_name"] or "", entry["file"] or "", entry["line"])
+            key = (
+                entry["direction"],
+                entry["qualified_name"] or "",
+                entry["file"] or "",
+                entry["line"],
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -333,11 +353,15 @@ def _next_steps(
     steps: list[str] = []
     if primary_symbols:
         steps.append(
-            f"Inspect {primary_symbols[0].qualified_name or primary_symbols[0].name} in {primary_symbols[0].file_path}:{primary_symbols[0].start_line}."
+            "Inspect "
+            f"{primary_symbols[0].qualified_name or primary_symbols[0].name} "
+            f"in {primary_symbols[0].file_path}:{primary_symbols[0].start_line}."
         )
     if related_api:
         steps.append(
-            f"Check the API entrypoint {related_api[0]['method']} {related_api[0]['path']} before changing validation behavior."
+            "Check the API entrypoint "
+            f"{related_api[0]['method']} {related_api[0]['path']} "
+            "before changing validation behavior."
         )
     if related_tests:
         steps.append(f"Review or extend tests in {related_tests[0]['file']}.")
@@ -346,7 +370,10 @@ def _next_steps(
     if data_types:
         steps.append(f"Validate the data contract in {data_types[0]['name']}.")
     elif primary_files:
-        steps.append(f"Use get_file_summary('{primary_files[0]['file']}') if you need more file-level context.")
+        steps.append(
+            f"Use get_file_summary('{primary_files[0]['file']}') "
+            "if you need more file-level context."
+        )
     deduped: list[str] = []
     seen: set[str] = set()
     for step in steps:
@@ -378,15 +405,30 @@ def build_task_context(
 
     why_these_results = []
     if seeds:
-        why_these_results.append("Primary symbols were chosen from exact identifier matches found in the task text.")
+        why_these_results.append(
+            "Primary symbols were chosen from exact identifier matches "
+            "found in the task text."
+        )
     if call_chain:
-        why_these_results.append("Call-chain entries show nearby callers/callees that frame the change surface.")
+        why_these_results.append(
+            "Call-chain entries show nearby callers/callees that frame "
+            "the change surface."
+        )
     if related_api:
-        why_these_results.append("Related API endpoints were pulled from route metadata connected to the same files or symbols.")
+        why_these_results.append(
+            "Related API endpoints were pulled from route metadata "
+            "connected to the same files or symbols."
+        )
     if related_tests:
-        why_these_results.append("Nearby tests were included to show existing coverage before editing code.")
+        why_these_results.append(
+            "Nearby tests were included to show existing coverage "
+            "before editing code."
+        )
     if data_types:
-        why_these_results.append("Data types capture DTOs/interfaces/classes that shape the method contract.")
+        why_these_results.append(
+            "Data types capture DTOs/interfaces/classes that shape "
+            "the method contract."
+        )
 
     return {
         "task": task,

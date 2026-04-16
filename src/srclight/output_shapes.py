@@ -10,7 +10,10 @@ def shape_compact_symbol_matches(matches: list[dict[str, Any]]) -> dict[str, Any
     return {
         "match_count": len(matches),
         "compact": True,
-        "hint": "Too many exact matches. Use get_signature(), symbols_in_file(), or search by qualified name/file.",
+        "hint": (
+            "Too many exact matches. Use get_signature(), symbols_in_file(), "
+            "or search by qualified name/file."
+        ),
         "symbols": [
             {
                 key: value
