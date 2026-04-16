@@ -1185,6 +1185,54 @@ def test_db_embeddings_incremental(tmp_path):
     db.close()
 
 
+def test_db_symbols_needing_embeddings_treats_null_embedding_hash_as_stale(tmp_path):
+    """Legacy embedding rows with NULL body_hash should always be refreshed."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+
+    file_id = db.upsert_file(FileRecord(
+        path="client/src/components/ProfileCard.vue",
+        content_hash="hash-1",
+        mtime=1.0,
+        language="vue",
+        size=100,
+        line_count=20,
+        summary="Vue shell around auth and GraphQL flow.",
+        metadata={"framework": "vue", "resource": "component"},
+    ))
+
+    sym_id = db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="component",
+        name="ProfileCard",
+        start_line=1,
+        end_line=5,
+        content="<template />",
+        body_hash="v1",
+    ), "client/src/components/ProfileCard.vue")
+    db.commit()
+
+    db.upsert_embedding(
+        sym_id,
+        "mock:test-model",
+        4,
+        vector_to_bytes([0.0, 1.0, 0.0, 0.0]),
+        None,
+    )
+    db.commit()
+
+    needing = db.get_symbols_needing_embeddings("mock:test-model")
+
+    assert len(needing) == 1
+    assert needing[0]["id"] == sym_id
+    assert needing[0]["embedding_body_hash"]
+    db.close()
+
+
 def test_db_symbols_needing_embeddings_decode_metadata_for_wave1_backend_text(tmp_path):
     """DB embedding fetches should preserve JSON metadata for backend summary text."""
     from srclight.db import Database, FileRecord, SymbolRecord

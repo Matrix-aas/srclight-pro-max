@@ -2140,7 +2140,8 @@ class Database:
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?
-               WHERE e.symbol_id IS NULL OR e.body_hash != {freshness_expr}
+               WHERE e.symbol_id IS NULL
+                  OR COALESCE(e.body_hash, '') != COALESCE({freshness_expr}, '')
                ORDER BY s.id
                LIMIT ?""",
             (model, limit),
