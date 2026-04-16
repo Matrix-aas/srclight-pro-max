@@ -491,6 +491,99 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
     }
 
 
+def _indexed_file_orientation_hints(file_rows: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize indexed file summaries + metadata into orientation hints."""
+    symbol_rows: list[dict[str, object]] = []
+    entrypoint_paths = {"src/main.ts", "src/main.js", "main.ts", "main.js", "server.ts"}
+
+    for row in file_rows:
+        metadata = row.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        else:
+            metadata = dict(metadata)
+
+        file_path = str(row.get("path") or "")
+        resource = str(metadata.get("resource") or "").lower()
+        if resource == "bootstrap" and file_path in entrypoint_paths:
+            metadata.pop("resource", None)
+
+        top_level_symbols = row.get("top_level_symbols") or []
+        primary_kind = ""
+        for symbol in top_level_symbols:
+            if not isinstance(symbol, dict):
+                continue
+            kind = str(symbol.get("kind") or "").lower()
+            if kind:
+                primary_kind = kind
+                if kind in {
+                    "controller",
+                    "route",
+                    "module",
+                    "config",
+                    "queue_processor",
+                    "microservice_handler",
+                    "scheduled_job",
+                }:
+                    break
+
+        symbol_rows.append({
+            "kind": primary_kind,
+            "name": Path(file_path).stem,
+            "signature": None,
+            "file_path": file_path,
+            "metadata": metadata,
+        })
+
+    return _indexed_orientation_hints(symbol_rows)
+
+
+def _merge_orientation_hints(*hint_sets: dict[str, object] | None) -> dict[str, object] | None:
+    """Merge multiple orientation hint payloads with stable precedence order."""
+    available = [hint for hint in hint_sets if hint]
+    if not available:
+        return None
+
+    merged: dict[str, object] = {
+        "signals": [],
+        "representative_files": {
+            "backend": [],
+            "data": [],
+            "async": [],
+            "config": [],
+        },
+        "route_systems": [],
+        "route_files": [],
+        "data_systems": [],
+        "async_systems": [],
+        "runtime_files": [],
+    }
+
+    def _extend_unique(bucket: list[str], values: list[object], *, limit: int | None = None) -> None:
+        for value in values:
+            text = str(value or "")
+            if not text or text in bucket:
+                continue
+            bucket.append(text)
+            if limit is not None and len(bucket) >= limit:
+                break
+
+    for hints in available:
+        _extend_unique(merged["signals"], list(hints.get("signals") or []))
+        representative_files = hints.get("representative_files")
+        if isinstance(representative_files, dict):
+            for category, limit in (("backend", 3), ("data", 3), ("async", 3), ("config", 4)):
+                bucket = merged["representative_files"].setdefault(category, [])
+                _extend_unique(bucket, list(representative_files.get(category) or []), limit=limit)
+        _extend_unique(merged["route_systems"], list(hints.get("route_systems") or []))
+        _extend_unique(merged["route_files"], list(hints.get("route_files") or []), limit=3)
+        _extend_unique(merged["data_systems"], list(hints.get("data_systems") or []))
+        _extend_unique(merged["async_systems"], list(hints.get("async_systems") or []))
+        _extend_unique(merged["runtime_files"], list(hints.get("runtime_files") or []), limit=3)
+
+    return merged
+
+
 def _merge_indexed_representative_files(
     representative_files: dict[str, list[str]],
     indexed_hints: dict[str, object] | None,
@@ -1410,7 +1503,10 @@ def codebase_map(project: str | None = None) -> str:
 
     indexed_hints = None
     try:
-        indexed_hints = _indexed_orientation_hints(db.orientation_symbols())
+        indexed_hints = _merge_orientation_hints(
+            _indexed_file_orientation_hints(db.orientation_files()),
+            _indexed_orientation_hints(db.orientation_symbols()),
+        )
     except (AttributeError, OSError, sqlite3.Error, json.JSONDecodeError):
         indexed_hints = None
 

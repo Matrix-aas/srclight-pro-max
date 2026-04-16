@@ -1215,6 +1215,219 @@ def test_workspace_db_codebase_map_uses_indexed_metadata_for_unconventional_back
     assert sum(1 for item in payload["start_here"] if item["path"].startswith("server/")) == 1
 
 
+def test_workspace_db_codebase_map_uses_indexed_file_summaries_for_orientation(
+    tmp_path, ws_dir
+):
+    project_dir = _create_indexed_project(tmp_path, "summary-oriented", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "OrdersRoutes",
+            "kind": "class",
+            "path": "src/http/orders.routes.ts",
+            "signature": "class OrdersRoutes",
+            "content": "orders route surface",
+        },
+        {
+            "name": "RuntimeConfig",
+            "kind": "class",
+            "path": "src/runtime/runtime.config.ts",
+            "signature": "class RuntimeConfig",
+            "content": "runtime env wiring",
+        },
+        {
+            "name": "EmailWorker",
+            "kind": "class",
+            "path": "src/queue/email.worker.ts",
+            "signature": "class EmailWorker",
+            "content": "async queue handler",
+        },
+    ])
+
+    (project_dir / "src/http").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/runtime").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/queue").mkdir(parents=True, exist_ok=True)
+    (project_dir / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "@nestjs/core": "^11.0.0",
+            "bullmq": "^5.0.0",
+        },
+    }))
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/http/orders.routes.ts").write_text("export class OrdersRoutes {}\n")
+    (project_dir / "src/runtime/runtime.config.ts").write_text("export class RuntimeConfig {}\n")
+    (project_dir / "src/queue/email.worker.ts").write_text("export class EmailWorker {}\n")
+
+    db = Database(project_dir / ".srclight" / "index.db")
+    db.open()
+    try:
+        db.update_file_summary(
+            "src/main.ts",
+            summary="Application bootstrap entrypoint.",
+            metadata={"framework": "nest", "resource": "bootstrap"},
+        )
+        db.update_file_summary(
+            "src/http/orders.routes.ts",
+            summary="Orders HTTP routes and transport handlers.",
+            metadata={"framework": "nest", "resource": "controller", "route_prefix": "/orders"},
+        )
+        db.update_file_summary(
+            "src/runtime/runtime.config.ts",
+            summary="Runtime configuration and module wiring.",
+            metadata={"framework": "nest", "resource": "config"},
+        )
+        db.update_file_summary(
+            "src/queue/email.worker.ts",
+            summary="Background email worker.",
+            metadata={"framework": "bullmq", "resource": "worker", "transport": "bullmq"},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    config = WorkspaceConfig(name="summary-oriented-codebase-map")
+    config.add_project("summary-oriented", str(project_dir))
+
+    with WorkspaceDB(config) as wdb:
+        payload = wdb.codebase_map(project="summary-oriented")
+
+    start_paths = [item["path"] for item in payload["start_here"]]
+
+    assert any(item["path"] == "src/main.ts" for item in payload["start_here"])
+    assert "src/http/orders.routes.ts" in payload["representative_files"]["backend"]
+    assert "src/runtime/runtime.config.ts" in payload["representative_files"]["config"]
+    assert "src/queue/email.worker.ts" in payload["representative_files"]["async"]
+    assert "src/http/orders.routes.ts" in start_paths
+    assert payload["topology"]["routes"]["files"] == ["src/http/orders.routes.ts"]
+    assert payload["topology"]["runtime"]["files"] == [
+        "package.json",
+        "src/runtime/runtime.config.ts",
+    ]
+    assert payload["topology"]["async"]["files"] == ["src/queue/email.worker.ts"]
+
+
+def test_workspace_db_codebase_map_keeps_unconventional_backend_surfaces_discoverable_from_file_summaries(
+    tmp_path, ws_dir
+):
+    project_dir = _create_indexed_project(tmp_path, "fullstack", [
+        {
+            "name": "bootstrap",
+            "kind": "function",
+            "path": "src/main.ts",
+            "signature": "async function bootstrap()",
+            "content": "bootstrap runtime",
+        },
+        {
+            "name": "OrdersEndpoint",
+            "kind": "class",
+            "path": "src/transport/orders.endpoint.ts",
+            "signature": "class OrdersEndpoint",
+            "content": "orders transport handler",
+        },
+        {
+            "name": "RuntimeSetup",
+            "kind": "class",
+            "path": "src/runtime/runtime.setup.ts",
+            "signature": "class RuntimeSetup",
+            "content": "runtime setup",
+        },
+        {
+            "name": "UserStore",
+            "kind": "class",
+            "path": "src/persistence/user.store.ts",
+            "signature": "class UserStore",
+            "content": "user persistence",
+        },
+        {
+            "name": "OrdersListener",
+            "kind": "class",
+            "path": "src/messaging/orders.listener.ts",
+            "signature": "class OrdersListener",
+            "content": "orders async listener",
+        },
+    ])
+
+    (project_dir / "app/pages").mkdir(parents=True)
+    (project_dir / "src/transport").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/runtime").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/persistence").mkdir(parents=True, exist_ok=True)
+    (project_dir / "src/messaging").mkdir(parents=True, exist_ok=True)
+
+    (project_dir / "package.json").write_text(json.dumps({
+        "dependencies": {
+            "nuxt": "^4.0.0",
+            "@nestjs/core": "^11.0.0",
+        },
+    }))
+    (project_dir / "nuxt.config.ts").write_text("export default defineNuxtConfig({})\n")
+    (project_dir / "app/pages/index.vue").write_text("<template>Home</template>\n")
+    (project_dir / "src/main.ts").write_text("async function bootstrap() {}\n")
+    (project_dir / "src/transport/orders.endpoint.ts").write_text("export class OrdersEndpoint {}\n")
+    (project_dir / "src/runtime/runtime.setup.ts").write_text("export class RuntimeSetup {}\n")
+    (project_dir / "src/persistence/user.store.ts").write_text("export class UserStore {}\n")
+    (project_dir / "src/messaging/orders.listener.ts").write_text("export class OrdersListener {}\n")
+
+    db = Database(project_dir / ".srclight" / "index.db")
+    db.open()
+    try:
+        db.update_file_summary(
+            "src/main.ts",
+            summary="Application bootstrap entrypoint.",
+            metadata={"framework": "nest", "resource": "bootstrap"},
+        )
+        db.update_file_summary(
+            "src/transport/orders.endpoint.ts",
+            summary="Orders transport and route handlers.",
+            metadata={"framework": "nest", "resource": "controller", "route_prefix": "/orders"},
+        )
+        db.update_file_summary(
+            "src/runtime/runtime.setup.ts",
+            summary="Runtime module and environment setup.",
+            metadata={"framework": "nest", "resource": "module"},
+        )
+        db.update_file_summary(
+            "src/persistence/user.store.ts",
+            summary="User persistence and repository wiring.",
+            metadata={"framework": "mikroorm", "resource": "repository"},
+        )
+        db.update_file_summary(
+            "src/messaging/orders.listener.ts",
+            summary="Orders event listener.",
+            metadata={"framework": "rabbitmq", "resource": "consumer", "transport": "rabbitmq"},
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    config = WorkspaceConfig(name="summary-metadata-fullstack")
+    config.add_project("fullstack", str(project_dir))
+
+    with WorkspaceDB(config) as wdb:
+        payload = wdb.codebase_map(project="fullstack")
+
+    start_paths = [item["path"] for item in payload["start_here"]]
+
+    assert payload["framework_hints"]["app_type"] == "fullstack"
+    assert payload["representative_files"]["backend"] == [
+        "src/main.ts",
+        "src/transport/orders.endpoint.ts",
+    ]
+    assert payload["topology"]["routes"]["files"] == ["src/transport/orders.endpoint.ts"]
+    assert payload["topology"]["data"]["files"] == ["src/persistence/user.store.ts"]
+    assert payload["topology"]["async"]["files"] == ["src/messaging/orders.listener.ts"]
+    assert payload["topology"]["runtime"]["files"] == [
+        "nuxt.config.ts",
+        "package.json",
+        "src/runtime/runtime.setup.ts",
+    ]
+    assert "src/transport/orders.endpoint.ts" in start_paths
+
+
 def test_workspace_project_scoped_miss_recovery_strings_include_project(
     tmp_path, ws_dir, monkeypatch
 ):

@@ -739,6 +739,76 @@ class Database:
             ],
         }
 
+    def orientation_files(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Return high-signal indexed files for repo orientation."""
+        assert self.conn is not None
+
+        row_limit = max(limit * 3, limit)
+        rows = self.conn.execute(
+            """SELECT id, path, language, size, line_count, summary, metadata
+               FROM files
+               WHERE summary IS NOT NULL
+                  OR metadata IS NOT NULL
+               ORDER BY
+                   CASE
+                       WHEN metadata IS NOT NULL AND summary IS NOT NULL THEN 0
+                       WHEN metadata IS NOT NULL THEN 1
+                       WHEN summary IS NOT NULL THEN 2
+                       ELSE 3
+                   END,
+                   path
+               LIMIT ?""",
+            (row_limit,),
+        ).fetchall()
+        if not rows:
+            return []
+
+        file_ids = [int(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in file_ids)
+        symbol_rows = self.conn.execute(
+            f"""SELECT file_id, name, kind, signature, start_line, end_line
+                FROM symbols
+                WHERE parent_symbol_id IS NULL
+                  AND file_id IN ({placeholders})
+                ORDER BY file_id, start_line, id""",
+            file_ids,
+        ).fetchall()
+
+        top_level_symbols: dict[int, list[dict[str, Any]]] = {}
+        for row in symbol_rows:
+            bucket = top_level_symbols.setdefault(int(row["file_id"]), [])
+            if len(bucket) >= 3:
+                continue
+            bucket.append({
+                "name": row["name"],
+                "kind": row["kind"],
+                "signature": row["signature"],
+                "line": row["start_line"],
+                "end_line": row["end_line"],
+            })
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = None
+            results.append({
+                "path": row["path"],
+                "language": row["language"],
+                "size": row["size"],
+                "line_count": row["line_count"],
+                "summary": row["summary"],
+                "metadata": metadata or {},
+                "top_level_symbols": top_level_symbols.get(int(row["id"]), []),
+            })
+            if len(results) >= limit:
+                break
+
+        return results
+
     # --- Symbols ---
 
     def insert_symbol(self, rec: SymbolRecord, file_path: str) -> int:

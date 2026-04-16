@@ -529,7 +529,9 @@ class WorkspaceDB:
                 _build_topology,
                 _detect_framework_hints,
                 _find_representative_files,
+                _indexed_file_orientation_hints,
                 _indexed_orientation_hints,
+                _merge_orientation_hints,
                 _merge_indexed_representative_files,
             )
 
@@ -543,7 +545,10 @@ class WorkspaceDB:
                 indexed_hints = None
                 try:
                     with self._open_project_db(entry) as db:
-                        indexed_hints = _indexed_orientation_hints(db.orientation_symbols())
+                        indexed_hints = _merge_orientation_hints(
+                            _indexed_file_orientation_hints(db.orientation_files()),
+                            _indexed_orientation_hints(db.orientation_symbols()),
+                        )
                 except (OSError, sqlite3.Error, json.JSONDecodeError):
                     indexed_hints = None
 
