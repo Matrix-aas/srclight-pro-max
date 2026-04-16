@@ -40,7 +40,7 @@ IndexEvent = dict[str, object]
 IndexEventCallback = Callable[[IndexEvent], None]
 
 # Bump when extraction/query behavior changes such that unchanged files must be re-indexed.
-INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-vue-normalized-metadata-v1"
+INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-vue-normalized-metadata-v4"
 
 
 # Default ignore patterns
@@ -204,18 +204,30 @@ def _get_git_head(root: Path) -> str | None:
 
 def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
     """Extract doc comment preceding a symbol node."""
-    # Look at the previous sibling for a comment
-    prev = node.prev_named_sibling
-    if prev is None:
-        # Check for comment as first child or preceding line
-        # Look at previous unnamed siblings too
-        prev_sib = node.prev_sibling
-        if prev_sib and prev_sib.type == "comment":
-            return prev_sib.text.decode("utf-8", errors="replace").strip()
-        return None
+    comment_nodes: list[Node] = []
+    cursor = node.prev_sibling
+    next_row = node.start_point[0] if getattr(node, "start_point", None) else None
 
-    if prev.type == "comment":
-        return prev.text.decode("utf-8", errors="replace").strip()
+    while cursor is not None:
+        if cursor.type == "comment":
+            if next_row is not None and getattr(cursor, "end_point", None):
+                gap = next_row - cursor.end_point[0]
+                if gap > 1:
+                    break
+                next_row = cursor.start_point[0]
+            comment_nodes.append(cursor)
+            cursor = cursor.prev_sibling
+            continue
+
+        if cursor.is_named:
+            break
+        cursor = cursor.prev_sibling
+
+    if comment_nodes:
+        return "\n".join(
+            comment.text.decode("utf-8", errors="replace").strip()
+            for comment in reversed(comment_nodes)
+        ).strip()
 
     # Python: check for docstring (first child expression_statement with string)
     if node.type in ("function_definition", "class_definition"):
@@ -230,10 +242,10 @@ def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
     return None
 
 
-def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
-    """Keep real JS/TS doc comments while rejecting separator and TODO noise."""
+def _clean_js_ts_doc_comment(comment: str | None) -> str | None:
+    """Normalize JS/TS/Vue doc comments and strip separator/TODO noise lines."""
     if not comment:
-        return False
+        return None
 
     cleaned_lines: list[str] = []
     for raw_line in comment.splitlines():
@@ -245,21 +257,24 @@ def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
         line = re.sub(r"^//+", "", line)
         line = re.sub(r"^\*+", "", line)
         line = line.strip()
-        if line:
-            cleaned_lines.append(line)
-
-    if not cleaned_lines:
-        return False
-
-    for line in cleaned_lines:
+        if not line:
+            continue
         if re.fullmatch(r"[-=/*_# ]+", line):
             continue
         if re.match(r"^(?:todo|fixme)\b", line, flags=re.IGNORECASE):
             continue
-        if re.search(r"\w", line, flags=re.UNICODE):
-            return True
+        if not re.search(r"\w", line, flags=re.UNICODE):
+            continue
+        cleaned_lines.append(line)
 
-    return False
+    if not cleaned_lines:
+        return None
+    return "\n".join(cleaned_lines)
+
+
+def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
+    """Keep real JS/TS doc comments while rejecting separator and TODO noise."""
+    return _clean_js_ts_doc_comment(comment) is not None
 
 
 def _extract_js_ts_doc_comment(source_bytes: bytes, node: Node) -> str | None:
@@ -271,8 +286,9 @@ def _extract_js_ts_doc_comment(source_bytes: bytes, node: Node) -> str | None:
     current: Node | None = node
     while current is not None:
         doc = _extract_doc_comment(source_bytes, current)
-        if _is_meaningful_js_ts_doc_comment(doc):
-            return doc
+        cleaned_doc = _clean_js_ts_doc_comment(doc)
+        if cleaned_doc is not None:
+            return cleaned_doc
         parent = current.parent
         if parent is None or parent.type not in transparent_wrappers:
             break
@@ -3302,6 +3318,7 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
     classes: list[str] = []
     module_refs: list[str] = []
     slots: list[str] = []
+    component_refs: list[str] = []
 
     for match in template_re.finditer(text):
         inner = re.sub(r"<!--.*?-->", " ", match.group(1), flags=re.DOTALL)
@@ -3312,6 +3329,16 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
                 continue
             if any(ch.isupper() for ch in tag) or "-" in tag or lower in special_tags:
                 components.append(tag)
+
+        for tag, attrs in re.findall(r"<([A-Za-z][\w.-]*)\b([^>]*)>", inner):
+            lower = tag.lower()
+            if lower == "template":
+                continue
+            if not (any(ch.isupper() for ch in tag) or "-" in tag or lower in special_tags):
+                continue
+            ref_match = re.search(r"\bref\s*=\s*(['\"])([^'\"]+)\1", attrs)
+            if ref_match:
+                component_refs.append(f"{ref_match.group(2)}:{tag}")
 
         directives.extend(re.findall(r"\b(v-[\w:-]+)", inner))
         events.extend(
@@ -3345,6 +3372,7 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
         "classes": _unique_sorted(classes),
         "module_refs": _unique_sorted(module_refs),
         "slots": _unique_sorted(slots),
+        "component_refs": _unique_sorted(component_refs),
     }
 
     if any(signals.values()):
@@ -3490,6 +3518,21 @@ def _strip_js_comments(text: str) -> str:
 def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | None:
     """Extract high-value Nuxt/Vue script hints from usable Vue script blocks."""
     script_re = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.DOTALL | re.IGNORECASE)
+    ignored_constructor_names = {
+        "AbortController",
+        "AbortSignal",
+        "Array",
+        "Date",
+        "Error",
+        "Map",
+        "Object",
+        "Promise",
+        "RegExp",
+        "Set",
+        "URL",
+        "WeakMap",
+        "WeakSet",
+    }
     composable_allowlist = {
         "useAppConfig", "useAsyncData", "useClipboard", "useCookie", "useCssModule",
         "useDebounceFn", "useDocumentVisibility", "useFetch", "useHead", "useI18n",
@@ -3511,6 +3554,8 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
     page_meta_values: list[str] = []
     props: list[str] = []
     emits: list[str] = []
+    template_refs: list[str] = []
+    constructed_classes: list[str] = []
 
     for match in script_re.finditer(text):
         attrs = match.group(1)
@@ -3564,6 +3609,22 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
                 for _, path in re.findall(r"\bnavigateTo\s*\(\s*(['\"])([^'\"]+)\1", cleaned)
                 if path
             )
+        template_refs.extend(
+            ref_name
+            for _, ref_name in re.findall(
+                r"\buseTemplateRef\s*\(\s*(['\"])([^'\"]+)\1",
+                cleaned,
+            )
+            if ref_name
+        )
+        constructed_classes.extend(
+            class_name
+            for class_name in re.findall(
+                r"\bnew\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^()]+>)?\s*\(",
+                code_only,
+            )
+            if class_name and class_name not in ignored_constructor_names
+        )
 
         if {"useFetch", "useLazyFetch"} & called_helpers:
             fetch_paths.extend(
@@ -3593,6 +3654,8 @@ def _extract_vue_script_frontend_signals(text: str) -> dict[str, list[str]] | No
         "page_meta_values": _unique_sorted(page_meta_values),
         "props": _unique_sorted(props),
         "emits": _unique_sorted(emits),
+        "template_refs": _unique_sorted(template_refs),
+        "constructed_classes": _unique_sorted(constructed_classes),
     }
 
     if any(signals.values()):
@@ -4097,16 +4160,38 @@ def _build_vue_component_summary(
     signature_parts = [f"component {component_name}"]
     doc_parts = [f"Vue component {component_name}."]
 
+    def _preferred_signal_items(
+        values: list[str],
+        preferred: tuple[str, ...],
+        *,
+        limit: int = 2,
+    ) -> list[str]:
+        ordered = [value for value in preferred if value in values]
+        ordered.extend(value for value in values if value not in ordered)
+        return ordered[:limit]
+
+    if script_signals and script_signals["props"]:
+        signature_parts.append("props: " + ", ".join(script_signals["props"][:3]))
+    if script_signals and script_signals["emits"]:
+        signature_parts.append("emits: " + ", ".join(script_signals["emits"][:3]))
+    if template_signals and template_signals["slots"]:
+        signature_parts.append("slots: " + ", ".join(template_signals["slots"][:2]))
+
     if template_signals:
+        template_signature_bits: list[str] = []
         if template_signals["components"]:
-            signature_parts.append(", ".join(template_signals["components"][:3]))
+            template_signature_bits.extend(template_signals["components"][:2])
+        if template_signals["directives"]:
+            template_signature_bits.extend(template_signals["directives"][:2])
+        if template_signature_bits:
+            signature_parts.append("uses: " + ", ".join(template_signature_bits))
+        if template_signals["components"]:
             doc_parts.append(
                 "Template components: "
                 + _format_search_aliases(template_signals["components"])
                 + "."
             )
         if template_signals["directives"]:
-            signature_parts.append(", ".join(template_signals["directives"][:3]))
             doc_parts.append(
                 "Template directives: " + ", ".join(template_signals["directives"]) + "."
             )
@@ -4128,17 +4213,20 @@ def _build_vue_component_summary(
             doc_parts.append("Template slots: " + ", ".join(template_signals["slots"]) + ".")
 
     if style_signals:
-        style_signature_bits = []
+        style_signature_bits: list[str] = []
+        include_style_vars = not (
+            script_signals and (script_signals["props"] or script_signals["emits"])
+        )
         if style_signals["langs"]:
-            style_signature_bits.extend(style_signals["langs"])
+            style_signature_bits.extend(style_signals["langs"][:1])
         if style_signals["flags"]:
-            style_signature_bits.extend(style_signals["flags"])
+            style_signature_bits.extend(style_signals["flags"][:2])
         if style_signals["classes"]:
-            style_signature_bits.extend(f".{name}" for name in style_signals["classes"][:3])
-        if style_signals["vars"]:
-            style_signature_bits.extend(style_signals["vars"][:2])
+            style_signature_bits.extend(f".{name}" for name in style_signals["classes"][:1])
+        if include_style_vars and style_signals["vars"]:
+            style_signature_bits.extend(style_signals["vars"][:1])
         if style_signature_bits:
-            signature_parts.append(", ".join(style_signature_bits))
+            signature_parts.append("style: " + ", ".join(style_signature_bits))
         if style_signals["classes"]:
             doc_parts.append("Style classes: " + ", ".join(style_signals["classes"]) + ".")
         if style_signals["vars"]:
@@ -4159,13 +4247,23 @@ def _build_vue_component_summary(
             )
 
     if script_signals:
-        script_signature_bits = []
-        if script_signals["macros"]:
-            script_signature_bits.extend(script_signals["macros"][:2])
-        if script_signals["composables"]:
-            script_signature_bits.extend(script_signals["composables"][:2])
+        script_signature_bits = _preferred_signal_items(
+            script_signals["macros"],
+            ("definePageMeta", "defineModel", "defineProps", "defineEmits", "defineOptions"),
+            limit=2,
+        )
+        script_signature_bits.extend(_preferred_signal_items(
+            script_signals["composables"],
+            (
+                "useFetch", "useLazyFetch", "useQuery", "useLazyQuery",
+                "useMutation", "useSubscription", "useRoute", "useRouter",
+                "useTemplateRef", "useI18n", "useCssModule", "useLocalePath",
+                "useNuxtApp",
+            ),
+            limit=2,
+        ))
         if script_signature_bits:
-            signature_parts.append(", ".join(script_signature_bits))
+            signature_parts.append("script: " + ", ".join(script_signature_bits))
         if script_signals["macros"]:
             doc_parts.append(
                 "Script macros: " + _format_search_aliases(script_signals["macros"]) + "."
@@ -4227,6 +4325,7 @@ def _build_vue_component_metadata(
     }
 
     metadata["slots"] = template_signals["slots"] if template_signals else []
+    metadata["component_refs"] = template_signals["component_refs"] if template_signals else []
 
     css_modules: list[str] = []
     if style_signals and "module" in style_signals["flags"]:
@@ -4247,6 +4346,8 @@ def _build_vue_component_metadata(
         metadata["stores_used"] = script_signals["stores"]
         metadata["graphql_ops_used"] = script_signals["graphql_ops"]
         metadata["routes_used"] = script_signals["navigate_paths"]
+        metadata["template_refs"] = script_signals["template_refs"]
+        metadata["constructed_classes"] = script_signals["constructed_classes"]
     else:
         metadata["props"] = []
         metadata["emits"] = []
@@ -4254,6 +4355,18 @@ def _build_vue_component_metadata(
         metadata["stores_used"] = []
         metadata["graphql_ops_used"] = []
         metadata["routes_used"] = []
+        metadata["template_refs"] = []
+        metadata["constructed_classes"] = []
+
+    ref_targets: list[str] = []
+    template_ref_names = set(metadata["template_refs"])
+    for entry in metadata["component_refs"]:
+        if ":" not in entry:
+            continue
+        ref_name, component_name = entry.split(":", 1)
+        if ref_name in template_ref_names and component_name:
+            ref_targets.append(component_name)
+    metadata["template_ref_targets"] = _unique_sorted(ref_targets)
 
     return metadata
 
@@ -5274,6 +5387,10 @@ class Indexer:
         symbols_by_name: dict[str, list[dict[str, object]]] = defaultdict(list)
         module_symbols: list[dict[str, object]] = []
         created_edges: set[tuple[int, int, str]] = set()
+        indexed_file_paths = [
+            str(row["path"])
+            for row in self.db.conn.execute("SELECT path FROM files")
+        ]
 
         def _parse_metadata(value: object) -> dict[str, object]:
             if isinstance(value, str):
@@ -5329,6 +5446,7 @@ class Indexer:
         root_path = Path(self.config.root) if self.config and self.config.root else None
         file_text_cache: dict[str, str] = {}
         import_binding_cache: dict[str, dict[str, tuple[str | None, str, str]]] = {}
+        export_binding_cache: dict[str, dict[str, list[tuple[str | None, str | None, str]]]] = {}
         default_export_name_cache: dict[str, set[str]] = {}
         tsconfig_alias_rule_cache: list[tuple[str, str, bool, list[str], str]] | None = None
 
@@ -5447,8 +5565,46 @@ class Indexer:
             import_binding_cache[file_path] = imported
             return imported
 
+        def _export_bindings(file_path: str) -> dict[str, list[tuple[str | None, str | None, str]]]:
+            if file_path in export_binding_cache:
+                return export_binding_cache[file_path]
+
+            exported: dict[str, list[tuple[str | None, str | None, str]]] = defaultdict(list)
+            pattern = re.compile(
+                r"^\s*export\s*\{(.*?)\}\s*(?:from\s*(['\"])([^'\"]+)\2)?\s*;?\s*$",
+                flags=re.MULTILINE | re.DOTALL,
+            )
+
+            for match in pattern.finditer(_file_text(file_path)):
+                clause = match.group(1)
+                module_specifier = match.group(3)
+                for part in clause.split(","):
+                    item = part.strip()
+                    if not item:
+                        continue
+                    alias_match = re.match(
+                        r"(default|[A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$",
+                        item,
+                    )
+                    if alias_match:
+                        local_name = alias_match.group(1)
+                        exported_name = alias_match.group(2)
+                    else:
+                        ident_match = re.match(r"([A-Za-z_$][\w$]*)$", item)
+                        if not ident_match:
+                            continue
+                        local_name = ident_match.group(1)
+                        exported_name = local_name
+                    export_kind = "default" if local_name == "default" else "named"
+                    exported[exported_name].append(
+                        (None if local_name == "default" else local_name, module_specifier, export_kind)
+                    )
+
+            export_binding_cache[file_path] = {key: value for key, value in exported.items()}
+            return export_binding_cache[file_path]
+
         def _ordered_import_candidate_paths(base_path: str, specifier: str) -> list[str]:
-            if any(specifier.endswith(ext) for ext in (".ts", ".tsx", ".js", ".jsx")):
+            if any(specifier.endswith(ext) for ext in (".ts", ".tsx", ".js", ".jsx", ".vue")):
                 return [base_path]
 
             return [
@@ -5456,10 +5612,12 @@ class Indexer:
                 f"{base_path}.tsx",
                 f"{base_path}.js",
                 f"{base_path}.jsx",
+                f"{base_path}.vue",
                 posixpath.join(base_path, "index.ts"),
                 posixpath.join(base_path, "index.tsx"),
                 posixpath.join(base_path, "index.js"),
                 posixpath.join(base_path, "index.jsx"),
+                posixpath.join(base_path, "index.vue"),
             ]
 
         def _resolve_existing_import_path(candidate_paths: list[str]) -> str | None:
@@ -5516,16 +5674,40 @@ class Indexer:
             candidates: list[dict[str, object]],
         ) -> str | None:
             for suffix in _workspace_alias_candidate_suffixes(module_specifier):
+                indexed_matches = sorted({
+                    file_path
+                    for file_path in indexed_file_paths
+                    if file_path.endswith(suffix)
+                })
+                if len(indexed_matches) == 1:
+                    return indexed_matches[0]
+                if indexed_matches:
+                    return None
                 matched_paths = sorted({
                     str(candidate["file_path"])
                     for candidate in candidates
                     if str(candidate["file_path"]).endswith(suffix)
                 })
                 if len(matched_paths) == 1:
-                    return matched_paths[0]
+                        return matched_paths[0]
                 if matched_paths:
                     return None
             return None
+
+        def _resolve_module_specifier_path(
+            source_file_path: str,
+            module_specifier: str,
+            candidates: list[dict[str, object]],
+        ) -> str | None:
+            import_path = _import_candidate_path(source_file_path, module_specifier)
+            if import_path:
+                return import_path
+
+            tsconfig_alias_path, tsconfig_alias_handled = _resolve_tsconfig_alias_path(module_specifier)
+            if tsconfig_alias_handled:
+                return tsconfig_alias_path
+
+            return _resolve_workspace_alias_path(module_specifier, candidates)
 
         def _default_export_names(file_path: str) -> set[str]:
             if file_path in default_export_name_cache:
@@ -5547,6 +5729,151 @@ class Indexer:
                 ]
                 return _dedupe(deduped)
             return deduped if len(deduped) == 1 else []
+
+        def _prefer_kinds(
+            candidates: list[dict[str, object]],
+            preferred_kinds: set[str] | None,
+        ) -> list[dict[str, object]]:
+            deduped = _dedupe(candidates)
+            if preferred_kinds:
+                preferred = [candidate for candidate in deduped if candidate["kind"] in preferred_kinds]
+                if preferred:
+                    return _dedupe(preferred)
+            return deduped
+
+        def _resolve_exported_targets(
+            file_path: str,
+            export_name: str,
+            *,
+            preferred_kinds: set[str] | None = None,
+            seen: set[tuple[str, str]] | None = None,
+        ) -> list[dict[str, object]]:
+            if seen is None:
+                seen = set()
+            key = (file_path, export_name)
+            if key in seen:
+                return []
+            seen.add(key)
+
+            local_candidates = _prefer_kinds(
+                [
+                    candidate
+                    for candidate in symbols_by_name.get(export_name, [])
+                    if str(candidate["file_path"]) == file_path
+                ],
+                preferred_kinds,
+            )
+            if local_candidates:
+                return local_candidates
+
+            bindings = _export_bindings(file_path).get(export_name, [])
+            if not bindings:
+                return []
+
+            resolved: list[dict[str, object]] = []
+            all_candidates = list(symbol_by_id.values())
+            for local_name, module_specifier, export_kind in bindings:
+                target_name = local_name or export_name
+                if module_specifier:
+                    target_file_path = _resolve_module_specifier_path(
+                        file_path,
+                        module_specifier,
+                        all_candidates,
+                    )
+                    if not target_file_path:
+                        continue
+                    if export_kind == "default":
+                        module_candidates = _prefer_kinds(
+                            [
+                                candidate
+                                for candidate in all_candidates
+                                if str(candidate["file_path"]) == target_file_path
+                            ],
+                            preferred_kinds,
+                        )
+                        resolved.extend(_filter_default_import_candidates(module_candidates))
+                        continue
+
+                    direct_candidates = _prefer_kinds(
+                        [
+                            candidate
+                            for candidate in symbols_by_name.get(target_name, [])
+                            if str(candidate["file_path"]) == target_file_path
+                        ],
+                        preferred_kinds,
+                    )
+                    if direct_candidates:
+                        resolved.extend(direct_candidates)
+                        continue
+
+                    resolved.extend(
+                        _resolve_exported_targets(
+                            target_file_path,
+                            target_name,
+                            preferred_kinds=preferred_kinds,
+                            seen=seen,
+                        )
+                    )
+                    continue
+
+                direct_candidates = _prefer_kinds(
+                    [
+                        candidate
+                        for candidate in symbols_by_name.get(target_name, [])
+                        if str(candidate["file_path"]) == file_path
+                    ],
+                    preferred_kinds,
+                )
+                if direct_candidates:
+                    resolved.extend(direct_candidates)
+                    continue
+
+                import_binding = _import_bindings(file_path).get(target_name)
+                if not import_binding:
+                    continue
+                imported_name, imported_module, import_kind = import_binding
+                target_file_path = _resolve_module_specifier_path(
+                    file_path,
+                    imported_module,
+                    all_candidates,
+                )
+                if not target_file_path:
+                    continue
+                if import_kind == "default":
+                    module_candidates = _prefer_kinds(
+                        [
+                            candidate
+                            for candidate in all_candidates
+                            if str(candidate["file_path"]) == target_file_path
+                        ],
+                        preferred_kinds,
+                    )
+                    resolved.extend(_filter_default_import_candidates(module_candidates))
+                    continue
+
+                candidate_name = imported_name or target_name
+                direct_import_candidates = _prefer_kinds(
+                    [
+                        candidate
+                        for candidate in symbols_by_name.get(candidate_name, [])
+                        if str(candidate["file_path"]) == target_file_path
+                    ],
+                    preferred_kinds,
+                )
+                if direct_import_candidates:
+                    resolved.extend(direct_import_candidates)
+                    continue
+
+                resolved.extend(
+                    _resolve_exported_targets(
+                        target_file_path,
+                        candidate_name,
+                        preferred_kinds=preferred_kinds,
+                        seen=seen,
+                    )
+                )
+
+            return _dedupe(resolved)
 
         def _ownership_evidence_text(symbol: dict[str, object]) -> str:
             text = str(symbol["content"] or "")
@@ -5619,41 +5946,30 @@ class Indexer:
                         ]
                         if preferred:
                             binding_candidates = preferred
-                    import_path = _import_candidate_path(source_file_path, module_specifier)
-                    if import_path:
-                        deduped = _dedupe([
-                            candidate
-                            for candidate in binding_candidates
-                            if str(candidate["file_path"]) == import_path
-                        ])
-                        if import_kind == "default":
-                            return _filter_default_import_candidates(deduped)
-                        return deduped
-                    tsconfig_alias_path, tsconfig_alias_handled = _resolve_tsconfig_alias_path(module_specifier)
-                    if tsconfig_alias_handled:
-                        if not tsconfig_alias_path:
-                            return []
-                        deduped = _dedupe([
-                            candidate
-                            for candidate in binding_candidates
-                            if str(candidate["file_path"]) == tsconfig_alias_path
-                        ])
-                        if import_kind == "default":
-                            return _filter_default_import_candidates(deduped)
-                        return deduped
-                    workspace_alias_path = _resolve_workspace_alias_path(
+                    resolved_module_path = _resolve_module_specifier_path(
+                        source_file_path,
                         module_specifier,
-                        binding_candidates,
+                        binding_candidates or list(symbol_by_id.values()),
                     )
-                    if workspace_alias_path:
+                    if resolved_module_path:
                         deduped = _dedupe([
                             candidate
                             for candidate in binding_candidates
-                            if str(candidate["file_path"]) == workspace_alias_path
+                            if str(candidate["file_path"]) == resolved_module_path
                         ])
                         if import_kind == "default":
                             return _filter_default_import_candidates(deduped)
-                        return deduped
+                        if deduped:
+                            return deduped
+                        if import_kind == "named":
+                            resolved_exports = _resolve_exported_targets(
+                                resolved_module_path,
+                                imported_name or name,
+                                preferred_kinds=preferred_kinds,
+                            )
+                            if resolved_exports:
+                                return resolved_exports
+                        return []
                     return []
             if not candidates:
                 return []
@@ -5859,6 +6175,17 @@ class Indexer:
                 for name in queue_names:
                     for target in _resolve_targets(name, source=symbol, preferred_kinds={"queue"}):
                         _add_edge(symbol, target, "queue_processor_queue")
+
+            if symbol["kind"] == "component":
+                constructed_class_names = _metadata_names(metadata, ("constructed_classes",))
+                for name in constructed_class_names:
+                    for target in _resolve_targets(name, source=symbol, preferred_kinds={"class"}):
+                        _add_edge(symbol, target, "component_constructor")
+
+                template_ref_targets = _metadata_names(metadata, ("template_ref_targets",))
+                for name in template_ref_targets:
+                    for target in _resolve_targets(name, source=symbol, preferred_kinds={"component"}):
+                        _add_edge(symbol, target, "component_template_ref")
 
         return len(created_edges)
 

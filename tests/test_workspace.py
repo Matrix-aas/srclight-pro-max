@@ -686,7 +686,7 @@ def test_workspace_db_list_files_and_get_file_summary_are_project_scoped(tmp_pat
                 "language": "typescript",
                 "size": 500,
                 "line_count": 50,
-                "summary": None,
+                "summary": "Top-level symbols: DomainModel (class).",
             },
         ]
 

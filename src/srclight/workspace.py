@@ -565,6 +565,7 @@ class WorkspaceDB:
                     representative_files,
                     framework_hints,
                     indexed_hints=indexed_hints,
+                    mode="workspace",
                 )
                 result.update({
                     "repo_root": str(repo_root),

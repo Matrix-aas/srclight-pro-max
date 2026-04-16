@@ -512,7 +512,7 @@ class TestFileNavigationTools:
                 "language": "typescript",
                 "size": 100,
                 "line_count": 10,
-                "summary": None,
+                "summary": "Indexed typescript file. No top-level symbols indexed.",
             },
         ]
 
@@ -523,6 +523,56 @@ class TestFileNavigationTools:
         ))
         assert deep_payload["recursive"] is True
         assert len(deep_payload["files"]) == 2
+
+    def test_list_files_derives_summary_from_top_level_symbols_when_file_summary_missing(self, db, monkeypatch):
+        file_path = "shared/src/domain/level/LayoutEngine.ts"
+        file_id = _insert_file(db, path=file_path, language="typescript")
+        _insert_symbol(
+            db,
+            file_id,
+            "LayoutEngine",
+            file_path=file_path,
+            kind="class",
+            start_line=1,
+            end_line=40,
+            signature="class LayoutEngine",
+            content="export class LayoutEngine {}",
+        )
+        _insert_symbol(
+            db,
+            file_id,
+            "measureNode",
+            file_path=file_path,
+            kind="function",
+            start_line=42,
+            end_line=55,
+            signature="function measureNode(node)",
+            content="export function measureNode(node) {}",
+        )
+        db.commit()
+
+        monkeypatch.setattr("srclight.server._is_workspace_mode", lambda: False)
+        monkeypatch.setattr("srclight.server._get_db", lambda: db)
+
+        payload = json.loads(server.list_files(path_prefix="shared/src/domain/level"))
+        assert payload["files"]
+        assert payload["files"][0]["summary"] == (
+            "Top-level symbols: LayoutEngine (class), measureNode (function)."
+        )
+
+    def test_list_files_marks_index_barrels_when_no_symbols_are_indexed(self, db, monkeypatch):
+        file_path = "shared/src/domain/level/index.ts"
+        _insert_file(db, path=file_path, language="typescript")
+        db.commit()
+
+        monkeypatch.setattr("srclight.server._is_workspace_mode", lambda: False)
+        monkeypatch.setattr("srclight.server._get_db", lambda: db)
+
+        payload = json.loads(server.list_files(path_prefix="shared/src/domain/level"))
+        assert payload["files"]
+        assert payload["files"][0]["summary"] == (
+            "Index barrel file (typescript). No top-level symbols indexed."
+        )
 
     def test_get_file_summary_returns_summary_and_top_level_symbols(self, db, monkeypatch):
         file_path = "client/src/components/ProfileCard.vue"

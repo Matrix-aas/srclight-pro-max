@@ -1,6 +1,7 @@
 """Tests for new features: search quality, edges, templates, parent-child, qualified names."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -615,6 +616,85 @@ def test_get_communities_verbose_returns_detailed_members(monkeypatch, db):
     assert "qualified_name" in communities["communities"][0]["members"][0]
 
 
+def test_get_communities_path_prefix_escapes_like_wildcards(monkeypatch, db):
+    exact_file = db.upsert_file(
+        FileRecord(
+            path="server/__tests__/alpha.ts",
+            content_hash="server/__tests__/alpha.ts",
+            mtime=1.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        )
+    )
+    wildcard_file = db.upsert_file(
+        FileRecord(
+            path="server/aatestsbb/beta.ts",
+            content_hash="server/aatestsbb/beta.ts",
+            mtime=1.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        )
+    )
+    exact_symbol = db.insert_symbol(
+        SymbolRecord(
+            file_id=exact_file,
+            kind="function",
+            name="exactSpec",
+            qualified_name="exactSpec",
+            start_line=1,
+            end_line=3,
+            content="exactSpec",
+            line_count=3,
+        ),
+        "server/__tests__/alpha.ts",
+    )
+    wildcard_symbol = db.insert_symbol(
+        SymbolRecord(
+            file_id=wildcard_file,
+            kind="function",
+            name="wildcardLeak",
+            qualified_name="wildcardLeak",
+            start_line=1,
+            end_line=3,
+            content="wildcardLeak",
+            line_count=3,
+        ),
+        "server/aatestsbb/beta.ts",
+    )
+    db.commit()
+    db.store_communities([
+        {
+            "id": 1,
+            "label": "Exact test community",
+            "symbol_count": 1,
+            "cohesion": 0.9,
+            "keywords": ["exact"],
+            "metadata": None,
+            "members": [{"id": exact_symbol}],
+        },
+        {
+            "id": 2,
+            "label": "Wildcard leak community",
+            "symbol_count": 1,
+            "cohesion": 0.9,
+            "keywords": ["wildcard"],
+            "metadata": None,
+            "members": [{"id": wildcard_symbol}],
+        },
+    ])
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    communities = json.loads(server.get_communities(path_prefix="server/__tests__/"))
+
+    assert communities["community_count"] == 1
+    assert communities["communities"][0]["label"] == "Exact test community"
+
+
 def test_get_execution_flows_summary_first_by_default(monkeypatch, db):
     _store_server_flow_graph(db)
 
@@ -641,6 +721,283 @@ def test_get_execution_flows_verbose_and_filtered(monkeypatch, db):
     assert verbose["flows"][0]["steps"]
     assert verbose["flows"][0]["max_depth_applied"] == 4
     assert filtered["flows"]
+
+
+def test_get_execution_flows_deduplicates_identical_filtered_shapes(monkeypatch, db):
+    server_file = db.upsert_file(
+        FileRecord(
+            path="server/game.ts",
+            content_hash="server/game.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    client_file = db.upsert_file(
+        FileRecord(
+            path="client/ui.ts",
+            content_hash="client/ui.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+
+    pre_a = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="resumeFromMenu",
+            qualified_name="client.resumeFromMenu",
+            start_line=1,
+            end_line=3,
+            content="resumeFromMenu",
+            line_count=3,
+        ),
+        "client/ui.ts",
+    )
+    pre_b = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="resumeFromHotkey",
+            qualified_name="client.resumeFromHotkey",
+            start_line=5,
+            end_line=7,
+            content="resumeFromHotkey",
+            line_count=3,
+        ),
+        "client/ui.ts",
+    )
+    resume = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="resume",
+            qualified_name="server.resume",
+            start_line=1,
+            end_line=3,
+            content="resume",
+            line_count=3,
+        ),
+        "server/game.ts",
+    )
+    all_connected = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="allConnected",
+            qualified_name="server.allConnected",
+            start_line=5,
+            end_line=7,
+            content="allConnected",
+            line_count=3,
+        ),
+        "server/game.ts",
+    )
+    post_a = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="finishResumeAnimation",
+            qualified_name="client.finishResumeAnimation",
+            start_line=9,
+            end_line=11,
+            content="finishResumeAnimation",
+            line_count=3,
+        ),
+        "client/ui.ts",
+    )
+    post_b = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="playResumeSound",
+            qualified_name="client.playResumeSound",
+            start_line=13,
+            end_line=15,
+            content="playResumeSound",
+            line_count=3,
+        ),
+        "client/ui.ts",
+    )
+    db.commit()
+
+    db.store_execution_flows([
+        {
+            "label": "resumeFromMenu -> finishResumeAnimation",
+            "entry_symbol_id": pre_a,
+            "terminal_symbol_id": post_a,
+            "step_count": 4,
+            "communities_crossed": 1,
+            "steps": [
+                {"order": 0, "symbol_id": pre_a, "community_id": 0},
+                {"order": 1, "symbol_id": resume, "community_id": 1},
+                {"order": 2, "symbol_id": all_connected, "community_id": 1},
+                {"order": 3, "symbol_id": post_a, "community_id": 0},
+            ],
+        },
+        {
+            "label": "resumeFromHotkey -> playResumeSound",
+            "entry_symbol_id": pre_b,
+            "terminal_symbol_id": post_b,
+            "step_count": 4,
+            "communities_crossed": 1,
+            "steps": [
+                {"order": 0, "symbol_id": pre_b, "community_id": 0},
+                {"order": 1, "symbol_id": resume, "community_id": 1},
+                {"order": 2, "symbol_id": all_connected, "community_id": 1},
+                {"order": 3, "symbol_id": post_b, "community_id": 0},
+            ],
+        },
+    ])
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    filtered = json.loads(server.get_execution_flows(path_prefix="server/"))
+    verbose = json.loads(server.get_execution_flows(path_prefix="server/", verbose=True))
+
+    assert filtered["flow_count"] == 1
+    assert filtered["flows"][0]["label"] == "resume -> allConnected"
+    assert len(filtered["flows"][0]["key_steps"]) == 2
+    assert verbose["flow_count"] == 1
+    assert len(verbose["flows"][0]["steps"]) == 2
+
+
+def test_vue_component_constructor_and_template_ref_edges_feed_impact(monkeypatch, db, tmp_path):
+    project = tmp_path / "vue-impact-project"
+    project.mkdir()
+
+    render_dir = project / "render"
+    render_dir.mkdir()
+
+    (render_dir / "BoardRenderer3D.ts").write_text("""\
+export class BoardRenderer3D {
+  mount() {
+    return true;
+  }
+}
+""")
+
+    (render_dir / "index.ts").write_text("""\
+export { BoardRenderer3D as BoardRenderer, BoardRenderer3D } from './BoardRenderer3D'
+""")
+
+    (project / "BoardPreview.vue").write_text("""\
+<template>
+  <canvas />
+</template>
+
+<script setup lang="ts">
+defineProps<{ zoom: number }>()
+</script>
+""")
+
+    (project / "GameBoard.vue").write_text("""\
+<template>
+  <BoardPreview ref="boardPreview" />
+</template>
+
+<script setup lang="ts">
+import { BoardRenderer } from './render'
+import BoardPreview from './BoardPreview.vue'
+
+const preview = useTemplateRef('boardPreview')
+const renderer = new BoardRenderer()
+const ready = new Promise<void>(() => {})
+</script>
+""")
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    board_renderer = db.get_symbol_by_name("BoardRenderer3D")
+    board_preview = db.get_symbol_by_name("BoardPreview")
+    game_board = db.get_symbol_by_name("GameBoard")
+
+    assert board_renderer is not None
+    assert board_preview is not None
+    assert game_board is not None
+    assert "Promise" not in ((game_board.metadata or {}).get("constructed_classes") or [])
+
+    renderer_callers = db.get_callers(board_renderer.id)
+    preview_callers = db.get_callers(board_preview.id)
+
+    assert any(item["symbol"].name == "GameBoard" for item in renderer_callers)
+    assert any(item["symbol"].name == "GameBoard" for item in preview_callers)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    impact = json.loads(server.get_impact("BoardRenderer3D"))
+
+    assert impact["direct_dependents"] >= 1
+
+
+def test_semantic_search_filters_low_similarity_results(monkeypatch):
+    class FakeDB:
+        def embedding_stats(self):
+            return {"model": "ollama:test", "dimensions": 3}
+
+        def vector_search(self, query_bytes, dims, kind=None, limit=10, cache=None):
+            return [
+                {"symbol_id": 1, "name": "HighMatch", "kind": "function", "similarity": 0.91},
+                {"symbol_id": 2, "name": "NoiseMatch", "kind": "function", "similarity": 0.12},
+            ][:limit]
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_get_vector_cache", lambda: None)
+
+    import srclight.embeddings as embeddings
+
+    monkeypatch.setattr(
+        embeddings,
+        "get_provider",
+        lambda model: SimpleNamespace(embed_one=lambda query: [0.1, 0.2, 0.3]),
+    )
+
+    payload = json.loads(server.semantic_search("rendering pipeline", min_similarity=0.3))
+
+    assert payload["result_count"] == 1
+    assert payload["results"][0]["name"] == "HighMatch"
+
+
+def test_hybrid_search_filters_low_similarity_embedding_noise(monkeypatch):
+    class FakeDB:
+        def search_symbols(self, query, kind=None, limit=40):
+            return []
+
+        def embedding_stats(self):
+            return {"model": "ollama:test", "dimensions": 3}
+
+        def vector_search(self, query_bytes, dims, kind=None, limit=40, cache=None):
+            return [
+                {"symbol_id": 1, "name": "StrongSemantic", "kind": "function", "similarity": 0.81},
+                {"symbol_id": 2, "name": "WeakSemantic", "kind": "function", "similarity": 0.14},
+            ][:limit]
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_get_vector_cache", lambda: None)
+
+    import srclight.embeddings as embeddings
+
+    monkeypatch.setattr(
+        embeddings,
+        "get_provider",
+        lambda model: SimpleNamespace(embed_one=lambda query: [0.1, 0.2, 0.3]),
+    )
+    monkeypatch.setattr(embeddings, "rrf_merge", lambda fts, emb: emb)
+
+    payload = json.loads(server.hybrid_search("rendering pipeline", min_similarity=0.3))
+
+    assert payload["result_count"] == 1
+    assert payload["results"][0]["name"] == "StrongSemantic"
 
 
 def test_get_community_missing_symbol_returns_file_level_fallback(monkeypatch, db):

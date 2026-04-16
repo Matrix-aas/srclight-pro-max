@@ -193,7 +193,7 @@ def test_indexer_build_change_forces_full_reindex(db, sample_project, monkeypatc
 
 def test_indexer_build_id_marks_wave2_async_extractor_version():
     """Vue metadata changes should produce a distinct build id suffix."""
-    assert INDEXER_BUILD_ID.endswith("vue-normalized-metadata-v1")
+    assert INDEXER_BUILD_ID.endswith("vue-normalized-metadata-v4")
 
 
 def test_index_csharp_doc_comments_do_not_leak_to_methods(db, tmp_path):
@@ -977,6 +977,14 @@ export function separatorDoc() {
   return false;
 }
 
+/**
+ * Mixed Vue docs should survive even when a separator sits closest.
+ */
+// -------
+export function mixedNoiseDoc() {
+  return true;
+}
+
 // FIXME: temporary Vue helper
 export function todoDoc() {
   return true;
@@ -1057,6 +1065,8 @@ def test_index_vue_script_doc_comments_filter_noise(db, vue_project):
 
     assert "Real Vue docs should remain attached." in (syms["meaningfulDoc"].doc_comment or "")
     assert syms["separatorDoc"].doc_comment is None
+    assert "Mixed Vue docs should survive" in (syms["mixedNoiseDoc"].doc_comment or "")
+    assert "-------" not in (syms["mixedNoiseDoc"].doc_comment or "")
     assert syms["todoDoc"].doc_comment is None
 
 
@@ -1363,6 +1373,12 @@ def test_index_vue_normalized_metadata_and_file_summary_are_persisted(db, vue_pr
     assert component.metadata["scoped_styles"] == ["scoped"]
     assert component.metadata["template"]["components"] == ["BaseCard"]
     assert component.metadata["style"]["flags"] == ["module", "scoped"]
+    assert component.signature is not None
+    assert component.signature.startswith("component NormalizedSignals")
+    assert "props: msg" in component.signature
+    assert "emits: save" in component.signature
+    assert "slots: header" in component.signature
+    assert "--accent-color" not in component.signature
 
     file_summary = db.get_file_summary("NormalizedSignals.vue")
     assert file_summary is not None
@@ -1372,6 +1388,13 @@ def test_index_vue_normalized_metadata_and_file_summary_are_persisted(db, vue_pr
     assert file_summary["metadata"]["resource"] == "component"
     assert file_summary["metadata"]["props"] == ["msg"]
     assert file_summary["metadata"]["css_modules"] == ["card"]
+
+    search_results = db.search_symbols("NormalizedSignals")
+    assert search_results
+    assert search_results[0]["signature"].startswith("component NormalizedSignals")
+    assert "props: msg" in search_results[0]["signature"]
+    assert "emits: save" in search_results[0]["signature"]
+    assert "--accent-color" not in (search_results[0]["signature"] or "")
 
 
 def test_index_vue_nested_macro_keys_ignore_string_noise(db, vue_project):
@@ -1473,7 +1496,7 @@ const emit = defineEmits<{ save: [] }>()
 
     cleared_summary = db.get_file_summary("SignalCleanup.vue")
     assert cleared_summary is not None
-    assert cleared_summary["summary"] is None
+    assert cleared_summary["summary"] == "Indexed vue file. No top-level symbols indexed."
     assert cleared_summary["metadata"] in (None, {})
     assert all(sym.kind != "component" for sym in db.symbols_in_file("SignalCleanup.vue"))
 
@@ -1833,6 +1856,14 @@ export function separatorDoc() {
   return false;
 }
 
+/**
+ * Mixed backend docs should survive even when a separator sits closest.
+ */
+// ======
+export function mixedNoiseDoc() {
+  return true;
+}
+
 // TODO: remove this placeholder after cleanup
 export function todoDoc() {
   return true;
@@ -2161,6 +2192,8 @@ def test_index_typescript_backend_framework_exports(db, typescript_backend_proje
     }
     assert "Real docs should remain attached." in (doc_symbols["meaningfulDoc"].doc_comment or "")
     assert doc_symbols["separatorDoc"].doc_comment is None
+    assert "Mixed backend docs should survive" in (doc_symbols["mixedNoiseDoc"].doc_comment or "")
+    assert "======" not in (doc_symbols["mixedNoiseDoc"].doc_comment or "")
     assert doc_symbols["todoDoc"].doc_comment is None
 
     health_symbols = {sym.name: sym for sym in db.symbols_in_file("server/src/routes/health.ts")}

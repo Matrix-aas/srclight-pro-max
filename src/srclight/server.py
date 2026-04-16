@@ -823,6 +823,8 @@ def _build_topology(
     representative_files: dict[str, list[str]],
     framework_hints: dict[str, object],
     indexed_hints: dict[str, object] | None = None,
+    *,
+    mode: str = "single",
 ) -> dict[str, dict[str, object]]:
     """Summarize the main architectural surfaces visible from repo layout."""
     manifest = _load_package_manifest(root)
@@ -851,6 +853,18 @@ def _build_topology(
         [path for path in backend_files if path.startswith(("server/api", "server/routes"))],
         limit=3,
     )
+    if (
+        mode == "single"
+        and
+        len(route_files) == 2
+        and any(path.startswith(("server/api", "server/routes")) for path in route_files)
+        and any(path.endswith(".controller.ts") or path.endswith(".controller.js") for path in route_files)
+        and not any(path.startswith("src/controllers/") for path in route_files)
+    ):
+        route_files = sorted(
+            route_files,
+            key=lambda path: (0 if path.startswith(("server/api", "server/routes")) else 1, path),
+        )
     if route_files and not route_systems:
         route_systems = ["generic"]
     if route_systems:
@@ -884,12 +898,33 @@ def _build_topology(
             "files": async_files,
         }
 
+    runtime_indexed_files = list(indexed_hints.get("runtime_files") or [])
+    special_runtime_configs = _collect_existing_paths(
+        root,
+        ("nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs", "package.json", "nest-cli.json"),
+        limit=5,
+    )
     runtime_files = _merge_representative_paths(
-        list(indexed_hints.get("runtime_files") or []),
+        runtime_indexed_files,
         [path for path in representative_files.get("config", []) if path in {"nuxt.config.ts", "nuxt.config.js", "nuxt.config.mjs", "package.json", "nest-cli.json"}],
         _collect_repo_files(root, ("src/config", "config"), limit=2, allowed_suffixes=(".ts", ".js", ".json", ".yaml", ".yml")),
         limit=3,
     )
+    if mode == "single" and len(runtime_indexed_files) > 1 and special_runtime_configs:
+        module_like_runtime_files = [
+            path
+            for path in runtime_indexed_files
+            if path.endswith(".module.ts")
+            or path.endswith(".module.js")
+            or "/runtime/" in path
+        ]
+        preferred_runtime = _merge_representative_paths(
+            special_runtime_configs,
+            module_like_runtime_files,
+            limit=3,
+        )
+        if preferred_runtime:
+            runtime_files = preferred_runtime
     if runtime_files:
         topology["runtime"] = {
             "files": runtime_files,
@@ -1310,6 +1345,20 @@ def _shape_search_result(result: dict[str, object]) -> dict[str, object]:
     return shaped
 
 
+def _filter_by_min_similarity(
+    results: list[dict[str, object]],
+    min_similarity: float | None,
+) -> list[dict[str, object]]:
+    """Drop semantic results below a caller-provided similarity floor."""
+    if min_similarity is None:
+        return results
+    return [
+        result
+        for result in results
+        if result.get("similarity") is None or float(result["similarity"]) >= min_similarity
+    ]
+
+
 def _format_community_payload(
     db: Database,
     symbol_name: str,
@@ -1536,7 +1585,7 @@ def codebase_map(project: str | None = None) -> str:
     representative_files = _find_representative_files(repo_root)
     framework_hints = _detect_framework_hints(repo_root, representative_files)
     start_here = _build_start_here(representative_files, framework_hints)
-    topology = _build_topology(repo_root, representative_files, framework_hints)
+    topology = _build_topology(repo_root, representative_files, framework_hints, mode="single")
     db_exists = db_path.exists()
     db_size = db_path.stat().st_size if db_exists else 0
 
@@ -1583,7 +1632,13 @@ def codebase_map(project: str | None = None) -> str:
     extra_signals = set(indexed_hints.get("signals") or []) if indexed_hints else None
     framework_hints = _detect_framework_hints(repo_root, representative_files, extra_signals=extra_signals)
     start_here = _build_start_here(representative_files, framework_hints)
-    topology = _build_topology(repo_root, representative_files, framework_hints, indexed_hints=indexed_hints)
+    topology = _build_topology(
+        repo_root,
+        representative_files,
+        framework_hints,
+        indexed_hints=indexed_hints,
+        mode="single",
+    )
 
     result = {
         "mode": "single",
@@ -2773,7 +2828,11 @@ def platform_conditionals(project: str | None = None, platform: str | None = Non
 
 @mcp.tool()
 def semantic_search(
-    query: str, kind: str | None = None, project: str | None = None, limit: int = 10,
+    query: str,
+    kind: str | None = None,
+    project: str | None = None,
+    limit: int = 10,
+    min_similarity: float | None = 0.3,
 ) -> str:
     """Find semantically similar code using embeddings.
 
@@ -2829,18 +2888,25 @@ def semantic_search(
     else:
         cache = _get_vector_cache()
         results = db.vector_search(query_bytes, dims, kind=kind, limit=limit, cache=cache)
+    results = _filter_by_min_similarity(results, min_similarity)
 
-    return json.dumps({
+    payload: dict[str, object] = {
         "query": query,
         "model": model_name,
+        "min_similarity": min_similarity,
         "result_count": len(results),
         "results": results,
-    }, indent=2)
+    }
+    return json.dumps(payload, indent=2)
 
 
 @mcp.tool()
 def hybrid_search(
-    query: str, kind: str | None = None, project: str | None = None, limit: int = 20,
+    query: str,
+    kind: str | None = None,
+    project: str | None = None,
+    limit: int = 20,
+    min_similarity: float | None = 0.3,
 ) -> str:
     """Search using both keyword matching AND semantic similarity.
 
@@ -2898,6 +2964,7 @@ def hybrid_search(
                 embedding_results = db.vector_search(
                     query_bytes, dims, kind=kind, limit=limit * 2, cache=cache
                 )
+            embedding_results = _filter_by_min_similarity(embedding_results, min_similarity)
             model_used = model_name
         except Exception as e:
             # Fail fast and report clearly when the embedding provider
@@ -2914,6 +2981,7 @@ def hybrid_search(
             "query": query,
             "mode": "hybrid (FTS5 + embeddings)",
             "model": model_used,
+            "min_similarity": min_similarity,
             "result_count": len(final),
             "results": [_shape_search_result(result) for result in final],
         }
@@ -2924,6 +2992,7 @@ def hybrid_search(
         payload = {
             "query": query,
             "mode": "keyword only (no embeddings available)",
+            "min_similarity": min_similarity,
             "result_count": min(len(fts_results), limit),
             "results": [_shape_search_result(result) for result in fts_results[:limit]],
         }

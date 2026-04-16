@@ -259,6 +259,64 @@ def _file_embedding_context_hash(summary: str | None, metadata: dict | None) -> 
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
+def _fallback_file_summary(
+    explicit_summary: str | None,
+    top_level_symbols: list[dict[str, Any]] | None = None,
+    *,
+    path: str | None = None,
+    language: str | None = None,
+) -> str | None:
+    """Return a cheap derived file summary when no persisted summary exists."""
+    if explicit_summary:
+        return explicit_summary
+    if not top_level_symbols:
+        if not path:
+            return None
+        basename = path.rsplit("/", 1)[-1]
+        if basename.startswith("index."):
+            if language:
+                return f"Index barrel file ({language}). No top-level symbols indexed."
+            return "Index barrel file. No top-level symbols indexed."
+        if language:
+            return f"Indexed {language} file. No top-level symbols indexed."
+        return "Indexed file. No top-level symbols indexed."
+
+    preview = [
+        f"{symbol['name']} ({symbol['kind']})"
+        for symbol in top_level_symbols[:3]
+        if symbol.get("name") and symbol.get("kind")
+    ]
+    if not preview:
+        return None
+    return "Top-level symbols: " + ", ".join(preview) + "."
+
+
+def _execution_flow_dedupe_key(flow: dict[str, Any]) -> tuple[Any, ...]:
+    """Build a stable key for deduplicating shaped execution-flow payloads."""
+    steps = flow.get("steps") or flow.get("key_steps") or []
+    step_key = tuple(
+        (
+            step.get("step_order"),
+            step.get("name"),
+            step.get("kind"),
+            step.get("file_path"),
+            step.get("community_id"),
+            step.get("symbol_id"),
+        )
+        for step in steps
+    )
+    return (
+        flow.get("label"),
+        flow.get("entry"),
+        flow.get("terminal"),
+        flow.get("step_count"),
+        flow.get("communities_crossed"),
+        flow.get("truncated"),
+        flow.get("max_depth_applied"),
+        step_key,
+    )
+
+
 _UNSET = object()
 
 SCHEMA_VERSION = 7
@@ -671,7 +729,7 @@ class Database:
         normalized_prefix = (path_prefix or "").strip().strip("/")
         params: list[Any] = []
         query = """
-            SELECT path, language, size, line_count, summary
+            SELECT id, path, language, size, line_count, summary
             FROM files
         """
         if normalized_prefix:
@@ -688,6 +746,26 @@ class Database:
         params.append(limit)
 
         rows = self.conn.execute(query, params).fetchall()
+        file_ids = [int(row["id"]) for row in rows]
+        top_level_symbols: dict[int, list[dict[str, Any]]] = {}
+        if file_ids:
+            placeholders = ",".join("?" for _ in file_ids)
+            symbol_rows = self.conn.execute(
+                f"""SELECT file_id, name, kind
+                    FROM symbols
+                    WHERE parent_symbol_id IS NULL
+                      AND file_id IN ({placeholders})
+                    ORDER BY file_id, start_line, id""",
+                file_ids,
+            ).fetchall()
+            for row in symbol_rows:
+                bucket = top_level_symbols.setdefault(int(row["file_id"]), [])
+                if len(bucket) >= 3:
+                    continue
+                bucket.append({
+                    "name": row["name"],
+                    "kind": row["kind"],
+                })
         files: list[dict[str, Any]] = []
         for row in rows:
             files.append({
@@ -695,7 +773,12 @@ class Database:
                 "language": row["language"],
                 "size": row["size"],
                 "line_count": row["line_count"],
-                "summary": row["summary"],
+                "summary": _fallback_file_summary(
+                    row["summary"],
+                    top_level_symbols.get(int(row["id"]), []),
+                    path=row["path"],
+                    language=row["language"],
+                ),
             })
         return files
 
@@ -744,23 +827,29 @@ class Database:
             (file_rec.id,),
         ).fetchall()
 
+        top_level_symbols = [
+            {
+                "name": row["name"],
+                "kind": row["kind"],
+                "signature": row["signature"],
+                "line": row["start_line"],
+                "end_line": row["end_line"],
+            }
+            for row in rows
+        ]
         return {
             "file": file_rec.path,
             "language": file_rec.language,
             "size": file_rec.size,
             "line_count": file_rec.line_count,
-            "summary": file_rec.summary,
+            "summary": _fallback_file_summary(
+                file_rec.summary,
+                top_level_symbols,
+                path=file_rec.path,
+                language=file_rec.language,
+            ),
             "metadata": file_rec.metadata,
-            "top_level_symbols": [
-                {
-                    "name": row["name"],
-                    "kind": row["kind"],
-                    "signature": row["signature"],
-                    "line": row["start_line"],
-                    "end_line": row["end_line"],
-                }
-                for row in rows
-            ],
+            "top_level_symbols": top_level_symbols,
         }
 
     def _refresh_file_embedding_context_hash(self, file_id: int) -> None:
@@ -1886,6 +1975,19 @@ class Database:
             except sqlite3.OperationalError:
                 pass
 
+        if results:
+            symbol_ids = [int(result["symbol_id"]) for result in results]
+            placeholders = ",".join("?" for _ in symbol_ids)
+            signature_rows = self.conn.execute(
+                f"""SELECT id, signature
+                    FROM symbols
+                    WHERE id IN ({placeholders})""",
+                symbol_ids,
+            ).fetchall()
+            signatures = {int(row["id"]): row["signature"] for row in signature_rows}
+            for result in results:
+                result["signature"] = signatures.get(int(result["symbol_id"]))
+
         self._rerank_search_results(results, query, code_like_query)
 
         # Sort: project code first, then by rank within each group
@@ -2399,11 +2501,11 @@ class Database:
         clauses: list[str] = []
         params: list[str] = []
         if path_prefix:
-            clauses.append(f"{file_alias}.path LIKE ?")
-            params.append(f"{path_prefix}%")
+            clauses.append(f"{file_alias}.path LIKE ? ESCAPE '\\'")
+            params.append(f"{_escape_like_literal(path_prefix)}%")
         if layer:
-            clauses.append(f"{file_alias}.path LIKE ?")
-            params.append(f"{layer}/%")
+            clauses.append(f"{file_alias}.path LIKE ? ESCAPE '\\'")
+            params.append(f"{_escape_like_literal(layer)}/%")
         if not clauses:
             return "", []
         return " AND " + " AND ".join(clauses), params
@@ -2695,7 +2797,15 @@ class Database:
             elif steps:
                 item["key_steps"] = steps
             results.append(item)
-        return results
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for item in results:
+            key = _execution_flow_dedupe_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
 
     def get_flows_for_symbol(self, symbol_id: int) -> list[dict]:
         """Get all execution flows that pass through a symbol."""
