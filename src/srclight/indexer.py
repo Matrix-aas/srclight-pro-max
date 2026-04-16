@@ -1084,6 +1084,25 @@ def _resolve_typescript_import_path(
     if root_path is None:
         return None
 
+    def _nearest_config_root() -> Path:
+        source_dir = (root_path / source_file_path).parent
+        try:
+            source_dir.relative_to(root_path)
+        except ValueError:
+            return root_path
+        for candidate_dir in (source_dir, *source_dir.parents):
+            for config_name in ("tsconfig.json", "jsconfig.json"):
+                if (candidate_dir / config_name).is_file():
+                    return candidate_dir
+            if candidate_dir == root_path:
+                break
+        return root_path
+
+    config_root = _nearest_config_root()
+    config_prefix = posixpath.relpath(config_root.as_posix(), root_path.as_posix())
+    if config_prefix == ".":
+        config_prefix = ""
+
     if module_specifier.startswith("."):
         base_path = posixpath.normpath((Path(source_file_path).parent / module_specifier).as_posix())
         return _resolve_existing_import_path(
@@ -1092,9 +1111,13 @@ def _resolve_typescript_import_path(
         )
 
     alias_path, alias_handled = _resolve_typescript_alias_rule(
-        root_path,
+        config_root,
         module_specifier,
-        lambda candidate_paths: _resolve_existing_import_path(root_path, candidate_paths),
+        lambda candidate_paths: (
+            posixpath.normpath(posixpath.join(config_prefix, resolved))
+            if (resolved := _resolve_existing_import_path(config_root, candidate_paths)) and config_prefix
+            else _resolve_existing_import_path(config_root, candidate_paths)
+        ),
     )
     if alias_handled:
         return alias_path
@@ -1118,6 +1141,64 @@ def _resolve_typescript_import_path(
         if len(matches) == 1:
             return matches[0]
         return None
+
+    package_json = root_path / "package.json"
+    if package_json.is_file():
+        try:
+            pkg = _parse_jsonc(package_json.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            pkg = None
+        workspace_patterns: list[str] = []
+        if isinstance(pkg, dict):
+            raw_workspaces = pkg.get("workspaces")
+            if isinstance(raw_workspaces, list):
+                workspace_patterns = [item for item in raw_workspaces if isinstance(item, str)]
+            elif isinstance(raw_workspaces, dict):
+                packages = raw_workspaces.get("packages")
+                if isinstance(packages, list):
+                    workspace_patterns = [item for item in packages if isinstance(item, str)]
+
+        for pattern in workspace_patterns:
+            for child_pkg_path in sorted(root_path.glob(f"{pattern}/package.json")):
+                if child_pkg_path == package_json:
+                    continue
+                try:
+                    child_pkg = _parse_jsonc(child_pkg_path.read_text(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+                if not isinstance(child_pkg, dict):
+                    continue
+                package_name = child_pkg.get("name")
+                if not isinstance(package_name, str) or not package_name:
+                    continue
+                package_rel = child_pkg_path.parent.relative_to(root_path).as_posix()
+                if module_specifier == package_name:
+                    direct = _resolve_existing_import_path(
+                        root_path,
+                        [
+                            posixpath.join(package_rel, "src/index.ts"),
+                            posixpath.join(package_rel, "src/index.tsx"),
+                            posixpath.join(package_rel, "src/index.js"),
+                            posixpath.join(package_rel, "src/index.jsx"),
+                            posixpath.join(package_rel, "index.ts"),
+                            posixpath.join(package_rel, "index.tsx"),
+                            posixpath.join(package_rel, "index.js"),
+                            posixpath.join(package_rel, "index.jsx"),
+                        ],
+                    )
+                    if direct:
+                        return direct
+                if module_specifier.startswith(f"{package_name}/"):
+                    suffix = module_specifier[len(package_name) + 1:]
+                    direct = _resolve_existing_import_path(
+                        root_path,
+                        _ordered_import_candidate_paths(
+                            posixpath.join(package_rel, suffix),
+                            suffix,
+                        ),
+                    )
+                    if direct:
+                        return direct
 
     return None
 
@@ -2220,6 +2301,34 @@ def _extract_service_config_refs(
     return sorted(set(refs))
 
 
+def _extract_constructor_dependency_refs(
+    class_text: str,
+    inject_local_names: set[str],
+) -> list[str]:
+    """Recover constructor-injected dependency identifiers from Nest classes."""
+    refs: list[str] = []
+    for inject_name in inject_local_names:
+        refs.extend(re.findall(
+            rf"@\s*{re.escape(inject_name)}\s*\(\s*(?:forwardRef\s*\(\s*\(\s*\)\s*=>\s*)?([A-Za-z_$][\w$]*)",
+            class_text,
+        ))
+
+    ctor_match = re.search(r"\bconstructor\s*\(([\s\S]*?)\)\s*\{", class_text)
+    if not ctor_match:
+        return sorted(set(refs))
+
+    ignored = {
+        "Array", "Boolean", "ConfigType", "Date", "Map", "Number", "Object",
+        "Promise", "ReadonlyArray", "Record", "Set", "String",
+    }
+    params = ctor_match.group(1)
+    for type_expr in re.findall(r":\s*([^=,\n)]+)", params):
+        for token in re.findall(r"\b([A-Z][A-Za-z0-9_$]*)\b", type_expr):
+            if token not in ignored:
+                refs.append(token)
+    return sorted(set(refs))
+
+
 def _build_nest_symbol_overrides(
     source_text: str,
     def_node: Node,
@@ -2234,6 +2343,11 @@ def _build_nest_symbol_overrides(
     nest_config_imports = _imported_name_map_from_module(source_text, "@nestjs/config")
     nest_graphql_imports = _imported_name_map_from_module(source_text, "@nestjs/graphql")
     mikroorm_nest_imports = _imported_name_map_from_module(source_text, "@mikro-orm/nestjs")
+    class_text = def_node.text.decode("utf-8", errors="replace") if kind == "class" else ""
+    dependency_refs = _extract_constructor_dependency_refs(
+        class_text,
+        _local_names_for_import(nest_common_imports, "Inject"),
+    ) if class_text else []
 
     if kind == "class":
         for decorator_name, args in decorator_parts:
@@ -2247,6 +2361,7 @@ def _build_nest_symbol_overrides(
                         "framework": "nestjs",
                         "resource": "controller",
                         "controller_path": controller_path,
+                        "dependency_refs": dependency_refs,
                     },
                 }
             if decorator_name == "Module":
@@ -2322,35 +2437,50 @@ def _build_nest_symbol_overrides(
                     },
                 }
 
-        class_text = def_node.text.decode("utf-8", errors="replace")
         if symbol_name:
             if symbol_name.endswith("Guard") or "implements CanActivate" in class_text:
                 return {
                     "kind": "guard",
                     "signature": f"Guard {symbol_name}",
                     "doc_comment": f"Nest guard {symbol_name}.",
-                    "metadata": {"framework": "nestjs", "resource": "guard"},
+                    "metadata": {
+                        "framework": "nestjs",
+                        "resource": "guard",
+                        "dependency_refs": dependency_refs,
+                    },
                 }
             if symbol_name.endswith("Pipe") or "implements PipeTransform" in class_text:
                 return {
                     "kind": "pipe",
                     "signature": f"Pipe {symbol_name}",
                     "doc_comment": f"Nest pipe {symbol_name}.",
-                    "metadata": {"framework": "nestjs", "resource": "pipe"},
+                    "metadata": {
+                        "framework": "nestjs",
+                        "resource": "pipe",
+                        "dependency_refs": dependency_refs,
+                    },
                 }
             if symbol_name.endswith("Interceptor") or "implements NestInterceptor" in class_text:
                 return {
                     "kind": "interceptor",
                     "signature": f"Interceptor {symbol_name}",
                     "doc_comment": f"Nest interceptor {symbol_name}.",
-                    "metadata": {"framework": "nestjs", "resource": "interceptor"},
+                    "metadata": {
+                        "framework": "nestjs",
+                        "resource": "interceptor",
+                        "dependency_refs": dependency_refs,
+                    },
                 }
             if symbol_name.endswith("Middleware") or "implements NestMiddleware" in class_text:
                 return {
                     "kind": "middleware",
                     "signature": f"Middleware {symbol_name}",
                     "doc_comment": f"Nest middleware {symbol_name}.",
-                    "metadata": {"framework": "nestjs", "resource": "middleware"},
+                    "metadata": {
+                        "framework": "nestjs",
+                        "resource": "middleware",
+                        "dependency_refs": dependency_refs,
+                    },
                 }
             if "Injectable" in decorator_names:
                 config_refs = _extract_service_config_refs(
@@ -2366,6 +2496,7 @@ def _build_nest_symbol_overrides(
                         "framework": "nestjs",
                         "resource": "service",
                         "config_refs": config_refs,
+                        "dependency_refs": dependency_refs,
                     },
                 }
 
@@ -2705,16 +2836,21 @@ def _build_elysia_symbol_overrides(symbol_name: str, value_text: str) -> dict[st
     plugin_name = name_match.group(2) if name_match else None
 
     routes: list[dict[str, str]] = []
-    for method, _quote, path in re.findall(
-        r"\.(get|post|put|patch|delete|options|head|all|ws)\s*\(\s*(['\"`])([^'\"`]+)\2",
+    handler_refs: list[str] = []
+    for method, _quote, path, handler_name in re.findall(
+        r"\.(get|post|put|patch|delete|options|head|all|ws)\s*\(\s*(['\"`])([^'\"`]+)\2(?:\s*,\s*([A-Za-z_$][\w$]*))?",
         value_text,
         flags=re.IGNORECASE,
     ):
         method_upper = _ELYSIA_ROUTE_METHODS[method.lower()]
-        routes.append({
+        route = {
             "method": method_upper,
             "path": _normalize_route_path(prefix, path),
-        })
+        }
+        if handler_name:
+            route["handler"] = handler_name
+            handler_refs.append(handler_name)
+        routes.append(route)
 
     plugins = sorted(set(re.findall(r"\.use\s*\(\s*([A-Za-z_$][\w$]*)", value_text)))
     hooks = sorted(
@@ -2752,6 +2888,7 @@ def _build_elysia_symbol_overrides(symbol_name: str, value_text: str) -> dict[st
                 "name": symbol_name,
                 "prefix": prefix,
                 "routes": routes,
+                "handler_refs": sorted(set(handler_refs)),
                 "plugins": plugins,
                 "hooks": hooks,
             },
@@ -3319,6 +3456,7 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
     module_refs: list[str] = []
     slots: list[str] = []
     component_refs: list[str] = []
+    handler_refs: list[str] = []
 
     for match in template_re.finditer(text):
         inner = re.sub(r"<!--.*?-->", " ", match.group(1), flags=re.DOTALL)
@@ -3346,6 +3484,10 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
             for name in re.findall(r"(?:@|v-on:)([\w:-]+)", inner)
             if name
         )
+        for _, handler_expr in re.findall(r"(?:@[\w:.-]+|v-on:[\w:.-]+)\s*=\s*(['\"])(.*?)\1", inner, re.DOTALL):
+            handler_match = re.match(r"\s*([A-Za-z_$][\w$]*)\s*(?:\(|$)", handler_expr.strip())
+            if handler_match:
+                handler_refs.append(handler_match.group(1))
         bindings.extend(
             name
             for name in re.findall(r"(?:\:|v-bind:)([\w:-]+)", inner)
@@ -3373,6 +3515,7 @@ def _extract_vue_template_signals(text: str) -> dict[str, list[str]] | None:
         "module_refs": _unique_sorted(module_refs),
         "slots": _unique_sorted(slots),
         "component_refs": _unique_sorted(component_refs),
+        "handler_refs": _unique_sorted(handler_refs),
     }
 
     if any(signals.values()):
@@ -3385,7 +3528,7 @@ def _has_meaningful_vue_template_signals(signals: dict[str, list[str]] | None) -
     if not signals:
         return False
 
-    meaningful_keys = ("components", "directives", "events", "bindings", "module_refs", "slots")
+    meaningful_keys = ("components", "directives", "events", "bindings", "module_refs", "slots", "handler_refs")
     return any(signals[key] for key in meaningful_keys)
 
 
@@ -4326,6 +4469,7 @@ def _build_vue_component_metadata(
 
     metadata["slots"] = template_signals["slots"] if template_signals else []
     metadata["component_refs"] = template_signals["component_refs"] if template_signals else []
+    metadata["template_handlers"] = template_signals["handler_refs"] if template_signals else []
 
     css_modules: list[str] = []
     if style_signals and "module" in style_signals["flags"]:
@@ -5293,6 +5437,20 @@ class Indexer:
 
         def _compute_confidence(source_file: str, target_file: str) -> float:
             """Score edge confidence by proximity."""
+            def _runtime_unit(path: str) -> str | None:
+                parts = [part for part in path.split("/") if part]
+                if len(parts) >= 2 and parts[0] in {"apps", "packages"}:
+                    return f"{parts[0]}/{parts[1]}"
+                if not parts:
+                    return None
+                front_parts = {"app", "client", "frontend", "ui", "web"}
+                back_parts = {"api", "backend", "server", "worker"}
+                if parts[0] in front_parts:
+                    return "frontend"
+                if parts[0] in back_parts:
+                    return "backend"
+                return None
+
             if source_file == target_file:
                 return 1.0
             s_vendored = is_vendored_path(source_file)
@@ -5302,6 +5460,12 @@ class Indexer:
                 return 0.2
             # Both vendored = skip entirely
             if s_vendored and t_vendored:
+                return 0.1
+            s_unit = _runtime_unit(source_file)
+            t_unit = _runtime_unit(target_file)
+            if s_unit and t_unit and s_unit != t_unit:
+                if s_unit.startswith("packages/") or t_unit.startswith("packages/"):
+                    return 0.55
                 return 0.1
             # Same directory
             if _dir_of(source_file) == _dir_of(target_file):
@@ -6157,6 +6321,12 @@ class Indexer:
                     for target in _resolve_targets(name, source=symbol, preferred_kinds={"config"}):
                         _add_edge(target, symbol, "config_metadata_consumer")
 
+            dependency_ref_names = _metadata_names(metadata, ("dependency_refs",))
+            for name in dependency_ref_names:
+                for target in _resolve_targets(name, source=symbol):
+                    if str(target["kind"]) not in {"config", "module"}:
+                        _add_edge(symbol, target, "constructor_dependency")
+
             if symbol["kind"] == "config":
                 continue
 
@@ -6176,11 +6346,22 @@ class Indexer:
                     for target in _resolve_targets(name, source=symbol, preferred_kinds={"queue"}):
                         _add_edge(symbol, target, "queue_processor_queue")
 
+            if symbol["kind"] == "router":
+                handler_names = _metadata_names(metadata, ("handler_refs",))
+                for name in handler_names:
+                    for target in _resolve_targets(name, source=symbol, preferred_kinds={"function", "method"}):
+                        _add_edge(symbol, target, "router_handler")
+
             if symbol["kind"] == "component":
                 constructed_class_names = _metadata_names(metadata, ("constructed_classes",))
                 for name in constructed_class_names:
                     for target in _resolve_targets(name, source=symbol, preferred_kinds={"class"}):
                         _add_edge(symbol, target, "component_constructor")
+
+                template_handler_names = _metadata_names(metadata, ("template_handlers",))
+                for name in template_handler_names:
+                    for target in _resolve_targets(name, source=symbol, preferred_kinds={"function", "method"}):
+                        _add_edge(symbol, target, "component_template_handler")
 
                 template_ref_targets = _metadata_names(metadata, ("template_ref_targets",))
                 for name in template_ref_targets:

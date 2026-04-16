@@ -96,6 +96,8 @@ def test_whats_changed_with_modifications(git_repo):
     assert result["total_changes"] >= 1
     files = [c["file"] for c in result["changes"]]
     assert "main.py" in files
+    assert result["summary"]["files_by_type"]["modified"] >= 1
+    assert result["summary"]["line_stats"]["added"] >= 1
 
 
 def test_whats_changed_with_untracked(git_repo):
@@ -103,6 +105,7 @@ def test_whats_changed_with_untracked(git_repo):
     result = whats_changed(git_repo)
     assert any(c["file"] == "new_file.py" and c["type"] == "untracked"
                for c in result["changes"])
+    assert result["summary"]["files_by_type"]["untracked"] >= 1
 
 
 def test_changes_to_file(git_repo):

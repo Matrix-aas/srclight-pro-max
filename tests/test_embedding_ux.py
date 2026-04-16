@@ -604,6 +604,37 @@ def test_codebase_map_bootstraps_frontend_repo_without_index(tmp_path, monkeypat
     assert payload["representative_files"]["server"] == ["server/api/health.get.ts"]
 
 
+def test_codebase_map_detects_elysia_signals_and_large_subsystems_without_index(tmp_path, monkeypatch):
+    repo = tmp_path / "elysia-app"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "src/http").mkdir(parents=True)
+    (repo / "shared/src/domain/level").mkdir(parents=True)
+
+    (repo / "package.json").write_text(json.dumps({"dependencies": {}}))
+    (repo / "src/http/app.ts").write_text(
+        "import { Elysia } from 'elysia';\n"
+        "export const app = new Elysia().get('/health', () => ({ ok: true }));\n"
+    )
+    for index in range(22):
+        (repo / "shared/src/domain/level" / f"LevelPart{index}.ts").write_text(
+            f"export const levelPart{index} = {index};\n"
+        )
+
+    monkeypatch.chdir(repo)
+    _reset_single_repo_server_state(monkeypatch)
+    monkeypatch.setattr(
+        server,
+        "_get_db",
+        lambda: (_ for _ in ()).throw(sqlite3.OperationalError("unable to open database file")),
+    )
+
+    payload = json.loads(server.codebase_map())
+
+    assert "elysia" in payload["framework_hints"]["signals"]
+    assert payload["framework_hints"]["app_type"] == "node"
+    assert "shared/src/domain/level (22 files)" in payload["brief"]
+
+
 def test_codebase_map_fullstack_backend_keeps_entrypoints_and_route_surfaces(tmp_path, monkeypatch):
     repo = tmp_path / "mixed-app"
     (repo / ".git").mkdir(parents=True)
@@ -1205,6 +1236,60 @@ def test_codebase_map_uses_indexed_symbol_metadata_for_backend_orientation(tmp_p
         "package.json",
         "src/bootstrap/runtime.module.ts",
     ]
+
+
+def test_codebase_map_indexed_repo_does_not_walk_full_filesystem_for_large_subsystems(
+    tmp_path, monkeypatch,
+):
+    repo = tmp_path / "indexed-no-subsystem-walk"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".srclight").mkdir(parents=True)
+    (repo / "src").mkdir(parents=True)
+    (repo / "package.json").write_text(json.dumps({"dependencies": {}}))
+    (repo / "src/main.ts").write_text("async function bootstrap() {}\n")
+
+    db = Database(repo / ".srclight" / "index.db")
+    db.open()
+    db.initialize()
+    try:
+        file_id = db.upsert_file(FileRecord(
+            path="src/main.ts",
+            content_hash="src/main.ts",
+            mtime=1.0,
+            language="typescript",
+            size=64,
+            line_count=1,
+        ))
+        db.insert_symbol(SymbolRecord(
+            file_id=file_id,
+            kind="function",
+            name="bootstrap",
+            qualified_name="bootstrap",
+            signature="async function bootstrap()",
+            start_line=1,
+            end_line=1,
+            content="bootstrap runtime",
+            line_count=1,
+            metadata={"resource": "bootstrap"},
+        ), "src/main.ts")
+        db.commit()
+
+        monkeypatch.chdir(repo)
+        _reset_single_repo_server_state(monkeypatch)
+        monkeypatch.setattr(server, "_read_index_signal", lambda root: None)
+        monkeypatch.setattr(
+            server,
+            "_large_subsystem_summaries",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("indexed codebase_map should not scan the full filesystem")
+            ),
+        )
+
+        payload = json.loads(server.codebase_map())
+    finally:
+        db.close()
+
+    assert payload["index"]["status"] == "ready"
 
 
 def test_codebase_map_treats_rmq_transport_metadata_as_rabbitmq_async_system(

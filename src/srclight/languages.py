@@ -136,7 +136,7 @@ _JS_QUERY = """
     declaration: (lexical_declaration
         (variable_declarator
             name: (identifier) @const.name
-            value: [(call_expression) (new_expression)]) @const.def))
+            value: [(call_expression) (new_expression) (array)]) @const.def))
 """
 
 _TS_QUERY = """
@@ -174,7 +174,7 @@ _TS_QUERY = """
     declaration: (lexical_declaration
         (variable_declarator
             name: (identifier) @const.name
-            value: [(call_expression) (new_expression)]) @const.def))
+            value: [(call_expression) (new_expression) (array)]) @const.def))
 """
 
 _RUST_QUERY = """

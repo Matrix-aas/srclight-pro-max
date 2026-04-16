@@ -1828,9 +1828,19 @@ def typescript_backend_project(tmp_path):
         """\
 import { Elysia } from 'elysia';
 
+export async function issueAnonymous() {
+  return { ok: true };
+}
+
+export async function issueRefresh() {
+  return { ok: true };
+}
+
+export const authRouteNames = ['/anonymous', '/refresh'];
+
 export const authRoutes = new Elysia({ prefix: '/api/auth' })
-  .post('/anonymous', async () => ({ ok: true }))
-  .post('/refresh', async () => ({ ok: true }));
+  .post('/anonymous', issueAnonymous)
+  .post('/refresh', issueRefresh);
 """
     )
 
@@ -1838,7 +1848,11 @@ export const authRoutes = new Elysia({ prefix: '/api/auth' })
         """\
 import { Elysia } from 'elysia';
 
-export const healthRoutes = new Elysia().get('/api/health', () => ({ ok: true }));
+export function healthHandler() {
+  return { ok: true };
+}
+
+export const healthRoutes = new Elysia().get('/api/health', healthHandler);
 """
     )
 
@@ -2179,10 +2193,26 @@ def test_index_typescript_backend_framework_exports(db, typescript_backend_proje
 
     auth_symbols = {sym.name: sym for sym in db.symbols_in_file("server/src/routes/auth.ts")}
     assert "authRoutes" in auth_symbols
+    assert auth_symbols["authRouteNames"].kind == "constant"
     assert auth_symbols["authRoutes"].kind == "router"
     assert "/api/auth" in (auth_symbols["authRoutes"].signature or "")
     assert "POST /api/auth/anonymous" in (auth_symbols["authRoutes"].signature or "")
     assert "POST /api/auth/refresh" in (auth_symbols["authRoutes"].doc_comment or "")
+
+    health_symbols = {sym.name: sym for sym in db.symbols_in_file("server/src/routes/health.ts")}
+    assert health_symbols["healthRoutes"].kind == "router"
+
+    auth_router = db.get_symbol_by_name("authRoutes")
+    health_router = db.get_symbol_by_name("healthRoutes")
+    assert auth_router is not None
+    assert health_router is not None
+
+    auth_callee_names = [item["symbol"].name for item in db.get_callees(auth_router.id)]
+    health_callee_names = [item["symbol"].name for item in db.get_callees(health_router.id)]
+
+    assert "issueAnonymous" in auth_callee_names
+    assert "issueRefresh" in auth_callee_names
+    assert "healthHandler" in health_callee_names
     assert auth_symbols["authRoutes"].metadata is not None
     assert auth_symbols["authRoutes"].metadata["framework"] == "elysia"
     assert auth_symbols["authRoutes"].metadata["prefix"] == "/api/auth"

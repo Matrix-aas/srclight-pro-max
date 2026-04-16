@@ -616,6 +616,199 @@ def test_get_communities_verbose_returns_detailed_members(monkeypatch, db):
     assert "qualified_name" in communities["communities"][0]["members"][0]
 
 
+def test_get_communities_recomputes_label_and_keywords_for_filtered_members(monkeypatch, db):
+    server_file = db.upsert_file(
+        FileRecord(
+            path="server/render.ts",
+            content_hash="server/render.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    client_file = db.upsert_file(
+        FileRecord(
+            path="client/audio.ts",
+            content_hash="client/audio.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    render_scene = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="renderScene",
+            qualified_name="server.renderScene",
+            start_line=1,
+            end_line=4,
+            content="render scene",
+            line_count=4,
+        ),
+        "server/render.ts",
+    )
+    render_sprite = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="renderSprite",
+            qualified_name="server.renderSprite",
+            start_line=5,
+            end_line=8,
+            content="render sprite",
+            line_count=4,
+        ),
+        "server/render.ts",
+    )
+    queue_audio = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="queueAudio",
+            qualified_name="client.queueAudio",
+            start_line=1,
+            end_line=4,
+            content="queue audio",
+            line_count=4,
+        ),
+        "client/audio.ts",
+    )
+    db.store_communities([
+        {
+            "id": 0,
+            "label": "Queue Audio",
+            "symbol_count": 3,
+            "cohesion": 0.9,
+            "keywords": ["queue", "audio"],
+            "members": [
+                {"id": render_scene, "name": "renderScene", "qualified_name": "server.renderScene", "kind": "function"},
+                {"id": render_sprite, "name": "renderSprite", "qualified_name": "server.renderSprite", "kind": "function"},
+                {"id": queue_audio, "name": "queueAudio", "qualified_name": "client.queueAudio", "kind": "function"},
+            ],
+        },
+    ])
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    communities = json.loads(server.get_communities(path_prefix="server/"))
+
+    assert communities["communities"]
+    filtered = communities["communities"][0]
+    assert filtered["member_count"] == 2
+    assert filtered["label"] == "Render Scene Sprite"
+    assert filtered["keywords"][:2] == ["render", "scene"]
+
+
+def test_graph_adjacent_tools_surface_ambiguity_for_same_name_symbols(monkeypatch, db):
+    file_a = db.upsert_file(
+        FileRecord(
+            path="apps/a/src/base.ts",
+            content_hash="apps/a/src/base.ts",
+            mtime=1.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        )
+    )
+    file_b = db.upsert_file(
+        FileRecord(
+            path="apps/b/src/base.ts",
+            content_hash="apps/b/src/base.ts",
+            mtime=1.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        )
+    )
+    base_a = db.insert_symbol(
+        SymbolRecord(
+            file_id=file_a,
+            kind="class",
+            name="BaseController",
+            qualified_name="apps.a.BaseController",
+            start_line=1,
+            end_line=4,
+            content="class BaseController {}",
+            line_count=4,
+        ),
+        "apps/a/src/base.ts",
+    )
+    base_b = db.insert_symbol(
+        SymbolRecord(
+            file_id=file_b,
+            kind="class",
+            name="BaseController",
+            qualified_name="apps.b.BaseController",
+            start_line=1,
+            end_line=4,
+            content="class BaseController {}",
+            line_count=4,
+        ),
+        "apps/b/src/base.ts",
+    )
+    gateway_a = db.insert_symbol(
+        SymbolRecord(
+            file_id=file_a,
+            kind="interface",
+            name="Gateway",
+            qualified_name="apps.a.Gateway",
+            start_line=6,
+            end_line=8,
+            content="interface Gateway {}",
+            line_count=3,
+        ),
+        "apps/a/src/base.ts",
+    )
+    gateway_b = db.insert_symbol(
+        SymbolRecord(
+            file_id=file_b,
+            kind="interface",
+            name="Gateway",
+            qualified_name="apps.b.Gateway",
+            start_line=6,
+            end_line=8,
+            content="interface Gateway {}",
+            line_count=3,
+        ),
+        "apps/b/src/base.ts",
+    )
+    db.store_communities([
+        {
+            "id": 1,
+            "label": "Base",
+            "symbol_count": 1,
+            "cohesion": 1.0,
+            "keywords": ["base"],
+            "members": [{"id": base_a}, {"id": gateway_a}],
+        },
+        {
+            "id": 2,
+            "label": "Base",
+            "symbol_count": 1,
+            "cohesion": 1.0,
+            "keywords": ["base"],
+            "members": [{"id": base_b}, {"id": gateway_b}],
+        },
+    ])
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    hierarchy = json.loads(server.get_type_hierarchy("BaseController"))
+    implementors = json.loads(server.get_implementors("Gateway"))
+    community = json.loads(server.get_community("BaseController"))
+
+    assert hierarchy["error"] == "Ambiguous symbol name 'BaseController'"
+    assert implementors["error"] == "Ambiguous symbol name 'Gateway'"
+    assert community["error"] == "Ambiguous symbol name 'BaseController'"
+
+
 def test_get_communities_path_prefix_escapes_like_wildcards(monkeypatch, db):
     exact_file = db.upsert_file(
         FileRecord(
@@ -692,7 +885,7 @@ def test_get_communities_path_prefix_escapes_like_wildcards(monkeypatch, db):
     communities = json.loads(server.get_communities(path_prefix="server/__tests__/"))
 
     assert communities["community_count"] == 1
-    assert communities["communities"][0]["label"] == "Exact test community"
+    assert communities["communities"][0]["label"] == "Exact Spec"
 
 
 def test_get_execution_flows_summary_first_by_default(monkeypatch, db):
@@ -868,6 +1061,122 @@ def test_get_execution_flows_deduplicates_identical_filtered_shapes(monkeypatch,
     assert len(verbose["flows"][0]["steps"]) == 2
 
 
+def test_get_execution_flows_deduplicates_identical_filtered_shapes_with_shifted_step_orders(monkeypatch, db):
+    server_file = db.upsert_file(
+        FileRecord(
+            path="server/game.ts",
+            content_hash="server/game-shifted.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    client_file = db.upsert_file(
+        FileRecord(
+            path="client/ui.ts",
+            content_hash="client/ui-shifted.ts",
+            mtime=1.0,
+            language="typescript",
+            size=200,
+            line_count=20,
+        )
+    )
+    pre = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="resumeEntry",
+            qualified_name="client.resumeEntry",
+            start_line=1,
+            end_line=3,
+            content="resumeEntry",
+            line_count=3,
+        ),
+        "client/ui.ts",
+    )
+    resume = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="resume",
+            qualified_name="server.resume",
+            start_line=1,
+            end_line=3,
+            content="resume",
+            line_count=3,
+        ),
+        "server/game.ts",
+    )
+    all_connected = db.insert_symbol(
+        SymbolRecord(
+            file_id=server_file,
+            kind="function",
+            name="allConnected",
+            qualified_name="server.allConnected",
+            start_line=5,
+            end_line=7,
+            content="allConnected",
+            line_count=3,
+        ),
+        "server/game.ts",
+    )
+    post = db.insert_symbol(
+        SymbolRecord(
+            file_id=client_file,
+            kind="function",
+            name="resumeExit",
+            qualified_name="client.resumeExit",
+            start_line=9,
+            end_line=11,
+            content="resumeExit",
+            line_count=3,
+        ),
+        "client/ui.ts",
+    )
+    db.commit()
+
+    db.store_execution_flows([
+        {
+            "label": "resumeEntry -> resumeExit",
+            "entry_symbol_id": pre,
+            "terminal_symbol_id": post,
+            "step_count": 4,
+            "communities_crossed": 1,
+            "steps": [
+                {"order": 0, "symbol_id": pre, "community_id": 0},
+                {"order": 1, "symbol_id": resume, "community_id": 1},
+                {"order": 2, "symbol_id": all_connected, "community_id": 1},
+                {"order": 3, "symbol_id": post, "community_id": 0},
+            ],
+        },
+        {
+            "label": "menuResume -> animateExit",
+            "entry_symbol_id": pre,
+            "terminal_symbol_id": post,
+            "step_count": 6,
+            "communities_crossed": 1,
+            "steps": [
+                {"order": 0, "symbol_id": pre, "community_id": 0},
+                {"order": 1, "symbol_id": post, "community_id": 0},
+                {"order": 4, "symbol_id": resume, "community_id": 1},
+                {"order": 5, "symbol_id": all_connected, "community_id": 1},
+            ],
+        },
+    ])
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    filtered = json.loads(server.get_execution_flows(path_prefix="server/"))
+
+    assert filtered["flow_count"] == 1
+    assert filtered["flows"][0]["label"] == "resume -> allConnected"
+
+
+
+
 def test_vue_component_constructor_and_template_ref_edges_feed_impact(monkeypatch, db, tmp_path):
     project = tmp_path / "vue-impact-project"
     project.mkdir()
@@ -936,6 +1245,42 @@ const ready = new Promise<void>(() => {})
     impact = json.loads(server.get_impact("BoardRenderer3D"))
 
     assert impact["direct_dependents"] >= 1
+    assert impact["risk"] in {"HIGH", "CRITICAL"}
+
+
+def test_vue_template_bound_handlers_are_not_marked_dead(db, tmp_path):
+    project = tmp_path / "vue-dead-code"
+    project.mkdir()
+    (project / "LoginForm.vue").write_text("""\
+<template>
+  <form @submit.prevent="handleSubmit">
+    <input @keydown="onUsernameKeyDown" />
+    <button @click="showDisclaimerModal">Open</button>
+  </form>
+</template>
+
+<script setup lang="ts">
+function handleSubmit() {
+  return true
+}
+
+function onUsernameKeyDown() {
+  return true
+}
+
+function showDisclaimerModal() {
+  return true
+}
+</script>
+""")
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    dead_names = {symbol.name for symbol in db.get_dead_symbols(kind="function")}
+    assert "handleSubmit" not in dead_names
+    assert "onUsernameKeyDown" not in dead_names
+    assert "showDisclaimerModal" not in dead_names
 
 
 def test_semantic_search_filters_low_similarity_results(monkeypatch):
@@ -1610,6 +1955,110 @@ def test_backend_ownership_dependents_follow_module_exports(db, backend_ownershi
     auth_module_dependents = [item["symbol"].name for item in db.get_dependents(auth_module.id)]
     assert "AuthConfig" in auth_module_dependents
     assert "authConfig" in auth_module_dependents
+
+
+def test_service_constructor_injection_creates_service_dependency_edges(db, tmp_path):
+    project = tmp_path / "service-di-project"
+    (project / "server/src/modules/coding").mkdir(parents=True)
+
+    (project / "server/src/modules/coding/coding.service.ts").write_text('''\
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class CodingService {
+  findOne() {
+    return { id: 1 };
+  }
+}
+''')
+
+    (project / "server/src/modules/coding/suggested-description.service.ts").write_text('''\
+import { Injectable } from '@nestjs/common';
+import { CodingService } from './coding.service';
+
+@Injectable()
+export class SuggestedDescriptionService {
+  constructor(private readonly coding: CodingService) {}
+
+  describe() {
+    return this.coding.findOne();
+  }
+}
+''')
+
+    (project / "server/src/modules/coding/coding.module.ts").write_text('''\
+import { Module } from '@nestjs/common';
+import { CodingService } from './coding.service';
+import { SuggestedDescriptionService } from './suggested-description.service';
+
+@Module({
+  providers: [CodingService, SuggestedDescriptionService],
+  exports: [CodingService, SuggestedDescriptionService],
+})
+export class CodingModule {}
+''')
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    coding_service = db.get_symbol_by_name("CodingService")
+    suggested_service = db.get_symbol_by_name("SuggestedDescriptionService")
+
+    assert coding_service is not None
+    assert suggested_service is not None
+
+    callers = [item["symbol"].name for item in db.get_callers(coding_service.id)]
+    assert "SuggestedDescriptionService" in callers
+
+
+def test_monorepo_runtime_boundaries_prevent_cross_app_dependents(monkeypatch, db, tmp_path):
+    project = tmp_path / "runtime-boundaries"
+    (project / "apps/frontend/src").mkdir(parents=True)
+    (project / "apps/backend/src").mkdir(parents=True)
+
+    (project / "apps/frontend/src/api.ts").write_text("""\
+export function fetchApi() {
+  return { ok: true }
+}
+""")
+    (project / "apps/frontend/src/comment.ts").write_text("""\
+import { fetchApi } from './api'
+
+export function likeOrDislike() {
+  return fetchApi()
+}
+
+export function resume() {
+  return likeOrDislike()
+}
+""")
+    (project / "apps/backend/src/comment.service.ts").write_text("""\
+export class CommentService {
+  likeOrDislike() {
+    return true
+  }
+}
+""")
+    (project / "apps/backend/src/main.ts").write_text("""\
+import { CommentService } from './comment.service'
+
+export function bootstrap() {
+  return new CommentService().likeOrDislike()
+}
+""")
+
+    indexer = Indexer(db, IndexConfig(root=project))
+    indexer.index(project)
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    dependents = json.loads(server.get_dependents("fetchApi", transitive=True))
+    dependent_names = {item["name"] for item in dependents["dependents"]}
+    assert "likeOrDislike" in dependent_names
+    assert "resume" in dependent_names
+    assert "CommentService" not in dependent_names
+    assert "bootstrap" not in dependent_names
 
 
 def test_async_traversal_ownership_links_handlers_and_queue_resources(db, tmp_path):

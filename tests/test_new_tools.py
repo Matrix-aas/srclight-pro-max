@@ -128,6 +128,93 @@ class TestFindDeadCode:
         dead = db.get_dead_symbols(limit=3)
         assert len(dead) == 3
 
+    def test_typescript_constructors_and_main_bootstrap_are_not_reported_dead(self, db):
+        file_id = _insert_file(db, path="apps/backend/src/main.ts", language="typescript")
+        _insert_symbol(
+            db,
+            file_id,
+            "bootstrap",
+            file_path="apps/backend/src/main.ts",
+            kind="function",
+            start_line=1,
+            end_line=5,
+            content="async function bootstrap() { return NestFactory.create(AppModule); }",
+        )
+        _insert_symbol(
+            db,
+            file_id,
+            "constructor",
+            file_path="apps/backend/src/main.ts",
+            kind="method",
+            start_line=7,
+            end_line=8,
+            content="constructor(private readonly app: AppService) {}",
+        )
+        db.commit()
+
+        dead = db.get_dead_symbols()
+        dead_names = [d.name for d in dead]
+        assert "bootstrap" not in dead_names
+        assert "constructor" not in dead_names
+
+
+# --- api_surface tests ---
+
+
+class TestApiSurface:
+    def test_api_surface_lists_nest_and_elysia_endpoints(self, db, monkeypatch):
+        controller_file = _insert_file(db, path="apps/backend/src/controllers/coding.controller.ts", language="typescript")
+        router_file = _insert_file(db, path="apps/backend/src/http/routes.ts", language="typescript")
+
+        _insert_symbol(
+            db,
+            controller_file,
+            "getCoding",
+            file_path="apps/backend/src/controllers/coding.controller.ts",
+            kind="route_handler",
+            signature="GET /coding/:id",
+            content="getCoding()",
+            metadata={
+                "framework": "nest",
+                "resource": "route_handler",
+                "http_method": "GET",
+                "route_path": "/coding/:id",
+                "route_prefix": "/coding",
+            },
+        )
+        _insert_symbol(
+            db,
+            router_file,
+            "codingRoutes",
+            file_path="apps/backend/src/http/routes.ts",
+            kind="router",
+            signature="Elysia router | /api | GET /api/health | POST /api/coding",
+            content="coding routes",
+            metadata={
+                "framework": "elysia",
+                "resource": "router",
+                "prefix": "/api",
+                "routes": [
+                    {"method": "GET", "path": "/api/health"},
+                    {"method": "POST", "path": "/api/coding"},
+                ],
+            },
+        )
+        db.commit()
+
+        monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+
+        payload = json.loads(server.api_surface())
+
+        assert payload["endpoint_count"] == 3
+        assert payload["endpoints"][0]["method"] == "GET"
+        assert {item["path"] for item in payload["endpoints"]} == {
+            "/coding/:id",
+            "/api/health",
+            "/api/coding",
+        }
+
 
 # --- find_pattern tests ---
 
@@ -398,6 +485,56 @@ class TestResolveImport:
         assert result["file"] == "src/utils.js"
         assert result["match_type"] == "file_path"
 
+    def test_resolve_typescript_alias_and_workspace_package(self, db, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / "apps/backend/src/entities/coding").mkdir(parents=True)
+        (repo / "packages/shared/src").mkdir(parents=True)
+        (repo / "package.json").write_text(
+            """\
+{
+  "name": "monorepo-root",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}
+"""
+        )
+        (repo / "apps/backend/tsconfig.json").write_text(
+            """\
+{
+  "compilerOptions": {
+    "baseUrl": "./src",
+    "paths": {
+      "@/*": ["*"]
+    }
+    }
+}
+"""
+        )
+        (repo / "apps/backend/src/entities/coding/coding.schema.ts").write_text("export class CodingSchema {}")
+        (repo / "packages/shared/package.json").write_text('{"name":"@repo/shared"}')
+        (repo / "packages/shared/src/index.ts").write_text("export interface SharedDto { id: string }")
+        _insert_file(db, "apps/backend/src/entities/coding/coding.schema.ts", language="typescript")
+        _insert_file(db, "packages/shared/src/index.ts", language="typescript")
+        db.commit()
+
+        alias_result = db.resolve_import(
+            "@/entities/coding/coding.schema",
+            hint_path="apps/backend/src/modules/coding/coding.service.ts",
+            root_path=repo,
+        )
+        assert alias_result is not None
+        assert alias_result["file"] == "apps/backend/src/entities/coding/coding.schema.ts"
+        assert alias_result["match_type"] == "file_path"
+
+        workspace_result = db.resolve_import(
+            "@repo/shared",
+            hint_path="apps/backend/src/modules/coding/coding.service.ts",
+            root_path=repo,
+        )
+        assert workspace_result is not None
+        assert workspace_result["file"] == "packages/shared/src/index.ts"
+        assert workspace_result["match_type"] == "file_path"
+
 
 class TestFindImportsIntegration:
     """Integration tests for the find_imports tool using the DB + file system."""
@@ -486,6 +623,62 @@ class TestFindImportsIntegration:
         assert "stdio.h" in modules
         assert "mylib.h" in modules
 
+    def test_server_find_imports_resolves_typescript_aliases_and_workspace_packages(self, db, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        service_dir = repo / "apps/backend/src/modules/coding"
+        entity_dir = repo / "apps/backend/src/entities/coding"
+        shared_dir = repo / "packages/shared/src"
+        service_dir.mkdir(parents=True)
+        entity_dir.mkdir(parents=True)
+        shared_dir.mkdir(parents=True)
+
+        (repo / "package.json").write_text(
+            """\
+{
+  "name": "monorepo-root",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"]
+}
+"""
+        )
+        (repo / "apps/backend/tsconfig.json").write_text(
+            """\
+{
+  "compilerOptions": {
+    "baseUrl": "./src",
+    "paths": {
+      "@/*": ["*"]
+    }
+  }
+}
+"""
+        )
+        (service_dir / "coding.service.ts").write_text(
+            """\
+import { CodingSchema } from '@/entities/coding/coding.schema';
+import { SharedDto } from '@repo/shared';
+"""
+        )
+        (entity_dir / "coding.schema.ts").write_text("export class CodingSchema {}")
+        (repo / "packages/shared/package.json").write_text('{"name":"@repo/shared"}')
+        (shared_dir / "index.ts").write_text("export interface SharedDto { id: string }")
+
+        _insert_file(db, "apps/backend/src/modules/coding/coding.service.ts", language="typescript")
+        _insert_file(db, "apps/backend/src/entities/coding/coding.schema.ts", language="typescript")
+        _insert_file(db, "packages/shared/src/index.ts", language="typescript")
+        db.commit()
+
+        monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_repo_root", repo)
+
+        payload = json.loads(server.find_imports("apps/backend/src/modules/coding/coding.service.ts"))
+
+        assert payload["resolved_count"] == 2
+        files = {entry["module"]: entry["resolved_to"]["file"] for entry in payload["imports"]}
+        assert files["@/entities/coding/coding.schema"] == "apps/backend/src/entities/coding/coding.schema.ts"
+        assert files["@repo/shared"] == "packages/shared/src/index.ts"
+
 
 class TestFileNavigationTools:
     def test_list_files_returns_db_backed_results(self, db, monkeypatch):
@@ -560,6 +753,31 @@ class TestFileNavigationTools:
             "Top-level symbols: LayoutEngine (class), measureNode (function)."
         )
 
+    def test_list_files_compacts_many_top_level_symbols_into_one_line_summary(self, db, monkeypatch):
+        file_path = "shared/src/domain/level/LayoutEngine.ts"
+        file_id = _insert_file(db, path=file_path, language="typescript")
+        for index, name in enumerate(("forwardSimulate", "assignMahjongLayout", "smartAssign", "seedLayout")):
+            _insert_symbol(
+                db,
+                file_id,
+                name,
+                file_path=file_path,
+                kind="function",
+                start_line=index * 10 + 1,
+                end_line=index * 10 + 5,
+                signature=f"function {name}()",
+                content=f"export function {name}() {{}}",
+            )
+        db.commit()
+
+        monkeypatch.setattr("srclight.server._is_workspace_mode", lambda: False)
+        monkeypatch.setattr("srclight.server._get_db", lambda: db)
+
+        payload = json.loads(server.list_files(path_prefix="shared/src/domain/level"))
+        assert payload["files"][0]["summary"] == (
+            "Top-level symbols: forwardSimulate (function), assignMahjongLayout (function), smartAssign (function) +1 more."
+        )
+
     def test_list_files_marks_index_barrels_when_no_symbols_are_indexed(self, db, monkeypatch):
         file_path = "shared/src/domain/level/index.ts"
         _insert_file(db, path=file_path, language="typescript")
@@ -603,3 +821,67 @@ class TestFileNavigationTools:
         assert payload["summary"] == "Profile card component shell."
         assert payload["metadata"] == {"framework": "vue"}
         assert payload["top_level_symbols"][0]["name"] == "ProfileCard"
+
+    def test_symbols_in_file_distinguishes_missing_file_from_empty_indexed_file(self, db, monkeypatch):
+        _insert_file(db, path="src/empty.ts", language="typescript")
+        db.commit()
+
+        monkeypatch.setattr("srclight.server._is_workspace_mode", lambda: False)
+        monkeypatch.setattr("srclight.server._get_db", lambda: db)
+
+        missing = json.loads(server.symbols_in_file("src/missing.ts"))
+        assert missing["error"] == "File 'src/missing.ts' not found"
+
+        empty = json.loads(server.symbols_in_file("src/empty.ts"))
+        assert empty["file"] == "src/empty.ts"
+        assert empty["symbol_count"] == 0
+        assert empty["symbols"] == []
+
+
+def test_list_projects_single_mode_returns_guidance(monkeypatch):
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_repo_root", None)
+
+    payload = json.loads(server.list_projects())
+
+    assert payload["error"] == "Not in workspace mode"
+    assert payload["mode"] == "single"
+    assert "srclight serve --workspace" in payload["hint"]
+
+
+def test_get_callees_reports_ambiguous_same_name_symbols(monkeypatch, db):
+    left_file = _insert_file(db, path="apps/backend/src/block.service.ts", language="typescript")
+    right_file = _insert_file(db, path="apps/backend/src/coding.service.ts", language="typescript")
+    _insert_symbol(
+        db,
+        left_file,
+        "findOne",
+        file_path="apps/backend/src/block.service.ts",
+        kind="method",
+        start_line=11,
+        end_line=20,
+        content="findOne() { return this.repo.findOne(); }",
+    )
+    _insert_symbol(
+        db,
+        right_file,
+        "findOne",
+        file_path="apps/backend/src/coding.service.ts",
+        kind="method",
+        start_line=16,
+        end_line=25,
+        content="findOne() { return this.repo.findOne(); }",
+    )
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_callees("findOne"))
+
+    assert payload["error"] == "Ambiguous symbol name 'findOne'"
+    assert payload["match_count"] == 2
+    assert {candidate["file"] for candidate in payload["candidates"]} == {
+        "apps/backend/src/block.service.ts",
+        "apps/backend/src/coding.service.ts",
+    }

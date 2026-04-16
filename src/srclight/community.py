@@ -456,12 +456,25 @@ def compute_impact(
     # Risk scoring
     n_direct = len(direct_ids)
     n_comm_crossings = len(affected_comms)
+    high_leverage_kinds = {"component", "controller", "route_handler", "router"}
+    medium_leverage_kinds = {"module", "plugin", "resolver", "service"}
+    weighted_direct = 0
+    direct_kinds: set[str] = set()
+    for item in direct:
+        kind = str(item["symbol"].kind or "")
+        direct_kinds.add(kind)
+        if kind in high_leverage_kinds:
+            weighted_direct += 5
+        elif kind in medium_leverage_kinds:
+            weighted_direct += 3
+        else:
+            weighted_direct += 1
 
     if n_direct > 25 or is_entry_point:
         risk = "CRITICAL"
-    elif n_direct > 10 or n_comm_crossings >= 2:
+    elif n_direct > 10 or n_comm_crossings >= 2 or weighted_direct >= 5:
         risk = "HIGH"
-    elif n_direct > 3 or n_comm_crossings >= 1:
+    elif n_direct > 3 or n_comm_crossings >= 1 or weighted_direct >= 3:
         risk = "MEDIUM"
     else:
         risk = "LOW"
@@ -469,6 +482,8 @@ def compute_impact(
     return {
         "risk": risk,
         "direct_dependents": n_direct,
+        "direct_weighted_score": weighted_direct,
+        "direct_kinds": sorted(kind for kind in direct_kinds if kind),
         "transitive_dependents": len(transitive_ids),
         "affected_communities": list(affected_comms),
         "affected_flows": affected_flow_labels,

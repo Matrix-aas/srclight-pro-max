@@ -7,12 +7,48 @@ C/C++ files for #ifdef platform guards.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("srclight.build")
+
+
+def _normalize_workspace_patterns(pkg: dict[str, Any]) -> list[str]:
+    workspaces = pkg.get("workspaces")
+    if isinstance(workspaces, list):
+        return [item for item in workspaces if isinstance(item, str)]
+    if isinstance(workspaces, dict):
+        packages = workspaces.get("packages")
+        if isinstance(packages, list):
+            return [item for item in packages if isinstance(item, str)]
+    return []
+
+
+def _read_package_json(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _package_dependency_entry(pkg_path: Path, pkg: dict[str, Any], repo_root: Path) -> dict[str, Any]:
+    deps = pkg.get("dependencies", {})
+    dev_deps = pkg.get("devDependencies", {})
+    return {
+        "file": pkg_path.relative_to(repo_root).as_posix(),
+        "name": pkg.get("name", pkg_path.parent.name),
+        "packages": [
+            {"name": k, "version": v, "dev": False}
+            for k, v in deps.items()
+        ] + [
+            {"name": k, "version": v, "dev": True}
+            for k, v in dev_deps.items()
+        ],
+    }
 
 # Common platform #ifdef macros
 PLATFORM_MACROS = {
@@ -389,24 +425,18 @@ def get_build_info(repo_root: Path) -> dict[str, Any]:
     pkg_json = repo_root / "package.json"
     if pkg_json.exists():
         result["build_systems"].append("npm")
-        try:
-            import json
-            pkg = json.loads(pkg_json.read_text())
-            deps = pkg.get("dependencies", {})
-            dev_deps = pkg.get("devDependencies", {})
-            result["dependencies"].append({
-                "file": "package.json",
-                "name": pkg.get("name", repo_root.name),
-                "packages": [
-                    {"name": k, "version": v, "dev": False}
-                    for k, v in deps.items()
-                ] + [
-                    {"name": k, "version": v, "dev": True}
-                    for k, v in dev_deps.items()
-                ],
-            })
-        except (json.JSONDecodeError, OSError):
-            pass
+        pkg = _read_package_json(pkg_json)
+        if pkg:
+            result["dependencies"].append(_package_dependency_entry(pkg_json, pkg, repo_root))
+            for pattern in _normalize_workspace_patterns(pkg):
+                for child_pkg_json in sorted(repo_root.glob(f"{pattern}/package.json")):
+                    if child_pkg_json == pkg_json or "node_modules" in child_pkg_json.parts:
+                        continue
+                    child_pkg = _read_package_json(child_pkg_json)
+                    if child_pkg:
+                        result["dependencies"].append(
+                            _package_dependency_entry(child_pkg_json, child_pkg, repo_root)
+                        )
 
     # Cargo.toml
     cargo = repo_root / "Cargo.toml"

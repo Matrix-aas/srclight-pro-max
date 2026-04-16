@@ -17,6 +17,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -43,6 +44,7 @@ _INSTRUCTIONS_TEMPLATE = """Welcome to Srclight — deep code indexing for AI ag
 
 ## Structure And Impact
 - `symbols_in_file(path, project)` — table of contents for one file.
+- `api_surface(path_prefix, project)` — fast API/HTTP endpoint inventory from indexed route metadata.
 - `get_callers(symbol_name, project)` / `get_callees(symbol_name, project)` — local dependency tracing.
 - `get_dependents(symbol_name, project)` / `get_impact(symbol_name, project)` — blast radius before changing code.
 - `detect_changes(ref, project)` — map git changes to changed symbols and impact after edits.
@@ -248,6 +250,111 @@ def _package_dependency_names(manifest: dict) -> set[str]:
     return names
 
 
+def _scan_framework_signals_in_files(root: Path, file_paths: list[str]) -> set[str]:
+    """Infer framework signals from a small set of representative source files."""
+    signals: set[str] = set()
+    for relative_path in file_paths[:8]:
+        path = root / relative_path
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "elysia" in text.lower() and (
+            re.search(r"\bnew\s+Elysia\s*\(", text)
+            or re.search(r"\bfrom\s*['\"]elysia['\"]", text)
+            or re.search(r"\bimport\s*\{\s*Elysia\s*\}", text)
+        ):
+            signals.add("elysia")
+    return signals
+
+
+def _large_subsystem_summaries(root: Path, *, min_files: int = 20, limit: int = 2) -> list[str]:
+    """Return compact summaries for deep directories with many files."""
+    ignored_parts = {
+        ".git",
+        ".nuxt",
+        ".next",
+        ".output",
+        ".srclight",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+    }
+    counts: dict[str, int] = {}
+    for current_root, dir_names, file_names in os.walk(root, topdown=True):
+        dir_names[:] = [name for name in dir_names if name not in ignored_parts]
+        try:
+            current_path = Path(current_root).relative_to(root)
+        except ValueError:
+            continue
+        base_parts = current_path.parts if str(current_path) != "." else ()
+        for file_name in file_names:
+            rel_parts = (*base_parts, file_name)
+            for depth in range(1, len(rel_parts)):
+                dir_path = "/".join(rel_parts[:depth])
+                counts[dir_path] = counts.get(dir_path, 0) + 1
+
+    return _large_subsystem_summaries_from_counts(
+        counts,
+        min_files=min_files,
+        limit=limit,
+    )
+
+
+def _large_subsystem_summaries_from_directory_summary(
+    directories: list[dict[str, object]],
+    *,
+    min_files: int = 20,
+    limit: int = 2,
+) -> list[str]:
+    """Build large-subsystem summaries from indexed directory stats."""
+    counts = {
+        str(item.get("path") or ""): int(item.get("files") or 0)
+        for item in directories
+        if item.get("path")
+    }
+    return _large_subsystem_summaries_from_counts(
+        counts,
+        min_files=min_files,
+        limit=limit,
+    )
+
+
+def _large_subsystem_summaries_from_counts(
+    counts: dict[str, int],
+    *,
+    min_files: int = 20,
+    limit: int = 2,
+) -> list[str]:
+    """Choose the most useful deep subsystem directories from file counts."""
+    if not counts:
+        return []
+
+    candidates = [
+        (directory, count)
+        for directory, count in counts.items()
+        if count >= min_files and directory.count("/") >= 1
+    ]
+    candidates.sort(key=lambda item: (-item[0].count("/"), -item[1], item[0]))
+
+    selected: list[tuple[str, int]] = []
+    for directory, count in candidates:
+        if any(
+            selected_dir.startswith(f"{directory}/") or directory.startswith(f"{selected_dir}/")
+            for selected_dir, _selected_count in selected
+        ):
+            continue
+        selected.append((directory, count))
+        if len(selected) >= limit:
+            break
+
+    selected.sort(key=lambda item: (-item[1], item[0]))
+    return [f"{directory} ({count} files)" for directory, count in selected]
+
+
 def _collect_repo_files(
     root: Path,
     relative_dirs: tuple[str, ...],
@@ -407,9 +514,10 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
         ]
 
         is_route_surface = (
-            kind in {"controller", "route"}
-            or resource in {"controller", "route"}
+            kind in {"controller", "route", "route_handler", "router"}
+            or resource in {"controller", "route", "route_handler", "router"}
             or has_route_metadata
+            or framework == "elysia"
         )
         is_nest_controller = (
             kind == "controller"
@@ -450,6 +558,10 @@ def _indexed_orientation_hints(symbol_rows: list[dict[str, object]]) -> dict[str
                 route_systems.append("nest_controllers")
             if framework == "nest":
                 _append(signals, framework)
+            if framework == "elysia":
+                _append(signals, framework)
+                if "elysia_routers" not in route_systems:
+                    route_systems.append("elysia_routers")
 
         if is_runtime:
             _append(representative_files["config"], path)
@@ -711,7 +823,7 @@ def _find_representative_files(root: Path) -> dict[str, list[str]]:
     backend = _merge_representative_paths(
         _collect_repo_files(root, ("server/api", "server/routes", "api"), limit=1, allowed_suffixes=(".ts", ".js", ".mjs")),
         _collect_existing_paths(root, ("src/main.ts", "src/main.js", "server.ts", "main.ts", "main.js"), limit=1),
-        _collect_repo_files(root, ("src/controllers", "src/modules", "src/server"), limit=1, allowed_suffixes=(".ts", ".js")),
+        _collect_repo_files(root, ("src/controllers", "src/modules", "src/server", "src/http", "src/routes"), limit=1, allowed_suffixes=(".ts", ".js")),
         limit=3,
     )
     if backend:
@@ -801,6 +913,8 @@ def _detect_framework_hints(
         or "nest-cli.json" in representative_files.get("config", [])
     ):
         signals.add("nest")
+    if "elysia" in dependencies:
+        signals.add("elysia")
     if representative_files.get("server") and "nuxt" in signals:
         signals.add("nitro")
     if (
@@ -811,6 +925,18 @@ def _detect_framework_hints(
         signals.add("prisma")
     if "bullmq" in dependencies or any("queue" in path or "processor" in path for path in representative_files.get("async", [])):
         signals.add("bullmq")
+
+    signals.update(
+        _scan_framework_signals_in_files(
+            root,
+            list(
+                dict.fromkeys(
+                    (representative_files.get("backend") or [])
+                    + (representative_files.get("server") or [])
+                )
+            ),
+        )
+    )
 
     return {
         "app_type": _infer_app_type(representative_files, signals, manifest_present=bool(manifest)),
@@ -846,10 +972,17 @@ def _build_topology(
         route_systems.append("nest_controllers")
     if any(path.startswith(("server/api", "server/routes")) for path in backend_files + (representative_files.get("server") or [])) and "nitro_file_routes" not in route_systems:
         route_systems.append("nitro_file_routes")
+    if (
+        "elysia" in signals
+        and any(path.startswith(("src/http", "src/routes")) for path in backend_files)
+        and "elysia_routers" not in route_systems
+    ):
+        route_systems.append("elysia_routers")
     route_files = _merge_representative_paths(
         list(indexed_hints.get("route_files") or []),
         [path for path in representative_files.get("server") or [] if path.startswith(("server/api", "server/routes"))],
         [path for path in backend_files if path.startswith("src/controllers")],
+        [path for path in backend_files if path.startswith(("src/http", "src/routes"))],
         [path for path in backend_files if path.startswith(("server/api", "server/routes"))],
         limit=3,
     )
@@ -938,6 +1071,7 @@ def _route_summary(route_systems: list[str]) -> str:
     """Summarize route systems without implying surfaces we did not detect."""
     labels = {
         "generic": "generic route handlers",
+        "elysia_routers": "Elysia routers",
         "nest_controllers": "Nest controllers",
         "nitro_file_routes": "Nitro file routes",
     }
@@ -1070,6 +1204,7 @@ def _build_repo_brief(
     start_here: list[dict[str, str]],
     *,
     indexed: bool,
+    large_subsystems: list[str] | None = None,
 ) -> str:
     """Build a compact AI-oriented repo summary."""
     app_type = str(framework_hints.get("app_type") or "codebase")
@@ -1079,7 +1214,10 @@ def _build_repo_brief(
     signal_text = f" with {', '.join(signals[:4])} signals" if signals else ""
     start_paths = ", ".join(item["path"] for item in start_here[:4])
     start_text = f" Start with {start_paths}." if start_paths else ""
-    return f"{label.capitalize()} {app_label} repo{signal_text}.{start_text}"
+    subsystem_text = ""
+    if large_subsystems:
+        subsystem_text = " Major subsystems: " + ", ".join(large_subsystems[:2]) + "."
+    return f"{label.capitalize()} {app_label} repo{signal_text}.{start_text}{subsystem_text}"
 
 
 def _bootstrap_codebase_map_result(
@@ -1092,6 +1230,7 @@ def _bootstrap_codebase_map_result(
 ) -> dict[str, object]:
     """Build a filesystem-only codebase map for repos without a usable index."""
     quoted_root = shlex.quote(str(repo_root))
+    large_subsystems = _large_subsystem_summaries(repo_root)
     return {
         "mode": "single",
         "repo_root": str(repo_root),
@@ -1105,7 +1244,12 @@ def _bootstrap_codebase_map_result(
         "representative_files": representative_files,
         "topology": topology,
         "start_here": start_here,
-        "brief": _build_repo_brief(framework_hints, start_here, indexed=False),
+        "brief": _build_repo_brief(
+            framework_hints,
+            start_here,
+            indexed=False,
+            large_subsystems=large_subsystems,
+        ),
         "hint": (
             "Repo is not indexed yet. "
             f"Run `srclight index --embed` from {quoted_root} "
@@ -1175,6 +1319,13 @@ def _get_learnings_db():
     _learnings_db.open()
     _learnings_db.initialize()
     return _learnings_db
+
+
+def _learnings_mode_error() -> str:
+    return json.dumps({
+        "error": "Learnings require workspace mode",
+        "hint": "Start the server with `srclight serve --workspace NAME` and try again.",
+    }, indent=2)
 
 
 def _get_db() -> Database:
@@ -1651,7 +1802,12 @@ def codebase_map(project: str | None = None) -> str:
             "edges": stats["edges"],
             "db_size_mb": stats["db_size_mb"],
         },
-        "brief": _build_repo_brief(framework_hints, start_here, indexed=True),
+        "brief": _build_repo_brief(
+            framework_hints,
+            start_here,
+            indexed=True,
+            large_subsystems=[],
+        ),
         "framework_hints": framework_hints,
         "representative_files": representative_files,
         "topology": topology,
@@ -1669,6 +1825,15 @@ def codebase_map(project: str | None = None) -> str:
     signal = _read_index_signal(_repo_root)
     if signal:
         result["index"]["last_indexed_at"] = signal.get("timestamp")
+
+    result["brief"] = _build_repo_brief(
+        framework_hints,
+        start_here,
+        indexed=True,
+        large_subsystems=_large_subsystem_summaries_from_directory_summary(
+            result["directories"],
+        ),
+    )
 
     return json.dumps(result, indent=2)
 
@@ -1847,9 +2012,16 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
             return _project_required_error("symbols_in_file")
         wdb = _get_workspace_db()
         all_results = []
+        file_found = False
         for batch in wdb._iter_batches(project_filter=project):
             for schema, project_name in batch:
                 try:
+                    file_row = wdb.conn.execute(
+                        f"SELECT 1 FROM [{schema}].files WHERE path = ? LIMIT 1",
+                        (path,),
+                    ).fetchone()
+                    if file_row:
+                        file_found = True
                     rows = wdb.conn.execute(
                         f"""SELECT s.name, s.kind, s.signature, s.start_line, s.end_line, s.doc_comment
                            FROM [{schema}].symbols s
@@ -1868,6 +2040,11 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
                     } for r in rows)
                 except Exception:
                     pass
+        if not file_found:
+            return json.dumps({
+                "error": f"File '{path}' not found in {project}",
+                "project": project,
+            }, indent=2)
         return json.dumps({
             "project": project,
             "file": path,
@@ -1876,9 +2053,10 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
         }, indent=2)
 
     db = _get_db()
+    file_rec = db.get_file(path)
+    if file_rec is None:
+        return json.dumps({"error": f"File '{path}' not found"}, indent=2)
     symbols = db.symbols_in_file(path)
-    if not symbols:
-        return json.dumps({"error": f"No symbols found in '{path}'"})
 
     result = []
     for sym in symbols:
@@ -1983,6 +2161,59 @@ def get_file_summary(path: str, project: str | None = None) -> str:
     return json.dumps(summary, indent=2)
 
 
+@mcp.tool()
+def api_surface(
+    path_prefix: str | None = None,
+    project: str | None = None,
+    limit: int = 100,
+) -> str:
+    """List indexed HTTP/API endpoints from route handlers and router metadata.
+
+    Args:
+        path_prefix: Optional path prefix to narrow the API surface
+        project: Optional project filter in workspace mode
+        limit: Maximum endpoints to return
+    """
+    _record_query()
+    if _is_workspace_mode():
+        project_error = _workspace_project_not_found_error(project)
+        if project_error is not None:
+            return project_error
+        if not project:
+            return _project_required_error("api_surface")
+        from .workspace import WorkspaceConfig
+
+        config = WorkspaceConfig.load(_workspace_name)
+        root = config.projects.get(project)
+        if not root:
+            return _project_not_found_error(project)
+        db_path = Path(root) / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"}, indent=2)
+        db = Database(db_path)
+        db.open()
+        try:
+            endpoints = db.api_surface(path_prefix=path_prefix, limit=limit)
+        finally:
+            db.close()
+        return json.dumps({
+            "project": project,
+            "path_prefix": path_prefix,
+            "limit": limit,
+            "endpoint_count": len(endpoints),
+            "endpoints": endpoints,
+        }, indent=2)
+
+    db = _get_db()
+    endpoints = db.api_surface(path_prefix=path_prefix, limit=limit)
+    return json.dumps({
+        "path_prefix": path_prefix,
+        "limit": limit,
+        "endpoint_count": len(endpoints),
+        "endpoints": endpoints,
+    }, indent=2)
+
+
 # --- Tier 2: Graph tools ---
 
 
@@ -2027,6 +2258,49 @@ def _dedup_edges(edges: list[dict]) -> list[dict]:
     return result
 
 
+def _ambiguous_symbol_error(
+    symbol_name: str,
+    candidates,
+    *,
+    project: str | None = None,
+) -> str:
+    payload: dict[str, object] = {
+        "error": f"Ambiguous symbol name '{symbol_name}'",
+        "match_count": len(candidates),
+        "candidates": [
+            {
+                "name": sym.name,
+                "kind": sym.kind,
+                "file": sym.file_path,
+                "line": sym.start_line,
+                "signature": sym.signature,
+            }
+            for sym in candidates
+        ],
+        "hint": (
+            "Use get_symbol() or symbols_in_file() to pick the exact symbol before running graph analysis."
+        ),
+    }
+    if project is not None:
+        payload["project"] = project
+    return json.dumps(payload, indent=2)
+
+
+def _resolve_graph_symbol(
+    db: Database,
+    symbol_name: str,
+    *,
+    project: str | None = None,
+):
+    symbols = db.get_symbols_by_name(symbol_name, limit=25)
+    exact = [sym for sym in symbols if sym.name == symbol_name]
+    if not exact:
+        return None, _symbol_not_found_error(symbol_name, project)
+    if len(exact) > 1:
+        return None, _ambiguous_symbol_error(symbol_name, exact, project=project)
+    return exact[0], None
+
+
 @mcp.tool()
 def get_callers(symbol_name: str, project: str | None = None) -> str:
     """Find all symbols that call or reference a given symbol.
@@ -2052,10 +2326,10 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        sym, error = _resolve_graph_symbol(db, symbol_name, project=project)
+        if error is not None:
             db.close()
-            return _symbol_not_found_error(symbol_name, project)
+            return error
         callers = db.get_callers(sym.id)
         result = _dedup_edges(callers)
         db.close()
@@ -2067,9 +2341,9 @@ def get_callers(symbol_name: str, project: str | None = None) -> str:
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(symbol_name)
-    if sym is None:
-        return _symbol_not_found_error(symbol_name)
+    sym, error = _resolve_graph_symbol(db, symbol_name)
+    if error is not None:
+        return error
 
     callers = db.get_callers(sym.id)
     result = _dedup_edges(callers)
@@ -2105,10 +2379,10 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        sym, error = _resolve_graph_symbol(db, symbol_name, project=project)
+        if error is not None:
             db.close()
-            return _symbol_not_found_error(symbol_name, project)
+            return error
         callees = db.get_callees(sym.id)
         result = _dedup_edges(callees)
         db.close()
@@ -2120,9 +2394,9 @@ def get_callees(symbol_name: str, project: str | None = None) -> str:
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(symbol_name)
-    if sym is None:
-        return _symbol_not_found_error(symbol_name)
+    sym, error = _resolve_graph_symbol(db, symbol_name)
+    if error is not None:
+        return error
 
     callees = db.get_callees(sym.id)
     result = _dedup_edges(callees)
@@ -2158,10 +2432,10 @@ def get_type_hierarchy(name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(name)
-        if sym is None:
+        sym, error = _resolve_graph_symbol(db, name, project=project)
+        if error is not None:
             db.close()
-            return _symbol_not_found_error(name, project)
+            return error
         base_classes = db.get_base_classes(sym.id)
         subclasses = db.get_subclasses(sym.id)
         db.close()
@@ -2173,9 +2447,9 @@ def get_type_hierarchy(name: str, project: str | None = None) -> str:
         }, indent=2)
 
     db = _get_db()
-    sym = db.get_symbol_by_name(name)
-    if sym is None:
-        return _symbol_not_found_error(name)
+    sym, error = _resolve_graph_symbol(db, name)
+    if error is not None:
+        return error
 
     base_classes = db.get_base_classes(sym.id)
     subclasses = db.get_subclasses(sym.id)
@@ -2285,17 +2559,17 @@ def get_dependents(symbol_name: str, transitive: bool = False, project: str | No
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        sym, error = _resolve_graph_symbol(db, symbol_name, project=project)
+        if error is not None:
             db.close()
-            return _symbol_not_found_error(symbol_name, project)
+            return error
         deps = db.get_dependents(sym.id, transitive=transitive)
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
-            return _symbol_not_found_error(symbol_name)
+        sym, error = _resolve_graph_symbol(db, symbol_name)
+        if error is not None:
+            return error
         deps = db.get_dependents(sym.id, transitive=transitive)
 
     result = _dedup_edges(deps)
@@ -2330,17 +2604,17 @@ def get_implementors(interface_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(interface_name)
-        if sym is None:
+        sym, error = _resolve_graph_symbol(db, interface_name, project=project)
+        if error is not None:
             db.close()
-            return _symbol_not_found_error(interface_name, project)
+            return error
         impls = db.get_implementors(sym.id)
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(interface_name)
-        if sym is None:
-            return _symbol_not_found_error(interface_name)
+        sym, error = _resolve_graph_symbol(db, interface_name)
+        if error is not None:
+            return error
         impls = db.get_implementors(sym.id)
 
     results = [
@@ -2455,7 +2729,12 @@ def list_projects() -> str:
     and DB size for each project.
     """
     if not _is_workspace_mode():
-        return json.dumps({"error": "Not in workspace mode. Start with --workspace NAME"})
+        return json.dumps({
+            "error": "Not in workspace mode",
+            "mode": "single",
+            "repo_root": str(_repo_root) if _repo_root else None,
+            "hint": "Restart with `srclight serve --workspace NAME` to query multiple indexed projects.",
+        }, indent=2)
 
     wdb = _get_workspace_db()
     projects = wdb.list_projects()
@@ -2754,6 +3033,58 @@ def get_build_targets(project: str | None = None) -> str:
 
     info = build_mod.get_build_info(repo_root)
     return json.dumps(info, indent=2)
+
+
+def _find_imports_in_repo(db: Database, repo_root: Path, path: str, language: str) -> dict[str, Any]:
+    file_path = repo_root / path
+    try:
+        content = file_path.read_text(errors="replace")
+    except OSError as e:
+        return {"error": f"Cannot read file: {e}"}
+
+    raw_imports = _extract_imports(content, language)
+    imports = []
+    resolved_count = 0
+    for imp in raw_imports:
+        entry: dict[str, Any] = {
+            "statement": imp["statement"],
+            "module": imp["module"],
+        }
+        if imp["names"]:
+            entry["names"] = imp["names"]
+
+        resolved_to = None
+        names_to_try: list[str] = []
+        if imp["names"]:
+            names_to_try.extend(imp["names"])
+        module_name = imp["module"]
+        fallback_name = module_name.split(".")[-1]
+        for candidate in (module_name, fallback_name):
+            if candidate and candidate not in names_to_try:
+                names_to_try.append(candidate)
+
+        for name in names_to_try:
+            result = db.resolve_import(name, hint_path=path, root_path=repo_root)
+            if result:
+                resolved_to = result
+                break
+
+        if resolved_to:
+            entry["resolved_to"] = resolved_to
+            entry["status"] = "resolved"
+            resolved_count += 1
+        else:
+            entry["resolved_to"] = None
+            entry["status"] = "external"
+        imports.append(entry)
+
+    return {
+        "file": path,
+        "language": language,
+        "import_count": len(imports),
+        "resolved_count": resolved_count,
+        "imports": imports,
+    }
 
 
 @mcp.tool()
@@ -3204,107 +3535,34 @@ def find_imports(path: str, project: str | None = None) -> str:
         if not project:
             return _project_required_error("find_imports")
         wdb = _get_workspace_db()
-
-        # Find the file in the workspace
-        file_info = None
-        for batch in wdb._iter_batches(project_filter=project):
-            for schema, project_name in batch:
-                try:
-                    row = wdb.conn.execute(
-                        f"SELECT * FROM [{schema}].files WHERE path = ?",
-                        (path,),
-                    ).fetchone()
-                    if row:
-                        file_info = {"language": row["language"], "schema": schema}
-                        break
-                except Exception:
-                    pass
-            if file_info:
-                break
-
-        if not file_info:
-            return json.dumps({"error": f"File '{path}' not found in project '{project}'"})
-
-        language = file_info["language"]
-        if not language or language not in IMPORT_PATTERNS:
-            return json.dumps({
-                "file": path,
-                "language": language,
-                "import_count": 0,
-                "resolved_count": 0,
-                "imports": [],
-                "note": f"Import extraction not supported for language: {language}",
-            }, indent=2)
-
-        # Read file content from disk
         config_entries = [e for e in wdb._all_indexable if e.name == project]
         if not config_entries:
             return _project_not_found_error(project)
-        project_root = Path(config_entries[0].root)
-        file_path = project_root / path
+        project_root = Path(config_entries[0].path)
+        db_path = project_root / ".srclight" / "index.db"
+        if not db_path.exists():
+            return json.dumps({"error": f"Project '{project}' not indexed"})
+        repo_db = Database(db_path)
+        repo_db.open()
         try:
-            content = file_path.read_text(errors="replace")
-        except OSError as e:
-            return json.dumps({"error": f"Cannot read file: {e}"})
-
-        raw_imports = _extract_imports(content, language)
-
-        imports = []
-        resolved_count = 0
-        for imp in raw_imports:
-            entry: dict = {
-                "statement": imp["statement"],
-                "module": imp["module"],
-            }
-            if imp["names"]:
-                entry["names"] = imp["names"]
-
-            resolved_to = None
-            names_to_try = imp["names"] if imp["names"] else [imp["module"].split(".")[-1]]
-            for name in names_to_try:
-                for batch in wdb._iter_batches(project_filter=project):
-                    for schema, pname in batch:
-                        try:
-                            row = wdb.conn.execute(
-                                f"""SELECT s.name, s.kind, s.start_line, f.path as file_path
-                                    FROM [{schema}].symbols s
-                                    JOIN [{schema}].files f ON s.file_id = f.id
-                                    WHERE s.name = ?
-                                    LIMIT 1""",
-                                (name,),
-                            ).fetchone()
-                            if row:
-                                resolved_to = {
-                                    "name": row["name"],
-                                    "file": row["file_path"],
-                                    "line": row["start_line"],
-                                    "kind": row["kind"],
-                                }
-                                break
-                        except Exception:
-                            pass
-                    if resolved_to:
-                        break
-                if resolved_to:
-                    break
-
-            if resolved_to:
-                entry["resolved_to"] = resolved_to
-                entry["status"] = "resolved"
-                resolved_count += 1
-            else:
-                entry["resolved_to"] = None
-                entry["status"] = "external"
-
-            imports.append(entry)
-
-        return json.dumps({
-            "file": path,
-            "language": language,
-            "import_count": len(imports),
-            "resolved_count": resolved_count,
-            "imports": imports,
-        }, indent=2)
+            file_rec = repo_db.get_file(path)
+            if not file_rec:
+                return json.dumps({"error": f"File '{path}' not found in project '{project}'"})
+            language = file_rec.language
+            if not language or language not in IMPORT_PATTERNS:
+                return json.dumps({
+                    "file": path,
+                    "language": language,
+                    "import_count": 0,
+                    "resolved_count": 0,
+                    "imports": [],
+                    "note": f"Import extraction not supported for language: {language}",
+                }, indent=2)
+            payload = _find_imports_in_repo(repo_db, project_root, path, language)
+            payload["project"] = project
+            return json.dumps(payload, indent=2)
+        finally:
+            repo_db.close()
 
     # Single-repo mode
     db = _get_db()
@@ -3322,53 +3580,9 @@ def find_imports(path: str, project: str | None = None) -> str:
             "imports": [],
             "note": f"Import extraction not supported for language: {language}",
         }, indent=2)
-
-    if _repo_root:
-        file_path = _repo_root / path
-    else:
-        file_path = Path(path)
-    try:
-        content = file_path.read_text(errors="replace")
-    except OSError as e:
-        return json.dumps({"error": f"Cannot read file: {e}"})
-
-    raw_imports = _extract_imports(content, language)
-
-    imports = []
-    resolved_count = 0
-    for imp in raw_imports:
-        entry: dict = {
-            "statement": imp["statement"],
-            "module": imp["module"],
-        }
-        if imp["names"]:
-            entry["names"] = imp["names"]
-
-        resolved_to = None
-        names_to_try = imp["names"] if imp["names"] else [imp["module"].split(".")[-1]]
-        for name in names_to_try:
-            result = db.resolve_import(name, hint_path=path)
-            if result:
-                resolved_to = result
-                break
-
-        if resolved_to:
-            entry["resolved_to"] = resolved_to
-            entry["status"] = "resolved"
-            resolved_count += 1
-        else:
-            entry["resolved_to"] = None
-            entry["status"] = "external"
-
-        imports.append(entry)
-
-    return json.dumps({
-        "file": path,
-        "language": language,
-        "import_count": len(imports),
-        "resolved_count": resolved_count,
-        "imports": imports,
-    }, indent=2)
+    if _repo_root is None:
+        return json.dumps({"error": "No repo root configured"}, indent=2)
+    return json.dumps(_find_imports_in_repo(db, _repo_root, path, language), indent=2)
 
 
 # --- Tier 8: Code Analysis ---
@@ -3753,6 +3967,8 @@ def record_learning(
         source_type: 'conversation', 'labbook', 'decisions_md', 'claude_md', 'agent_log'
         source_ref: Reference identifier (session ID, file path, etc.)
     """
+    if _workspace_name is None:
+        return _learnings_mode_error()
     from .learnings import LearningRecord
 
     ldb = _get_learnings_db()
@@ -3797,6 +4013,8 @@ def conversation_summary(
         tokens_out: Output tokens generated
         cost_usd: Estimated cost in USD
     """
+    if _workspace_name is None:
+        return _learnings_mode_error()
     from .learnings import ConversationRecord
 
     ldb = _get_learnings_db()
@@ -3834,6 +4052,8 @@ def relevant_learnings(
         kind: Filter by kind: 'decision', 'correction', 'discovery', 'pattern', 'blocker', 'convention'
         limit: Max results (default 10)
     """
+    if _workspace_name is None:
+        return _learnings_mode_error()
     ldb = _get_learnings_db()
 
     # FTS search
@@ -3882,6 +4102,8 @@ def learning_stats(
         project: Filter to a specific project (omit for all)
         days: Look back N days (omit for all time)
     """
+    if _workspace_name is None:
+        return _learnings_mode_error()
     ldb = _get_learnings_db()
     s = ldb.stats(project=project, days=days)
     return json.dumps(s, indent=2)
@@ -3971,9 +4193,13 @@ def get_community(symbol_name: str, project: str | None = None) -> str:
         db = Database(db_path)
         db.open()
         try:
-            sym = db.get_symbol_by_name(symbol_name)
-            if sym is None:
+            symbols = db.get_symbols_by_name(symbol_name, limit=25)
+            exact = [sym for sym in symbols if sym.name == symbol_name]
+            if not exact:
                 return json.dumps(_community_fallback_payload(db, symbol_name, project=project), indent=2)
+            if len(exact) > 1:
+                return _ambiguous_symbol_error(symbol_name, exact, project=project)
+            sym = exact[0]
             return json.dumps(
                 _format_community_payload(db, symbol_name, sym, project=project),
                 indent=2,
@@ -3982,9 +4208,13 @@ def get_community(symbol_name: str, project: str | None = None) -> str:
             db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        symbols = db.get_symbols_by_name(symbol_name, limit=25)
+        exact = [sym for sym in symbols if sym.name == symbol_name]
+        if not exact:
             return json.dumps(_community_fallback_payload(db, symbol_name), indent=2)
+        if len(exact) > 1:
+            return _ambiguous_symbol_error(symbol_name, exact)
+        sym = exact[0]
         return json.dumps(_format_community_payload(db, symbol_name, sym), indent=2)
 
 
@@ -4075,10 +4305,10 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
             return json.dumps({"error": f"Project '{project}' not indexed"})
         db = Database(db_path)
         db.open()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
+        sym, error = _resolve_graph_symbol(db, symbol_name, project=project)
+        if error is not None:
             db.close()
-            return _symbol_not_found_error(symbol_name, project)
+            return error
         # Build sym_to_community map from stored data
         communities = db.get_community_records(limit=None)
         sym_to_comm: dict[int, int] = {}
@@ -4092,9 +4322,9 @@ def get_impact(symbol_name: str, project: str | None = None) -> str:
         db.close()
     else:
         db = _get_db()
-        sym = db.get_symbol_by_name(symbol_name)
-        if sym is None:
-            return _symbol_not_found_error(symbol_name)
+        sym, error = _resolve_graph_symbol(db, symbol_name)
+        if error is not None:
+            return error
         communities = db.get_community_records(limit=None)
         sym_to_comm = {}
         for c in communities:

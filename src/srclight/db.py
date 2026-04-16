@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 import struct
+from collections import Counter
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -288,7 +289,35 @@ def _fallback_file_summary(
     ]
     if not preview:
         return None
-    return "Top-level symbols: " + ", ".join(preview) + "."
+    extra_count = max(len(top_level_symbols) - len(preview), 0)
+    suffix = f" +{extra_count} more" if extra_count else ""
+    return "Top-level symbols: " + ", ".join(preview) + suffix + "."
+
+
+def _compact_file_summary(
+    explicit_summary: str | None,
+    top_level_symbols: list[dict[str, Any]] | None = None,
+    *,
+    path: str | None = None,
+    language: str | None = None,
+    max_chars: int = 160,
+) -> str | None:
+    """Return a compact single-line summary suitable for file lists."""
+    summary = _fallback_file_summary(
+        explicit_summary,
+        top_level_symbols,
+        path=path,
+        language=language,
+    )
+    if summary is None:
+        return None
+    compact = " ".join(summary.split())
+    if len(compact) <= max_chars:
+        return compact
+    sentence = re.split(r"(?<=[.!?])\s+", compact, maxsplit=1)[0].strip()
+    if sentence and len(sentence) <= max_chars:
+        return sentence
+    return compact[: max_chars - 1].rstrip() + "…"
 
 
 def _execution_flow_dedupe_key(flow: dict[str, Any]) -> tuple[Any, ...]:
@@ -296,19 +325,15 @@ def _execution_flow_dedupe_key(flow: dict[str, Any]) -> tuple[Any, ...]:
     steps = flow.get("steps") or flow.get("key_steps") or []
     step_key = tuple(
         (
-            step.get("step_order"),
+            index,
             step.get("name"),
             step.get("kind"),
             step.get("file_path"),
             step.get("community_id"),
-            step.get("symbol_id"),
         )
-        for step in steps
+        for index, step in enumerate(steps)
     )
     return (
-        flow.get("label"),
-        flow.get("entry"),
-        flow.get("terminal"),
         flow.get("step_count"),
         flow.get("communities_crossed"),
         flow.get("truncated"),
@@ -760,8 +785,6 @@ class Database:
             ).fetchall()
             for row in symbol_rows:
                 bucket = top_level_symbols.setdefault(int(row["file_id"]), [])
-                if len(bucket) >= 3:
-                    continue
                 bucket.append({
                     "name": row["name"],
                     "kind": row["kind"],
@@ -773,7 +796,7 @@ class Database:
                 "language": row["language"],
                 "size": row["size"],
                 "line_count": row["line_count"],
-                "summary": _fallback_file_summary(
+                "summary": _compact_file_summary(
                     row["summary"],
                     top_level_symbols.get(int(row["id"]), []),
                     path=row["path"],
@@ -1114,15 +1137,17 @@ class Database:
                 """SELECT s.kind, s.name, s.signature, s.metadata, f.path AS file_path
                    FROM symbols s
                    JOIN files f ON s.file_id = f.id
-                   WHERE s.kind IN ('controller', 'route')
-                      OR json_extract(s.metadata, '$.resource') IN ('controller', 'route')
+                   WHERE s.kind IN ('controller', 'route', 'route_handler', 'router')
+                      OR json_extract(s.metadata, '$.resource') IN ('controller', 'route', 'route_handler', 'router')
                       OR json_extract(s.metadata, '$.route_prefix') IS NOT NULL
                       OR json_extract(s.metadata, '$.route_path') IS NOT NULL
                       OR json_extract(s.metadata, '$.http_method') IS NOT NULL
                    ORDER BY CASE
                         WHEN s.kind = 'controller' THEN 0
-                        WHEN json_extract(s.metadata, '$.resource') = 'controller' THEN 1
-                        ELSE 2
+                        WHEN s.kind = 'route_handler' THEN 1
+                        WHEN s.kind = 'router' THEN 2
+                        WHEN json_extract(s.metadata, '$.resource') = 'controller' THEN 3
+                        ELSE 4
                    END, f.path, s.start_line
                    LIMIT ?""",
                 chunk,
@@ -2566,6 +2591,11 @@ class Database:
             path_prefix=path_prefix,
             layer=layer,
         )
+        recomputed = self._recompute_filtered_community_labels(
+            communities,
+            path_prefix=path_prefix,
+            layer=layer,
+        )
         results: list[dict] = []
         for community in communities:
             members = self.get_community_members(
@@ -2575,19 +2605,73 @@ class Database:
                 layer=layer,
                 verbose=verbose,
             )
+            label, keywords = recomputed.get(
+                community["id"],
+                (community["label"], community["keywords"]),
+            )
             results.append(
                 {
                     "id": community["id"],
-                    "label": community["label"],
+                    "label": label,
                     "member_count": community["member_count"],
                     "cohesion": community["cohesion"],
-                    "keywords": community["keywords"],
+                    "keywords": keywords,
                     "truncated": member_limit is not None and community["member_count"] > len(members),
                     "member_limit_applied": member_limit,
                     "members": members,
                 }
             )
         return results
+
+    def _recompute_filtered_community_labels(
+        self,
+        communities: list[dict[str, Any]],
+        *,
+        path_prefix: str | None = None,
+        layer: str | None = None,
+    ) -> dict[int, tuple[str, list[str]]]:
+        """Recompute community labels/keywords from the filtered member subset."""
+        if not communities or (not path_prefix and not layer):
+            return {}
+
+        assert self.conn is not None
+        from .community import _extract_keywords, _label_community, _tokenize_name
+
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix, layer=layer)
+        community_ids = [int(community["id"]) for community in communities]
+        placeholders = ",".join("?" for _ in community_ids)
+        rows = self.conn.execute(
+            f"""SELECT sc.community_id, s.name
+                FROM symbol_communities sc
+                JOIN symbols s ON sc.symbol_id = s.id
+                JOIN files f ON s.file_id = f.id
+                WHERE sc.community_id IN ({placeholders})"""
+            + filter_sql
+            + """
+                ORDER BY sc.community_id, s.name""",
+            [*community_ids, *filter_params],
+        ).fetchall()
+
+        names_by_community: dict[int, list[str]] = {community_id: [] for community_id in community_ids}
+        global_freq = Counter()
+        for row in rows:
+            community_id = int(row["community_id"])
+            name = str(row["name"] or "").strip()
+            if not name:
+                continue
+            names_by_community.setdefault(community_id, []).append(name)
+            global_freq.update(set(_tokenize_name(name)))
+
+        n_communities = max(len([names for names in names_by_community.values() if names]), 1)
+        recomputed: dict[int, tuple[str, list[str]]] = {}
+        for community_id, names in names_by_community.items():
+            if not names:
+                continue
+            recomputed[community_id] = (
+                _label_community(names, global_freq, n_communities),
+                _extract_keywords(names, global_freq, n_communities),
+            )
+        return recomputed
 
     def get_community_for_symbol(self, symbol_id: int) -> int | None:
         """Get the community ID for a symbol, or None."""
@@ -2807,6 +2891,84 @@ class Database:
             deduped.append(item)
         return deduped
 
+    def api_surface(
+        self,
+        *,
+        path_prefix: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return a compact API endpoint surface from indexed route symbols."""
+        assert self.conn is not None
+        filter_sql, filter_params = self._file_filter_sql(path_prefix=path_prefix)
+        rows = self.conn.execute(
+            """SELECT s.name, s.kind, s.metadata, f.path AS file_path
+               FROM symbols s
+               JOIN files f ON s.file_id = f.id
+               WHERE s.kind IN ('route_handler', 'router', 'route')"""
+            + filter_sql
+            + """
+               ORDER BY f.path, s.start_line, s.name
+               LIMIT ?""",
+            [*filter_params, max(limit * 3, limit)],
+        ).fetchall()
+
+        endpoints: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for row in rows:
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except json.JSONDecodeError:
+                    metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            framework = str(metadata.get("framework") or "").lower() or None
+            if row["kind"] == "router" and isinstance(metadata.get("routes"), list):
+                for route in metadata["routes"]:
+                    if not isinstance(route, dict):
+                        continue
+                    method = str(route.get("method") or "").upper().strip()
+                    path = str(route.get("path") or "").strip()
+                    if not method or not path:
+                        continue
+                    key = (method, path, str(row["file_path"]))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    endpoints.append({
+                        "method": method,
+                        "path": path,
+                        "symbol": row["name"],
+                        "kind": row["kind"],
+                        "framework": framework,
+                        "file_path": row["file_path"],
+                    })
+                    if len(endpoints) >= limit:
+                        return endpoints
+                continue
+
+            method = str(metadata.get("http_method") or "").upper().strip()
+            path = str(metadata.get("route_path") or "").strip()
+            if not method or not path:
+                continue
+            key = (method, path, str(row["file_path"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            endpoints.append({
+                "method": method,
+                "path": path,
+                "symbol": row["name"],
+                "kind": row["kind"],
+                "framework": framework,
+                "file_path": row["file_path"],
+            })
+            if len(endpoints) >= limit:
+                break
+        return endpoints
+
     def get_flows_for_symbol(self, symbol_id: int) -> list[dict]:
         """Get all execution flows that pass through a symbol."""
         assert self.conn is not None
@@ -2897,7 +3059,12 @@ class Database:
             "db_size_mb": round(db_size / (1024 * 1024), 2),
         }
 
-    def resolve_import(self, name: str, hint_path: str | None = None) -> dict | None:
+    def resolve_import(
+        self,
+        name: str,
+        hint_path: str | None = None,
+        root_path: Path | None = None,
+    ) -> dict | None:
         """Try to resolve an import name to an indexed symbol or file.
 
         Resolution strategy:
@@ -2952,6 +3119,24 @@ class Database:
                 "match_type": "qualified_name",
             }
 
+        if root_path is not None and hint_path:
+            from .indexer import _resolve_typescript_import_path
+
+            resolved_path = _resolve_typescript_import_path(root_path, hint_path, name)
+            if resolved_path:
+                row = self.conn.execute(
+                    "SELECT * FROM files WHERE path = ?",
+                    (resolved_path,),
+                ).fetchone()
+                if row:
+                    return {
+                        "name": name,
+                        "file": row["path"],
+                        "line": 1,
+                        "kind": "module",
+                        "match_type": "file_path",
+                    }
+
         # 3. File path match — convert dotted module to path patterns
         candidates = []
         dotted = name.replace(".", "/")
@@ -2999,7 +3184,16 @@ class Database:
             WHERE e.id IS NULL
               AND s.name NOT LIKE 'test\\_%' ESCAPE '\\'
               AND s.name NOT LIKE 'Test%'
-              AND s.name NOT IN ('main', '__init__', '__main__', '__new__', '__del__')
+              AND s.name NOT IN ('main', '__init__', '__main__', '__new__', '__del__', 'constructor')
+              AND NOT (
+                    s.name = 'bootstrap'
+                AND (
+                        f.path LIKE '%/main.ts'
+                     OR f.path LIKE '%/main.js'
+                     OR f.path LIKE '%/main.tsx'
+                     OR f.path LIKE '%/main.jsx'
+                )
+              )
               AND f.path NOT LIKE '%test%'
               AND f.path NOT LIKE '%vendor%'
               AND f.path NOT LIKE '%third_party%'

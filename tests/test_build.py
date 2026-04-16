@@ -145,3 +145,60 @@ def test_get_build_info_empty(tmp_path):
     info = get_build_info(tmp_path)
     assert info["build_systems"] == []
     assert info["targets"] == []
+
+
+def test_get_build_info_discovers_npm_workspaces_and_packages(tmp_path):
+    (tmp_path / "package.json").write_text("""
+{
+  "name": "monorepo-root",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "dependencies": {
+    "turbo": "^2.0.0"
+  }
+}
+""")
+    (tmp_path / "turbo.json").write_text('{"tasks": {}}')
+
+    backend = tmp_path / "apps" / "backend"
+    frontend = tmp_path / "apps" / "frontend"
+    shared = tmp_path / "packages" / "shared"
+    backend.mkdir(parents=True)
+    frontend.mkdir(parents=True)
+    shared.mkdir(parents=True)
+
+    (backend / "package.json").write_text("""
+{
+  "name": "@repo/backend",
+  "dependencies": {
+    "@repo/shared": "workspace:*",
+    "@nestjs/common": "^10.0.0"
+  }
+}
+""")
+    (frontend / "package.json").write_text("""
+{
+  "name": "@repo/frontend",
+  "dependencies": {
+    "@repo/shared": "workspace:*",
+    "vue": "^3.5.0"
+  }
+}
+""")
+    (shared / "package.json").write_text("""
+{
+  "name": "@repo/shared",
+  "dependencies": {
+    "zod": "^4.0.0"
+  }
+}
+""")
+
+    info = get_build_info(tmp_path)
+
+    assert "npm" in info["build_systems"]
+    names = {entry["name"] for entry in info["dependencies"]}
+    assert "monorepo-root" in names
+    assert "@repo/backend" in names
+    assert "@repo/frontend" in names
+    assert "@repo/shared" in names

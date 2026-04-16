@@ -36,6 +36,26 @@ def _run_git_lines(repo_root: Path, *args: str, timeout: int = 30) -> list[str]:
     return [line for line in out.splitlines() if line.strip()]
 
 
+def _parse_numstat(lines: list[str]) -> dict[str, dict[str, int]]:
+    """Parse git --numstat output into per-file line deltas."""
+    stats: dict[str, dict[str, int]] = {}
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added_text, deleted_text, path = parts
+        try:
+            added = 0 if added_text == "-" else int(added_text)
+            deleted = 0 if deleted_text == "-" else int(deleted_text)
+        except ValueError:
+            continue
+        stats[path] = {
+            "added": added,
+            "deleted": deleted,
+        }
+    return stats
+
+
 @dataclass
 class BlameInfo:
     """Blame info for a line range."""
@@ -237,13 +257,25 @@ def whats_changed(repo_root: Path) -> dict[str, Any]:
     """
     # Staged changes
     staged = _run_git_lines(repo_root, "diff", "--cached", "--name-status")
+    staged_numstat = _parse_numstat(_run_git_lines(repo_root, "diff", "--cached", "--numstat"))
     # Unstaged changes
     unstaged = _run_git_lines(repo_root, "diff", "--name-status")
+    unstaged_numstat = _parse_numstat(_run_git_lines(repo_root, "diff", "--numstat"))
     # Untracked files
     untracked = _run_git_lines(repo_root, "ls-files", "--others", "--exclude-standard")
 
     changes = []
     seen = set()
+    files_by_type = {
+        "added": 0,
+        "deleted": 0,
+        "modified": 0,
+        "untracked": 0,
+    }
+    staged_count = 0
+    unstaged_count = 0
+    total_added = 0
+    total_deleted = 0
 
     for line in staged:
         parts = line.split("\t", 1)
@@ -252,8 +284,19 @@ def whats_changed(repo_root: Path) -> dict[str, Any]:
             change_type = {"M": "modified", "A": "added", "D": "deleted"}.get(
                 status[0], "modified"
             )
-            changes.append({"file": path, "type": change_type, "staged": True})
+            line_stats = staged_numstat.get(path, {"added": 0, "deleted": 0})
+            changes.append({
+                "file": path,
+                "type": change_type,
+                "staged": True,
+                "lines_added": line_stats["added"],
+                "lines_deleted": line_stats["deleted"],
+            })
             seen.add(path)
+            files_by_type[change_type] = files_by_type.get(change_type, 0) + 1
+            staged_count += 1
+            total_added += line_stats["added"]
+            total_deleted += line_stats["deleted"]
 
     for line in unstaged:
         parts = line.split("\t", 1)
@@ -263,15 +306,43 @@ def whats_changed(repo_root: Path) -> dict[str, Any]:
                 change_type = {"M": "modified", "A": "added", "D": "deleted"}.get(
                     status[0], "modified"
                 )
-                changes.append({"file": path, "type": change_type, "staged": False})
+                line_stats = unstaged_numstat.get(path, {"added": 0, "deleted": 0})
+                changes.append({
+                    "file": path,
+                    "type": change_type,
+                    "staged": False,
+                    "lines_added": line_stats["added"],
+                    "lines_deleted": line_stats["deleted"],
+                })
                 seen.add(path)
+                files_by_type[change_type] = files_by_type.get(change_type, 0) + 1
+                unstaged_count += 1
+                total_added += line_stats["added"]
+                total_deleted += line_stats["deleted"]
 
     for path in untracked:
         if path not in seen:
-            changes.append({"file": path, "type": "untracked", "staged": False})
+            changes.append({
+                "file": path,
+                "type": "untracked",
+                "staged": False,
+                "lines_added": 0,
+                "lines_deleted": 0,
+            })
+            files_by_type["untracked"] += 1
+            unstaged_count += 1
 
     return {
         "total_changes": len(changes),
+        "summary": {
+            "files_by_type": files_by_type,
+            "staged": staged_count,
+            "unstaged": unstaged_count,
+            "line_stats": {
+                "added": total_added,
+                "deleted": total_deleted,
+            },
+        },
         "changes": changes,
     }
 
