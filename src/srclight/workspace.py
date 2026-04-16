@@ -531,8 +531,8 @@ class WorkspaceDB:
                 _find_representative_files,
                 _indexed_file_orientation_hints,
                 _indexed_orientation_hints,
-                _merge_orientation_hints,
                 _merge_indexed_representative_files,
+                _merge_orientation_hints,
             )
 
             entry = next(

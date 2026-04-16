@@ -2867,7 +2867,11 @@ class Database:
 
         return None
 
-    def get_dead_symbols(self, kind: str | None = None) -> list[SymbolRecord]:
+    def get_dead_symbols(
+        self,
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> list[SymbolRecord]:
         """Find symbols with no incoming edges — potential dead code.
 
         Returns symbols that are never referenced as a target in symbol_edges.
@@ -2875,14 +2879,13 @@ class Database:
         """
         assert self.conn is not None
 
-        allowed_kinds = ("function", "method", "class", "struct", "enum", "interface")
+        default_kinds = ("function", "method", "class", "struct")
         sql = """
             SELECT s.*, f.path as file_path
             FROM symbols s
             JOIN files f ON s.file_id = f.id
             LEFT JOIN symbol_edges e ON e.target_id = s.id
             WHERE e.id IS NULL
-              AND s.kind IN ({kinds})
               AND s.name NOT LIKE 'test\\_%' ESCAPE '\\'
               AND s.name NOT LIKE 'Test%'
               AND s.name NOT IN ('main', '__init__', '__main__', '__new__', '__del__')
@@ -2890,15 +2893,22 @@ class Database:
               AND f.path NOT LIKE '%vendor%'
               AND f.path NOT LIKE '%third_party%'
               AND f.path NOT LIKE '%third-party%'
-        """.format(kinds=",".join("?" for _ in allowed_kinds))
-
-        params: list[Any] = list(allowed_kinds)
+              AND COALESCE(s.visibility, '') NOT IN ('public', 'export')
+        """
 
         if kind:
             sql += "  AND s.kind = ?\n"
-            params.append(kind)
+            params: list[Any] = [kind]
+        else:
+            sql += "  AND s.kind IN ({kinds})\n".format(
+                kinds=",".join("?" for _ in default_kinds)
+            )
+            params = list(default_kinds)
 
         sql += "ORDER BY f.path, s.start_line"
+        if limit is not None:
+            sql += "\nLIMIT ?"
+            params.append(limit)
 
         rows = self.conn.execute(sql, params).fetchall()
         return [self._row_to_symbol(r) for r in rows]
@@ -2949,7 +2959,8 @@ class Database:
             matches = []
             lines = content.split("\n")
             for i, line in enumerate(lines):
-                if compiled.search(line):
+                match_obj = compiled.search(line)
+                if match_obj:
                     # Build snippet: matching line + 1 line context each side
                     start = max(0, i - 1)
                     end = min(len(lines), i + 2)
@@ -2958,6 +2969,8 @@ class Database:
                         "line_offset": i + 1,  # 1-based within symbol
                         "absolute_line": row["start_line"] + i,
                         "snippet": snippet,
+                        "line": line,
+                        "match": match_obj.group(0),
                     })
 
             if matches:
@@ -2976,6 +2989,37 @@ class Database:
                     break
 
         return results
+
+    def find_pattern_in_symbols(
+        self,
+        pattern: str,
+        language: str | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Backward-compatible wrapper around search_pattern()."""
+        results = self.search_pattern(pattern, language=language, kind=kind, limit=limit)
+        return [
+            {
+                "name": result["name"],
+                "qualified_name": result["qualified_name"],
+                "kind": result["kind"],
+                "file": result["file"],
+                "start_line": result["start_line"],
+                "end_line": result["end_line"],
+                "language": result["language"],
+                "match_count": len(result["matches"]),
+                "matched_lines": [
+                    {
+                        "line_offset": match["line_offset"],
+                        "line": match["line"],
+                        "match": match["match"],
+                    }
+                    for match in result["matches"]
+                ],
+            }
+            for result in results
+        ]
 
     def commit(self) -> None:
         assert self.conn is not None

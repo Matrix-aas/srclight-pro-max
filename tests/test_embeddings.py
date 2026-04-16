@@ -1383,7 +1383,13 @@ def test_db_symbols_needing_embeddings_refresh_on_file_summary_change(tmp_path):
     freshness_hash = initial[0]["embedding_body_hash"]
     assert freshness_hash
 
-    db.upsert_embedding(sym_id, "mock:test-model", 4, vector_to_bytes([0.0, 1.0, 0.0, 0.0]), freshness_hash)
+    db.upsert_embedding(
+        sym_id,
+        "mock:test-model",
+        4,
+        vector_to_bytes([0.0, 1.0, 0.0, 0.0]),
+        freshness_hash,
+    )
     db.commit()
 
     db.update_file_summary(

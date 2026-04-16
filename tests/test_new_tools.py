@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
 import srclight.server as server
+from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
 from srclight.server import _extract_imports
 
 
