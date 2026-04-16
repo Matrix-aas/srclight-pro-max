@@ -1,6 +1,8 @@
 """Tests for the database layer."""
 
 
+import sqlite3
+
 import pytest
 
 from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord, content_hash
@@ -51,6 +53,50 @@ def test_upsert_file(db):
     assert got.content_hash == "def456"
 
 
+def test_initialize_migrates_file_summary_columns(tmp_path):
+    """Older DBs gain summary and metadata columns during initialize."""
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE schema_info (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        INSERT INTO schema_info (key, value) VALUES ('schema_version', '5');
+        CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            path TEXT UNIQUE NOT NULL,
+            content_hash TEXT NOT NULL,
+            mtime REAL NOT NULL,
+            language TEXT,
+            size INTEGER,
+            line_count INTEGER,
+            indexed_at TEXT
+        );
+        INSERT INTO files (path, content_hash, mtime, language, size, line_count, indexed_at)
+        VALUES ('legacy.py', 'abc123', 1.0, 'python', 42, 3, '2026-01-01T00:00:00.000Z');
+    """)
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)
+    db.open()
+    try:
+        db.initialize()
+        migrated = db.get_file("legacy.py")
+        assert migrated is not None
+        assert migrated.summary is None
+        assert migrated.metadata is None
+
+        columns = {
+            row["name"] for row in db.conn.execute("PRAGMA table_info(files)").fetchall()
+        }
+        assert "summary" in columns
+        assert "metadata" in columns
+    finally:
+        db.close()
+
+
 def test_file_needs_reindex(db):
     """Change detection works via content hash."""
     rec = FileRecord(
@@ -62,6 +108,78 @@ def test_file_needs_reindex(db):
     assert not db.file_needs_reindex("src/main.py", "abc123")
     assert db.file_needs_reindex("src/main.py", "different_hash")
     assert db.file_needs_reindex("nonexistent.py", "abc123")
+
+
+def test_list_files_filters_by_prefix_and_recursion(db):
+    """list_files supports shallow and recursive prefix filtering."""
+    for path in [
+        "shared/src/domain/aggregate.ts",
+        "shared/src/domain/level/nested.ts",
+        "shared/src/domain/level/deeper/more.ts",
+        "shared/src/other/util.ts",
+    ]:
+        db.upsert_file(FileRecord(
+            path=path,
+            content_hash=path,
+            mtime=1000.0,
+            language="typescript",
+            size=100,
+            line_count=10,
+        ))
+    db.commit()
+
+    shallow = db.list_files(path_prefix="shared/src/domain", recursive=False)
+    assert [item["path"] for item in shallow] == ["shared/src/domain/aggregate.ts"]
+
+    deep = db.list_files(path_prefix="shared/src/domain", recursive=True, limit=2)
+    assert len(deep) == 2
+    assert all(item["path"].startswith("shared/src/domain/") for item in deep)
+
+    level = db.list_files(path_prefix="shared/src/domain/level", recursive=False)
+    assert [item["path"] for item in level] == ["shared/src/domain/level/nested.ts"]
+
+
+def test_update_and_get_file_summary(db):
+    """File summaries persist lightweight metadata and expose file TOC data."""
+    file_id = db.upsert_file(FileRecord(
+        path="client/src/components/ProfileCard.vue",
+        content_hash="profile-card",
+        mtime=1000.0,
+        language="vue",
+        size=240,
+        line_count=20,
+    ))
+    db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="component",
+        name="ProfileCard",
+        qualified_name="ProfileCard",
+        signature="<script setup>",
+        start_line=1,
+        end_line=20,
+        content="<template><div /></template>",
+        line_count=20,
+    ), "client/src/components/ProfileCard.vue")
+    db.commit()
+
+    db.update_file_summary(
+        "client/src/components/ProfileCard.vue",
+        summary="Renders the account profile card shell.",
+        metadata={"framework": "vue", "tags": ["ui", "profile"]},
+    )
+    db.commit()
+
+    file_rec = db.get_file("client/src/components/ProfileCard.vue")
+    assert file_rec is not None
+    assert file_rec.summary == "Renders the account profile card shell."
+    assert file_rec.metadata == {"framework": "vue", "tags": ["ui", "profile"]}
+
+    summary = db.get_file_summary("client/src/components/ProfileCard.vue")
+    assert summary is not None
+    assert summary["file"] == "client/src/components/ProfileCard.vue"
+    assert summary["summary"] == "Renders the account profile card shell."
+    assert summary["metadata"] == {"framework": "vue", "tags": ["ui", "profile"]}
+    assert summary["top_level_symbols"][0]["name"] == "ProfileCard"
 
 
 def test_insert_symbol_and_search(db):

@@ -1,9 +1,12 @@
 """Tests for new analysis tools: find_dead_code, find_pattern, find_imports."""
 
 
+import json
+
 import pytest
 
 from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
+import srclight.server as server
 from srclight.server import _extract_imports
 
 
@@ -482,3 +485,71 @@ class TestFindImportsIntegration:
         modules = [i["module"] for i in raw_imports]
         assert "stdio.h" in modules
         assert "mylib.h" in modules
+
+
+class TestFileNavigationTools:
+    def test_list_files_returns_db_backed_results(self, db, monkeypatch):
+        file_paths = [
+            "shared/src/domain/model.ts",
+            "shared/src/domain/level/nested.ts",
+            "shared/src/domain/level/deeper/more.ts",
+            "shared/src/infra/http.ts",
+        ]
+        for path in file_paths:
+            _insert_file(db, path=path, language="typescript")
+        db.commit()
+
+        monkeypatch.setattr("srclight.server._is_workspace_mode", lambda: False)
+        monkeypatch.setattr("srclight.server._get_db", lambda: db)
+
+        payload = json.loads(server.list_files(path_prefix="shared/src/domain", recursive=False))
+        assert payload["path_prefix"] == "shared/src/domain"
+        assert payload["recursive"] is False
+        assert payload["files"][0]["path"].startswith("shared/src/domain/")
+        assert payload["files"] == [
+            {
+                "path": "shared/src/domain/model.ts",
+                "language": "typescript",
+                "size": 100,
+                "line_count": 10,
+                "summary": None,
+            },
+        ]
+
+        deep_payload = json.loads(server.list_files(
+            path_prefix="shared/src/domain",
+            recursive=True,
+            limit=2,
+        ))
+        assert deep_payload["recursive"] is True
+        assert len(deep_payload["files"]) == 2
+
+    def test_get_file_summary_returns_summary_and_top_level_symbols(self, db, monkeypatch):
+        file_path = "client/src/components/ProfileCard.vue"
+        file_id = _insert_file(db, path=file_path, language="vue", size=240, line_count=20)
+        _insert_symbol(
+            db,
+            file_id,
+            "ProfileCard",
+            file_path=file_path,
+            kind="component",
+            start_line=1,
+            end_line=20,
+            content="<template><div /></template>",
+            signature="<script setup>",
+        )
+        db.update_file_summary(
+            file_path,
+            summary="Profile card component shell.",
+            metadata={"framework": "vue"},
+        )
+        db.commit()
+
+        monkeypatch.setattr("srclight.server._is_workspace_mode", lambda: False)
+        monkeypatch.setattr("srclight.server._get_db", lambda: db)
+
+        payload = json.loads(server.get_file_summary(file_path))
+        assert payload["file"] == file_path
+        assert payload["summary"] == "Profile card component shell."
+        assert payload["metadata"] == {"framework": "vue"}
+        assert payload["top_level_symbols"][0]["name"] == "ProfileCard"

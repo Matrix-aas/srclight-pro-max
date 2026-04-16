@@ -243,7 +243,7 @@ def _normalized_token_phrase(text: str) -> str:
     """Normalize arbitrary text into a comparable token phrase."""
     return " ".join(re.findall(r"[A-Za-z0-9]+", (text or "").lower())).strip()
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -264,6 +264,8 @@ CREATE TABLE IF NOT EXISTS files (
     language TEXT,
     size INTEGER,
     line_count INTEGER,
+    summary TEXT,
+    metadata TEXT,
     indexed_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -422,6 +424,8 @@ class FileRecord:
     language: str | None = None
     size: int = 0
     line_count: int = 0
+    summary: str | None = None
+    metadata: dict | None = None
     indexed_at: str | None = None
 
 
@@ -502,6 +506,15 @@ class Database:
             self.conn.execute("ALTER TABLE index_state ADD COLUMN indexer_version TEXT")
         except Exception:
             pass  # column already exists
+        # Migrate v5 -> v6: file summary metadata
+        try:
+            self.conn.execute("ALTER TABLE files ADD COLUMN summary TEXT")
+        except Exception:
+            pass  # column already exists
+        try:
+            self.conn.execute("ALTER TABLE files ADD COLUMN metadata TEXT")
+        except Exception:
+            pass  # column already exists
         # Migrate v4 -> v5: add community/flow tables
         try:
             self.conn.execute("SELECT 1 FROM communities LIMIT 1")
@@ -541,17 +554,29 @@ class Database:
     def upsert_file(self, rec: FileRecord) -> int:
         """Insert or update a file record. Returns file ID."""
         assert self.conn is not None
+        metadata_json = json.dumps(rec.metadata) if rec.metadata is not None else None
         self.conn.execute(
-            """INSERT INTO files (path, content_hash, mtime, language, size, line_count)
-               VALUES (?, ?, ?, ?, ?, ?)
+            """INSERT INTO files (path, content_hash, mtime, language, size, line_count, summary, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(path) DO UPDATE SET
                    content_hash=excluded.content_hash,
                    mtime=excluded.mtime,
                    language=excluded.language,
                    size=excluded.size,
                    line_count=excluded.line_count,
+                   summary=excluded.summary,
+                   metadata=excluded.metadata,
                    indexed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')""",
-            (rec.path, rec.content_hash, rec.mtime, rec.language, rec.size, rec.line_count),
+            (
+                rec.path,
+                rec.content_hash,
+                rec.mtime,
+                rec.language,
+                rec.size,
+                rec.line_count,
+                rec.summary,
+                metadata_json,
+            ),
         )
         # lastrowid is unreliable for ON CONFLICT DO UPDATE — fetch the actual ID
         row = self.conn.execute(
@@ -564,14 +589,22 @@ class Database:
         row = self.conn.execute("SELECT * FROM files WHERE path = ?", (path,)).fetchone()
         if row is None:
             return None
-        return FileRecord(**{k: row[k] for k in row.keys()})
+        return self._row_to_file(row)
 
     def get_file_by_id(self, file_id: int) -> FileRecord | None:
         assert self.conn is not None
         row = self.conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
         if row is None:
             return None
-        return FileRecord(**{k: row[k] for k in row.keys()})
+        return self._row_to_file(row)
+
+    def _row_to_file(self, row: sqlite3.Row) -> FileRecord:
+        data = {k: row[k] for k in row.keys()}
+        if isinstance(data.get("metadata"), str):
+            data["metadata"] = json.loads(data["metadata"])
+        valid_fields = {f.name for f in fields(FileRecord)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
+        return FileRecord(**data)
 
     def file_needs_reindex(self, path: str, content_hash: str) -> bool:
         """Check if file needs re-indexing by comparing content hash."""
@@ -595,6 +628,96 @@ class Database:
         assert self.conn is not None
         rows = self.conn.execute("SELECT path FROM files").fetchall()
         return {row["path"] for row in rows}
+
+    def list_files(
+        self,
+        path_prefix: str | None = None,
+        *,
+        recursive: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List indexed files, optionally filtered by a path prefix."""
+        assert self.conn is not None
+
+        normalized_prefix = (path_prefix or "").strip().strip("/")
+        params: list[Any] = []
+        query = """
+            SELECT path, language, size, line_count, summary
+            FROM files
+        """
+        if normalized_prefix:
+            query += " WHERE path LIKE ? COLLATE NOCASE"
+            params.append(f"{normalized_prefix}/%")
+        query += " ORDER BY path"
+
+        rows = self.conn.execute(query, params).fetchall()
+        files: list[dict[str, Any]] = []
+        prefix_with_sep = f"{normalized_prefix}/" if normalized_prefix else ""
+        for row in rows:
+            path = row["path"]
+            if normalized_prefix and not recursive:
+                suffix = path[len(prefix_with_sep):]
+                if "/" in suffix:
+                    continue
+            files.append({
+                "path": path,
+                "language": row["language"],
+                "size": row["size"],
+                "line_count": row["line_count"],
+                "summary": row["summary"],
+            })
+            if len(files) >= limit:
+                break
+        return files
+
+    def update_file_summary(
+        self,
+        path: str,
+        *,
+        summary: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Persist lightweight summary fields for an indexed file."""
+        assert self.conn is not None
+        metadata_json = json.dumps(metadata) if metadata is not None else None
+        self.conn.execute(
+            "UPDATE files SET summary = ?, metadata = ? WHERE path = ?",
+            (summary, metadata_json, path),
+        )
+
+    def get_file_summary(self, path: str) -> dict[str, Any] | None:
+        """Return lightweight summary metadata and top-level symbols for a file."""
+        file_rec = self.get_file(path)
+        if file_rec is None or file_rec.id is None:
+            return None
+
+        assert self.conn is not None
+        rows = self.conn.execute(
+            """SELECT name, kind, signature, start_line, end_line
+               FROM symbols
+               WHERE file_id = ? AND parent_symbol_id IS NULL
+               ORDER BY start_line, id""",
+            (file_rec.id,),
+        ).fetchall()
+
+        return {
+            "file": file_rec.path,
+            "language": file_rec.language,
+            "size": file_rec.size,
+            "line_count": file_rec.line_count,
+            "summary": file_rec.summary,
+            "metadata": file_rec.metadata,
+            "top_level_symbols": [
+                {
+                    "name": row["name"],
+                    "kind": row["kind"],
+                    "signature": row["signature"],
+                    "line": row["start_line"],
+                    "end_line": row["end_line"],
+                }
+                for row in rows
+            ],
+        }
 
     # --- Symbols ---
 

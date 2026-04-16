@@ -1678,6 +1678,91 @@ def symbols_in_file(path: str, project: str | None = None) -> str:
     }, indent=2)
 
 
+@mcp.tool()
+def list_files(
+    path_prefix: str | None = None,
+    project: str | None = None,
+    recursive: bool = True,
+    limit: int = 100,
+) -> str:
+    """List indexed files, optionally filtered by a path prefix.
+
+    Args:
+        path_prefix: Optional directory-like prefix to filter indexed files
+        project: Optional project filter in workspace mode
+        recursive: Whether to include nested descendants below path_prefix
+        limit: Maximum files to return (default 100)
+    """
+    _record_query()
+    if _is_workspace_mode():
+        project_error = _workspace_project_not_found_error(project)
+        if project_error is not None:
+            return project_error
+        wdb = _get_workspace_db()
+        files = wdb.list_files(
+            path_prefix=path_prefix,
+            project=project,
+            recursive=recursive,
+            limit=limit,
+        )
+        payload: dict[str, object] = {
+            "path_prefix": path_prefix,
+            "recursive": recursive,
+            "limit": limit,
+            "file_count": len(files),
+            "files": files,
+        }
+        if project is not None:
+            payload["project"] = project
+        return json.dumps(payload, indent=2)
+
+    db = _get_db()
+    files = db.list_files(path_prefix=path_prefix, recursive=recursive, limit=limit)
+    return json.dumps({
+        "path_prefix": path_prefix,
+        "recursive": recursive,
+        "limit": limit,
+        "file_count": len(files),
+        "files": files,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_file_summary(path: str, project: str | None = None) -> str:
+    """Get lightweight summary metadata and top-level symbols for one indexed file.
+
+    Args:
+        path: Relative file path
+        project: Optional project filter in workspace mode
+    """
+    _record_query()
+    if _is_workspace_mode():
+        project_error = _workspace_project_not_found_error(project)
+        if project_error is not None:
+            return project_error
+        wdb = _get_workspace_db()
+        summary = wdb.get_file_summary(path, project=project)
+        if summary is None:
+            payload = {"error": f"File '{path}' not found"}
+            if project is not None:
+                payload["error"] = f"File '{path}' not found in {project}"
+                payload["project"] = project
+            return json.dumps(payload, indent=2)
+        if isinstance(summary, list):
+            return json.dumps({
+                "file": path,
+                "match_count": len(summary),
+                "summaries": summary,
+            }, indent=2)
+        return json.dumps(summary, indent=2)
+
+    db = _get_db()
+    summary = db.get_file_summary(path)
+    if summary is None:
+        return json.dumps({"error": f"File '{path}' not found"}, indent=2)
+    return json.dumps(summary, indent=2)
+
+
 # --- Tier 2: Graph tools ---
 
 

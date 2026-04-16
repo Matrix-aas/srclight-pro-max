@@ -399,6 +399,62 @@ class WorkspaceDB:
             for item in candidates[:limit]
         ]
 
+    def list_files(
+        self,
+        path_prefix: str | None = None,
+        *,
+        project: str | None = None,
+        recursive: bool = True,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List indexed files across workspace projects."""
+        results: list[dict[str, Any]] = []
+
+        for entry in self._iter_entries(project_filter=project):
+            try:
+                with self._open_project_db(entry) as db:
+                    project_files = db.list_files(
+                        path_prefix=path_prefix,
+                        recursive=recursive,
+                        limit=limit,
+                    )
+                    for item in project_files:
+                        results.append({"project": entry.name, **item})
+                        if len(results) >= limit:
+                            return results
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Skipping list_files for %s due to project DB error: %s", entry.name, e)
+                continue
+
+        return results
+
+    def get_file_summary(
+        self,
+        path: str,
+        *,
+        project: str | None = None,
+    ) -> dict[str, Any] | list[dict[str, Any]] | None:
+        """Get one file summary, optionally scoped to a single project."""
+        summaries: list[dict[str, Any]] = []
+
+        for entry in self._iter_entries(project_filter=project):
+            try:
+                with self._open_project_db(entry) as db:
+                    summary = db.get_file_summary(path)
+                    if summary is not None:
+                        summaries.append({"project": entry.name, **summary})
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Skipping get_file_summary for %s due to project DB error: %s", entry.name, e)
+                continue
+
+        if project is not None:
+            return summaries[0] if summaries else None
+        if not summaries:
+            return None
+        if len(summaries) == 1:
+            return summaries[0]
+        return summaries
+
     def codebase_map(self, project: str | None = None) -> dict[str, Any]:
         """Get aggregated stats across all projects (or a single one)."""
         assert self.conn is not None

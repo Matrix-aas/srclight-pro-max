@@ -593,6 +593,173 @@ def test_workspace_get_symbol_miss_keeps_project_scoped_hints(tmp_path, ws_dir, 
     assert "AuthRoutesService" not in payload["did_you_mean"]
 
 
+def test_workspace_db_list_files_and_get_file_summary_are_project_scoped(tmp_path, ws_dir):
+    alpha = _create_indexed_project(tmp_path, "alpha", [
+        {
+            "name": "ProfileCard",
+            "kind": "component",
+            "path": "client/src/components/ProfileCard.vue",
+            "signature": "<script setup>",
+            "content": "<template><div /></template>",
+        },
+    ])
+    beta = _create_indexed_project(tmp_path, "beta", [
+        {
+            "name": "ProfileCard",
+            "kind": "component",
+            "path": "client/src/components/ProfileCard.vue",
+            "signature": "<script setup>",
+            "content": "<template><aside /></template>",
+        },
+        {
+            "name": "DomainModel",
+            "kind": "class",
+            "path": "shared/src/domain/level/model.ts",
+            "signature": "class DomainModel",
+            "content": "export class DomainModel {}",
+        },
+    ])
+
+    alpha_db = Database(alpha / ".srclight" / "index.db")
+    alpha_db.open()
+    try:
+        alpha_db.update_file_summary(
+            "client/src/components/ProfileCard.vue",
+            summary="Alpha profile card.",
+            metadata={"framework": "vue", "project_label": "alpha"},
+        )
+        alpha_db.commit()
+    finally:
+        alpha_db.close()
+
+    beta_db = Database(beta / ".srclight" / "index.db")
+    beta_db.open()
+    try:
+        beta_db.update_file_summary(
+            "client/src/components/ProfileCard.vue",
+            summary="Beta profile card.",
+            metadata={"framework": "vue", "project_label": "beta"},
+        )
+        beta_db.commit()
+    finally:
+        beta_db.close()
+
+    config = WorkspaceConfig(name="workspace-file-tools")
+    config.add_project("alpha", str(alpha))
+    config.add_project("beta", str(beta))
+
+    with WorkspaceDB(config) as wdb:
+        alpha_files = wdb.list_files(
+            path_prefix="client/src/components",
+            project="alpha",
+            recursive=False,
+        )
+        assert alpha_files == [
+            {
+                "project": "alpha",
+                "path": "client/src/components/ProfileCard.vue",
+                "language": "csharp",
+                "size": 500,
+                "line_count": 50,
+                "summary": "Alpha profile card.",
+            },
+        ]
+
+        beta_files = wdb.list_files(
+            path_prefix="shared/src/domain",
+            project="beta",
+            recursive=True,
+            limit=50,
+        )
+        assert beta_files == [
+            {
+                "project": "beta",
+                "path": "shared/src/domain/level/model.ts",
+                "language": "typescript",
+                "size": 500,
+                "line_count": 50,
+                "summary": None,
+            },
+        ]
+
+        alpha_summary = wdb.get_file_summary(
+            "client/src/components/ProfileCard.vue",
+            project="alpha",
+        )
+        assert alpha_summary["project"] == "alpha"
+        assert alpha_summary["summary"] == "Alpha profile card."
+        assert alpha_summary["metadata"]["project_label"] == "alpha"
+        assert alpha_summary["top_level_symbols"][0]["name"] == "ProfileCard"
+
+
+def test_workspace_server_file_tools_keep_project_scope(tmp_path, ws_dir, monkeypatch):
+    alpha = _create_indexed_project(tmp_path, "alpha", [
+        {
+            "name": "ProfileCard",
+            "kind": "component",
+            "path": "client/src/components/ProfileCard.vue",
+            "signature": "<script setup>",
+            "content": "<template><div /></template>",
+        },
+    ])
+    beta = _create_indexed_project(tmp_path, "beta", [
+        {
+            "name": "ProfileCard",
+            "kind": "component",
+            "path": "client/src/components/ProfileCard.vue",
+            "signature": "<script setup>",
+            "content": "<template><aside /></template>",
+        },
+        {
+            "name": "NestedFile",
+            "kind": "class",
+            "path": "shared/src/domain/level/model.ts",
+            "signature": "class NestedFile",
+            "content": "export class NestedFile {}",
+        },
+    ])
+
+    for project_dir, label in ((alpha, "alpha"), (beta, "beta")):
+        project_db = Database(project_dir / ".srclight" / "index.db")
+        project_db.open()
+        try:
+            project_db.update_file_summary(
+                "client/src/components/ProfileCard.vue",
+                summary=f"{label.title()} profile card.",
+                metadata={"framework": "vue", "project_label": label},
+            )
+            project_db.commit()
+        finally:
+            project_db.close()
+
+    config = WorkspaceConfig(name="workspace-file-tools-server")
+    config.add_project("alpha", str(alpha))
+    config.add_project("beta", str(beta))
+
+    with WorkspaceDB(config) as wdb:
+        monkeypatch.setattr(server, "_is_workspace_mode", lambda: True)
+        monkeypatch.setattr(server, "_get_workspace_db", lambda: wdb)
+
+        payload = json.loads(server.list_files(
+            path_prefix="shared/src/domain",
+            project="beta",
+            recursive=True,
+            limit=50,
+        ))
+        assert payload["project"] == "beta"
+        assert payload["recursive"] is True
+        assert payload["files"][0]["path"].startswith("shared/src/domain/level")
+
+        summary = json.loads(server.get_file_summary(
+            "client/src/components/ProfileCard.vue",
+            project="alpha",
+        ))
+        assert summary["project"] == "alpha"
+        assert summary["file"] == "client/src/components/ProfileCard.vue"
+        assert summary["summary"] == "Alpha profile card."
+        assert summary["top_level_symbols"][0]["name"] == "ProfileCard"
+
+
 def test_workspace_db_codebase_map_orients_fullstack_backend_async_project(tmp_path, ws_dir):
     project_dir = _create_indexed_project(tmp_path, "fullstack", [
         {
