@@ -6,6 +6,7 @@ import json
 import pytest
 
 import srclight.server as server
+import srclight.task_context as task_context
 from srclight.db import Database, EdgeRecord, FileRecord, SymbolRecord
 from srclight.indexer import IndexConfig, Indexer
 from srclight.server import _extract_imports
@@ -1115,3 +1116,45 @@ def test_context_for_task_returns_compact_actionable_context(monkeypatch, db, tm
     assert payload["call_chain"]
     assert payload["next_steps"]
     assert payload["why_these_results"]
+
+
+def test_context_for_task_uses_hybrid_seed_fallback_for_natural_language(monkeypatch, db, tmp_path):
+    file_id = _insert_file(
+        db,
+        path="apps/backend/src/auth.service.ts",
+        language="typescript",
+        line_count=80,
+    )
+    _insert_symbol(
+        db,
+        file_id,
+        "refreshSession",
+        file_path="apps/backend/src/auth.service.ts",
+        kind="method",
+        start_line=15,
+        end_line=34,
+        qualified_name="AuthService.refreshSession",
+        signature="refreshSession(sessionToken: string)",
+        content="refreshSession() { return this.tokens.rotate(); }",
+    )
+    db.commit()
+
+    hybrid_calls: list[tuple[str, int]] = []
+
+    def _fake_hybrid_seed_candidates(db_obj, task, seed_limit):
+        hybrid_calls.append((task, seed_limit))
+        sym = db_obj.get_symbol_by_name("refreshSession")
+        return [(35, sym, "matched hybrid search")]
+
+    monkeypatch.setattr(db, "search_symbols", lambda *args, **kwargs: [])
+    monkeypatch.setattr(task_context, "_hybrid_seed_candidates", _fake_hybrid_seed_candidates)
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_repo_root", tmp_path)
+
+    payload = json.loads(server.context_for_task("fix the login bug", budget="small"))
+
+    assert hybrid_calls == [("fix the login bug", 4)]
+    assert payload["seeds"]
+    assert payload["seeds"][0]["qualified_name"] == "AuthService.refreshSession"
+    assert payload["seeds"][0]["reason"] == "matched hybrid search"

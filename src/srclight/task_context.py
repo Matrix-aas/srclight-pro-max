@@ -41,6 +41,7 @@ _BUDGETS: dict[str, dict[str, int]] = {
 }
 
 _TYPE_KINDS = {"interface", "type_alias", "class", "struct", "enum"}
+_HYBRID_MIN_SIMILARITY = 0.3
 
 
 def _task_tokens(task: str) -> list[str]:
@@ -90,6 +91,61 @@ def _symbol_brief(sym: SymbolRecord) -> dict[str, Any]:
         "signature": sym.signature,
         "doc_comment": sym.doc_comment,
     }
+
+
+def _hybrid_seed_candidates(
+    db: Database,
+    task: str,
+    seed_limit: int,
+) -> list[tuple[int, SymbolRecord, str]]:
+    """Return ordered seed candidates using the same idea as hybrid_search()."""
+    from .embeddings import get_provider, rrf_merge, vector_to_bytes
+
+    keyword_results = db.search_symbols(task, limit=seed_limit * 3)
+    merged_results = keyword_results
+
+    emb_stats = db.embedding_stats()
+    if emb_stats.get("model") and emb_stats.get("dimensions"):
+        try:
+            provider = get_provider(str(emb_stats["model"]))
+            query_bytes = vector_to_bytes(provider.embed_one(task))
+            semantic_results = db.vector_search(
+                query_bytes,
+                int(emb_stats["dimensions"]),
+                limit=seed_limit * 3,
+            )
+            semantic_results = [
+                result
+                for result in semantic_results
+                if (result.get("similarity") or 0) >= _HYBRID_MIN_SIMILARITY
+            ]
+            if semantic_results:
+                merged_results = rrf_merge(keyword_results, semantic_results)
+        except Exception:
+            pass
+
+    candidates: list[tuple[int, SymbolRecord, str]] = []
+    seen: set[int] = set()
+    for index, result in enumerate(merged_results[: seed_limit * 3]):
+        symbol_id = result.get("symbol_id")
+        if not isinstance(symbol_id, int) or symbol_id in seen:
+            continue
+        symbol = db.get_symbol_by_id(symbol_id)
+        if symbol is None:
+            continue
+        seen.add(symbol_id)
+
+        sources = {str(source) for source in result.get("sources", []) if source}
+        if "fts" in sources and "embedding" in sources:
+            reason = "matched hybrid search"
+        elif "embedding" in sources or result.get("similarity") is not None:
+            reason = "matched semantic search"
+        else:
+            reason = "matched keyword search"
+
+        score = max(seed_limit * 10 - index, 1)
+        candidates.append((score, symbol, reason))
+    return candidates
 
 
 def _edge_brief(entry: dict[str, Any], direction: str) -> dict[str, Any]:
@@ -170,15 +226,12 @@ def _seed_symbols(
                 scored[sym.id] = (score, sym, f"matched identifier '{candidate}'")
 
     if not scored:
-        for result in db.search_symbols(task, limit=seed_limit * 3):
-            symbol_id = result.get("symbol_id")
-            if symbol_id is None:
+        for score, sym, reason in _hybrid_seed_candidates(db, task, seed_limit):
+            if sym.id is None:
                 continue
-            for sym in db.get_symbols_by_name(str(result.get("name") or ""), limit=seed_limit * 4):
-                if sym.id != symbol_id:
-                    continue
-                scored[sym.id] = (25, sym, "matched keyword search")
-                break
+            existing = scored.get(sym.id)
+            if existing is None or score > existing[0]:
+                scored[sym.id] = (score, sym, reason)
 
     ranked = sorted(
         scored.values(),
