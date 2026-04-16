@@ -5140,7 +5140,16 @@ class Indexer:
         }
 
         # Only create edges TO meaningful symbol kinds (not prototypes/namespaces)
-        EDGE_TARGET_KINDS = {"function", "method", "class", "struct", "enum", "interface", "template"}
+        EDGE_TARGET_KINDS = {
+            "function",
+            "method",
+            "class",
+            "struct",
+            "enum",
+            "interface",
+            "type_alias",
+            "template",
+        }
 
         filtered_names = {
             name: syms for name, syms in name_to_symbols.items()
@@ -5196,7 +5205,7 @@ class Indexer:
         MAX_REFS_PER_SYMBOL = 30
 
         content_rows = self.db.conn.execute(
-            f"""SELECT s.id, s.name, s.content FROM symbols s
+            f"""SELECT s.id, s.name, s.content, f.language FROM symbols s
                JOIN files f ON s.file_id = f.id
                WHERE s.name IS NOT NULL AND f.language NOT IN ({placeholders})""",
             list(excluded),
@@ -5206,6 +5215,7 @@ class Indexer:
             source_id = row["id"]
             source_name = row["name"]
             content = row["content"]
+            source_lang = str(row["language"] or "")
             source_info = symbol_info.get(source_id)
             if not source_info:
                 continue
@@ -5229,10 +5239,14 @@ class Indexer:
                     # Skip very low confidence edges
                     if confidence < 0.2:
                         continue
+                    edge_type = "uses_type" if (
+                        source_lang in {"typescript", "tsx", "vue"}
+                        and target["kind"] in {"interface", "type_alias"}
+                    ) else "calls"
                     self.db.insert_edge(EdgeRecord(
                         source_id=source_id,
                         target_id=target["id"],
-                        edge_type="calls",
+                        edge_type=edge_type,
                         confidence=confidence,
                     ))
                     edge_count += 1

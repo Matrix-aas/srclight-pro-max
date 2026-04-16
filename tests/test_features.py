@@ -751,6 +751,33 @@ class Worker:
     return src
 
 
+@pytest.fixture
+def typescript_type_refs_project(tmp_path):
+    """Project where TS annotations reference interfaces and type aliases."""
+    src = tmp_path / "ts-type-refs"
+    src.mkdir()
+
+    (src / "types.ts").write_text('''\
+export interface Props {
+  msg: string;
+}
+
+export type Payload = {
+  id: string;
+};
+''')
+
+    (src / "consumer.ts").write_text('''\
+import type { Payload, Props } from "./types";
+
+export function render(props: Props): Payload {
+  return { id: props.msg };
+}
+''')
+
+    return src
+
+
 class TestEdges:
     def test_edges_populated(self, db, python_with_calls):
         """Indexing creates call graph edges."""
@@ -781,6 +808,54 @@ class TestEdges:
         callees = db.get_callees(process.id)
         callee_names = [c["symbol"].name for c in callees]
         assert "helper" in callee_names
+
+    def test_type_references_use_distinct_edge_type(self, db, typescript_type_refs_project):
+        """TS annotations should produce uses_type edges for interface/type alias targets."""
+        indexer = Indexer(db, IndexConfig(root=typescript_type_refs_project))
+        indexer.index(typescript_type_refs_project)
+
+        props = db.get_symbol_by_name("Props")
+        payload = db.get_symbol_by_name("Payload")
+        consumer = db.get_symbol_by_name("render")
+
+        assert props is not None
+        assert payload is not None
+        assert consumer is not None
+
+        caller_names = [item["symbol"].name for item in db.get_callers(props.id)]
+        assert "render" in caller_names
+
+        props_callers = db.get_callers(props.id)
+        assert any(item["edge_type"] == "uses_type" for item in props_callers)
+        assert all(item["edge_type"] != "calls" for item in props_callers if item["symbol"].name == "render")
+
+        callee_types = {
+            item["symbol"].name: item["edge_type"]
+            for item in db.get_callees(consumer.id)
+            if item["symbol"].name in {"Props", "Payload"}
+        }
+        assert callee_types["Props"] == "uses_type"
+        assert callee_types["Payload"] == "uses_type"
+
+    def test_server_dedup_keeps_same_symbol_with_multiple_edge_types(self):
+        """Server dedup should not collapse different edge types for one symbol name."""
+        symbol = SymbolRecord(
+            file_id=1,
+            kind="interface",
+            name="Props",
+            qualified_name="Props",
+            start_line=1,
+            end_line=1,
+            content="",
+            line_count=1,
+        )
+        edges = [
+            {"symbol": symbol, "edge_type": "calls", "confidence": 0.8},
+            {"symbol": symbol, "edge_type": "uses_type", "confidence": 0.9},
+        ]
+
+        deduped = server._dedup_edges(edges)
+        assert {edge["edge_type"] for edge in deduped} == {"calls", "uses_type"}
 
 
 # --- 3. C++ template name extraction ---

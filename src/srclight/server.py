@@ -1916,31 +1916,33 @@ def get_file_summary(path: str, project: str | None = None) -> str:
 
 
 def _dedup_edges(edges: list[dict]) -> list[dict]:
-    """Deduplicate edges by symbol name, keeping the highest-confidence entry."""
-    by_name: dict[str, dict] = {}
+    """Deduplicate edges by symbol name and edge type."""
+    by_key: dict[tuple[str, str], dict] = {}
     for c in edges:
         s = c["symbol"]
         name = s.name
+        edge_type = c["edge_type"]
         confidence = c["confidence"]
         entry = {
             "name": name,
             "kind": s.kind,
             "file": s.file_path,
             "line": s.start_line,
-            "edge_type": c["edge_type"],
+            "edge_type": edge_type,
             "confidence": confidence,
         }
-        if name not in by_name:
-            by_name[name] = entry
-            by_name[name]["_locations"] = [(s.file_path, s.start_line)]
+        key = (name, edge_type)
+        if key not in by_key:
+            by_key[key] = entry
+            by_key[key]["_locations"] = [(s.file_path, s.start_line)]
         else:
-            by_name[name]["_locations"].append((s.file_path, s.start_line))
-            if confidence > by_name[name]["confidence"]:
-                by_name[name].update(entry)
-                by_name[name]["_locations"] = by_name[name]["_locations"]
+            by_key[key]["_locations"].append((s.file_path, s.start_line))
+            if confidence > by_key[key]["confidence"]:
+                by_key[key].update(entry)
+                by_key[key]["_locations"] = by_key[key]["_locations"]
 
     result = []
-    for entry in by_name.values():
+    for entry in by_key.values():
         locations = entry.pop("_locations")
         if len(locations) > 1:
             entry["locations"] = [{"file": file_path, "line": line} for file_path, line in locations]
