@@ -1361,6 +1361,32 @@ def _community_fallback_payload(
     project: str | None = None,
 ) -> dict[str, object]:
     """Build a miss payload that escalates from nearest symbol to file candidates."""
+    file_candidates = db.suggest_file_candidates(symbol_name, limit=5)
+    raw_query = symbol_name.strip().lower()
+
+    def _is_exact_query_filename(candidate: dict[str, object]) -> bool:
+        candidate_path = Path(str(candidate.get("path") or ""))
+        return candidate_path.stem.lower() == raw_query or candidate_path.name.lower() == raw_query
+
+    def _file_candidate_payload(candidates: list[dict[str, object]]) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "symbol": symbol_name,
+            "community": None,
+        }
+        if project is not None:
+            payload["project"] = project
+            candidates = [{**candidate, "project": project} for candidate in candidates]
+        payload["fallback_stage"] = "file_candidate"
+        payload["file_candidates"] = candidates
+        payload["next_step"] = {
+            "tool": "symbols_in_file",
+            "call": _tool_call("symbols_in_file", str(candidates[0]["path"]), project=project),
+        }
+        return payload
+
+    if file_candidates and _is_exact_query_filename(file_candidates[0]):
+        return _file_candidate_payload(file_candidates)
+
     nearest_matches = db.suggest_symbol_name_matches(symbol_name, limit=1)
     if nearest_matches:
         nearest_name = nearest_matches[0]["name"]
@@ -1399,25 +1425,15 @@ def _community_fallback_payload(
                 payload["project"] = project
             return payload
 
-    file_candidates = db.suggest_file_candidates(symbol_name, limit=5)
+    if file_candidates:
+        return _file_candidate_payload(file_candidates)
+
     payload: dict[str, object] = {
         "symbol": symbol_name,
         "community": None,
     }
     if project is not None:
         payload["project"] = project
-
-    if file_candidates:
-        if project is not None:
-            file_candidates = [{**candidate, "project": project} for candidate in file_candidates]
-        payload["fallback_stage"] = "file_candidate"
-        payload["file_candidates"] = file_candidates
-        payload["next_step"] = {
-            "tool": "symbols_in_file",
-            "call": _tool_call("symbols_in_file", str(file_candidates[0]["path"]), project=project),
-        }
-        return payload
-
     payload["fallback_stage"] = "suggested_tool"
     payload["next_step"] = {
         "tool": "hybrid_search",
