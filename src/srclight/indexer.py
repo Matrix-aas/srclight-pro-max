@@ -6080,7 +6080,11 @@ class Indexer:
         for symbol_id, emb_bytes in results:
             # Find body_hash from the symbols list
             sym = next((s for s in symbols if s["id"] == symbol_id), None)
-            body_hash = sym["body_hash"] if sym else None
+            body_hash = (
+                sym.get("embedding_body_hash")
+                if sym is not None
+                else None
+            ) or (sym["body_hash"] if sym else None)
             self.db.upsert_embedding(symbol_id, provider.name, dims, emb_bytes, body_hash)
 
         self.db.commit()

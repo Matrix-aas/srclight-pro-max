@@ -158,6 +158,18 @@ def prepare_embedding_text(symbol: dict) -> str:
         # Truncate to ~2000 chars (~500 tokens) to stay within limits
         parts.append(content[:2000])
 
+    metadata = symbol.get("metadata") or {}
+
+    def _list_values(value: object) -> list[str] | None:
+        if not isinstance(value, list):
+            return None
+        return [str(item) for item in value]
+
+    def _lists_match(left: object, right: object) -> bool:
+        left_values = _list_values(left)
+        right_values = _list_values(right)
+        return left_values == right_values
+
     file_summary = symbol.get("file_summary") or ""
     if file_summary:
         parts.append(f"file summary: {str(file_summary).strip()}")
@@ -167,11 +179,12 @@ def prepare_embedding_text(symbol: dict) -> str:
         file_metadata_parts = []
         file_framework = file_summary_metadata.get("framework")
         file_resource = file_summary_metadata.get("resource")
-        if file_framework or file_resource:
-            file_metadata_parts.append(
-                "file summary metadata: "
-                + " ".join(part for part in (file_framework, file_resource) if part)
-            )
+        symbol_framework = metadata.get("framework")
+        symbol_resource = metadata.get("resource")
+        emit_file_metadata_prefix = (
+            file_framework != symbol_framework or file_resource != symbol_resource
+        )
+        list_metadata_parts = []
         for key, label in (
             ("props", "props"),
             ("emits", "emits"),
@@ -185,12 +198,17 @@ def prepare_embedding_text(symbol: dict) -> str:
             ("mikroorm_feature_entities", "mikroorm feature entities"),
         ):
             values = file_summary_metadata.get(key)
-            if isinstance(values, list) and values:
-                file_metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+            if isinstance(values, list) and values and not _lists_match(metadata.get(key), values):
+                list_metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+        if emit_file_metadata_prefix and (file_framework or file_resource):
+            file_metadata_parts.append(
+                "file summary metadata: "
+                + " ".join(part for part in (file_framework, file_resource) if part)
+            )
+        file_metadata_parts.extend(list_metadata_parts)
         if file_metadata_parts:
             parts.append("\n".join(file_metadata_parts))
 
-    metadata = symbol.get("metadata") or {}
     if isinstance(metadata, dict):
         metadata_parts = []
         symbol_name = symbol.get("name") or ""
@@ -223,6 +241,11 @@ def prepare_embedding_text(symbol: dict) -> str:
                 values = metadata.get(key)
                 if isinstance(values, list) and values:
                     metadata_parts.append(f"{label}: " + ", ".join(str(value) for value in values))
+
+        if resource == "service" and symbol_name:
+            config_refs = metadata.get("config_refs")
+            if isinstance(config_refs, list) and config_refs:
+                metadata_parts.append("config refs: " + ", ".join(str(value) for value in config_refs))
 
         if framework == "vue" and resource == "component":
             for key, label in (

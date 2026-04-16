@@ -249,6 +249,22 @@ def _escape_like_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _embedding_freshness_hash(symbol: dict[str, Any]) -> str:
+    """Hash the embedding inputs that should invalidate a stored vector."""
+    file_summary = symbol.get("file_summary")
+    file_summary_metadata = symbol.get("file_summary_metadata")
+    if not file_summary and not file_summary_metadata:
+        return str(symbol.get("body_hash") or "")
+
+    payload = {
+        "body_hash": symbol.get("body_hash"),
+        "file_summary": file_summary,
+        "file_summary_metadata": file_summary_metadata,
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
 _UNSET = object()
 
 SCHEMA_VERSION = 6
@@ -2060,15 +2076,24 @@ class Database:
         """Get symbols that need embeddings (no embedding or body_hash changed)."""
         assert self.conn is not None
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path, f.summary as file_summary, f.metadata as file_summary_metadata
+            """SELECT s.*, f.path as file_path, f.summary as file_summary,
+                      f.metadata as file_summary_metadata, e.body_hash as embedded_body_hash
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?
-               WHERE e.symbol_id IS NULL OR e.body_hash != s.body_hash
-               LIMIT ?""",
-            (model, limit),
-        ).fetchall()
-        return [asdict(self._row_to_symbol(row)) for row in rows]
+               ORDER BY s.id""",
+            (model,),
+        )
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            symbol = asdict(self._row_to_symbol(row))
+            freshness_hash = _embedding_freshness_hash(symbol)
+            if row["embedded_body_hash"] is None or row["embedded_body_hash"] != freshness_hash:
+                symbol["embedding_body_hash"] = freshness_hash
+                results.append(symbol)
+                if len(results) >= limit:
+                    break
+        return results
 
     def vector_search(self, query_embedding: bytes, dimensions: int,
                       limit: int = 10, kind: str | None = None,

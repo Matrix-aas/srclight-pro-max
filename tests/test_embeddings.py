@@ -290,6 +290,16 @@ def test_prepare_embedding_text_serializes_graphql_and_nest_mikroorm_extras():
             "mikroorm_feature_entities": ["User"],
         },
     }
+    service = {
+        "name": "AuthService",
+        "qualified_name": "AuthService",
+        "signature": "Nest service AuthService",
+        "metadata": {
+            "framework": "nestjs",
+            "resource": "service",
+            "config_refs": ["PaymentConfig"],
+        },
+    }
     bootstrap = {
         "name": "bootstrap",
         "qualified_name": "bootstrap",
@@ -314,7 +324,7 @@ def test_prepare_embedding_text_serializes_graphql_and_nest_mikroorm_extras():
     }
 
     text = "\n".join(
-        prepare_embedding_text(sym) for sym in (resolver, module, bootstrap, mikro_schema)
+        prepare_embedding_text(sym) for sym in (resolver, module, service, bootstrap, mikro_schema)
     )
 
     assert "graphql field: viewer" in text
@@ -324,6 +334,8 @@ def test_prepare_embedding_text_serializes_graphql_and_nest_mikroorm_extras():
     assert "mikroorm feature entities: User" in text
     assert "root module: AppModule" in text
     assert "schema: UserSchema" in text
+    assert "Nest service AuthService" in text
+    assert "config refs: PaymentConfig" in text
 
 
 def test_prepare_embedding_text_persistence_aggregate_metadata():
@@ -1328,3 +1340,95 @@ def test_db_symbols_needing_embeddings_include_file_summary_context(tmp_path):
         "props": ["msg"],
         "css_modules": ["card"],
     }
+
+
+def test_db_symbols_needing_embeddings_refresh_on_file_summary_change(tmp_path):
+    """A file-summary-only change should make existing embeddings stale."""
+    from srclight.db import Database, FileRecord, SymbolRecord
+
+    db_path = tmp_path / "test.db"
+    db = Database(db_path)
+    db.open()
+    db.initialize()
+
+    file_id = db.upsert_file(FileRecord(
+        path="client/src/components/ProfileCard.vue",
+        content_hash="hash-1",
+        mtime=1.0,
+        language="vue",
+        size=100,
+        line_count=20,
+        summary="Vue shell around auth and GraphQL flow.",
+        metadata={
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "css_modules": ["card"],
+        },
+    ))
+
+    sym_id = db.insert_symbol(SymbolRecord(
+        file_id=file_id,
+        kind="component",
+        name="ProfileCard",
+        start_line=1,
+        end_line=5,
+        content="<template />",
+        body_hash="v1",
+    ), "client/src/components/ProfileCard.vue")
+    db.commit()
+
+    initial = db.get_symbols_needing_embeddings("mock:test-model")
+    assert len(initial) == 1
+    freshness_hash = initial[0]["embedding_body_hash"]
+    assert freshness_hash
+
+    db.upsert_embedding(sym_id, "mock:test-model", 4, vector_to_bytes([0.0, 1.0, 0.0, 0.0]), freshness_hash)
+    db.commit()
+
+    db.update_file_summary(
+        "client/src/components/ProfileCard.vue",
+        summary="Vue shell around updated auth and GraphQL flow.",
+        metadata={
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "css_modules": ["card"],
+        },
+    )
+
+    stale = db.get_symbols_needing_embeddings("mock:test-model")
+
+    assert len(stale) == 1
+    assert stale[0]["id"] == sym_id
+    assert stale[0]["embedding_body_hash"] != freshness_hash
+    db.close()
+
+
+def test_prepare_embedding_text_avoids_duplicate_file_summary_metadata_when_symbol_already_has_it():
+    sym = {
+        "name": "NormalizedSignals",
+        "qualified_name": "NormalizedSignals",
+        "signature": "component NormalizedSignals",
+        "file_summary": "Vue shell around auth and GraphQL flow.",
+        "file_summary_metadata": {
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "graphql_ops_used": ["mutation SaveCart", "query GetCatalog"],
+            "css_modules": ["card"],
+        },
+        "metadata": {
+            "framework": "vue",
+            "resource": "component",
+            "props": ["msg"],
+            "graphql_ops_used": ["mutation SaveCart", "query GetCatalog"],
+            "css_modules": ["card"],
+        },
+    }
+
+    text = prepare_embedding_text(sym)
+
+    assert "file summary: Vue shell around auth and GraphQL flow." in text
+    assert "file summary metadata:" not in text
+    assert text.count("props: msg") == 1
