@@ -931,6 +931,25 @@ const text = "defineProps<{ fake: true }>() defineEmits(['oops'])"
 </style>
 ''')
 
+    (src / "MacroEdgeCases.vue").write_text('''\
+<template><div /></template>
+
+<script setup lang="ts">
+const props = defineProps<{
+  cb: (x: Foo<Bar>) => Baz
+  'data-id': string
+  other: string
+}>()
+
+const emit = defineEmits({
+  save: null,
+  cancel: payload => true,
+})
+
+const text = "defineProps<{ fake: true }>() defineEmits({ nope: null })"
+</script>
+''')
+
     (src / "DocCommentCleanup.vue").write_text('''\
 <template><div /></template>
 
@@ -1000,8 +1019,8 @@ def test_index_vue_script_setup_ts_offsets_lines(db, vue_project):
     indexer = Indexer(db, config)
     stats = indexer.index(vue_project)
 
-    assert stats.files_scanned == 24
-    assert stats.files_indexed == 24
+    assert stats.files_scanned == 25
+    assert stats.files_indexed == 25
     assert stats.symbols_extracted > 0
     assert stats.errors == 0
 
@@ -1369,6 +1388,20 @@ def test_index_vue_style_only_css_module_uses_stylesheet_classes(db, vue_project
 
     assert component.metadata is not None
     assert component.metadata["css_modules"] == ["badge", "card"]
+
+
+def test_index_vue_macro_edge_cases_preserve_nested_generics_and_object_emits(db, vue_project):
+    """Vue macro extraction should survive nested generics, quoted prop keys, and object emits."""
+    config = IndexConfig(root=vue_project)
+    indexer = Indexer(db, config)
+    indexer.index(vue_project)
+
+    syms = db.symbols_in_file("MacroEdgeCases.vue")
+    component = next(s for s in syms if s.kind == "component")
+
+    assert component.metadata is not None
+    assert component.metadata["props"] == ["cb", "data-id", "other"]
+    assert component.metadata["emits"] == ["cancel", "save"]
 
 
 def test_index_vue_reindex_clears_stale_file_summary_when_signals_disappear(db, tmp_path):

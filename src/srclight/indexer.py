@@ -3615,7 +3615,7 @@ def _extract_vue_macro_keys(text: str, macro_name: str) -> list[str]:
 
         opener = masked[cursor]
         if opener == "<":
-            body = _extract_balanced_inner_text(text, cursor, "<", ">")
+            body = _extract_vue_generic_body(text, cursor)
             if not body:
                 continue
             keys.extend(_extract_top_level_vue_keys(body))
@@ -3625,11 +3625,12 @@ def _extract_vue_macro_keys(text: str, macro_name: str) -> list[str]:
             body = _extract_balanced_inner_text(text, cursor, "(", ")")
             if not body:
                 continue
-            keys.extend(
-                value
-                for value in re.findall(r"['\"]([^'\"]+)['\"]", body)
-                if value
-            )
+            if macro_name == "defineEmits":
+                stripped = body.lstrip()
+                if stripped.startswith("["):
+                    keys.extend(value for value in re.findall(r"['\"]([^'\"]+)['\"]", body) if value)
+                elif stripped.startswith("{"):
+                    keys.extend(_extract_top_level_vue_keys(body))
 
     return _unique_sorted(keys)
 
@@ -3826,45 +3827,265 @@ def _extract_balanced_inner_text(text: str, open_index: int, open_char: str, clo
     return None
 
 
-def _extract_top_level_vue_keys(body: str) -> list[str]:
-    """Extract top-level keys from a Vue type/object body."""
-    keys: list[str] = []
-    masked = _mask_js_strings_and_comments(body)
-    depth = 0
-    i = 0
+def _extract_vue_generic_body(text: str, open_index: int) -> str | None:
+    """Return the body inside a Vue generic wrapper, tolerating nested generics and arrows."""
+    if open_index >= len(text) or text[open_index] != "<":
+        return None
 
-    while i < len(masked):
-        ch = masked[i]
-        if ch == "{":
-            depth += 1
+    i = open_index + 1
+    start = i
+    angle_depth = 1
+    in_single = False
+    in_double = False
+    in_template = False
+    in_line_comment = False
+    in_block_comment = False
+    escaped = False
+
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
             i += 1
             continue
-        if ch == "}":
-            depth = max(0, depth - 1)
-            i += 1
-            continue
 
-        if depth == 1 and (ch.isalpha() or ch == "_"):
-            start = i
-            while i < len(masked) and (masked[i].isalnum() or masked[i] in {"_", "-"}):
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
                 i += 1
-            key = masked[start:i]
-            j = i
-            while j < len(masked) and masked[j].isspace():
-                j += 1
-            if j < len(masked) and masked[j] in {"?", ":"}:
-                if masked[j] == "?":
-                    j += 1
-                    while j < len(masked) and masked[j].isspace():
-                        j += 1
-                if j < len(masked) and masked[j] == ":":
-                    if key not in {"type", "readonly"}:
-                        keys.append(key)
             continue
+
+        if in_single or in_double or in_template:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif in_single and ch == "'":
+                in_single = False
+            elif in_double and ch == '"':
+                in_double = False
+            elif in_template and ch == "`":
+                in_template = False
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "`":
+            in_template = True
+            i += 1
+            continue
+
+        if ch == "<":
+            angle_depth += 1
+        elif ch == ">":
+            if _previous_non_space_char(text, i) == "=":
+                i += 1
+                continue
+            angle_depth -= 1
+            if angle_depth == 0:
+                return text[start:i]
 
         i += 1
 
+    return None
+
+
+def _previous_non_space_char(text: str, index: int) -> str:
+    i = index - 1
+    while i >= 0 and text[i].isspace():
+        i -= 1
+    return text[i] if i >= 0 else ""
+
+
+def _extract_top_level_vue_keys(body: str) -> list[str]:
+    """Extract top-level keys from a Vue type/object body."""
+    keys: list[str] = []
+    i = 0
+    brace_depth = 0
+    paren_depth = 0
+    bracket_depth = 0
+    angle_depth = 0
+    segment_start = 0
+    in_single = False
+    in_double = False
+    in_template = False
+    in_line_comment = False
+    in_block_comment = False
+    escaped = False
+
+    def flush_segment(end_index: int) -> None:
+        segment = body[segment_start:end_index].strip()
+        key = _extract_vue_property_key(segment)
+        if key is not None:
+            keys.append(key)
+
+    while i < len(body):
+        ch = body[i]
+        nxt = body[i + 1] if i + 1 < len(body) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if in_single or in_double or in_template:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif in_single and ch == "'":
+                in_single = False
+            elif in_double and ch == '"':
+                in_double = False
+            elif in_template and ch == "`":
+                in_template = False
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "`":
+            in_template = True
+            i += 1
+            continue
+
+        if ch == "{":
+            brace_depth += 1
+            if brace_depth == 1:
+                segment_start = i + 1
+            i += 1
+            continue
+        if ch == "}":
+            if brace_depth == 1 and paren_depth == 0 and bracket_depth == 0 and angle_depth == 0:
+                flush_segment(i)
+            brace_depth = max(0, brace_depth - 1)
+            if brace_depth == 0:
+                segment_start = i + 1
+            i += 1
+            continue
+        if ch == "(":
+            paren_depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            paren_depth = max(0, paren_depth - 1)
+            i += 1
+            continue
+        if ch == "[":
+            bracket_depth += 1
+            i += 1
+            continue
+        if ch == "]":
+            bracket_depth = max(0, bracket_depth - 1)
+            i += 1
+            continue
+        if ch == "<":
+            angle_depth += 1
+            i += 1
+            continue
+        if ch == ">":
+            angle_depth = max(0, angle_depth - 1)
+            i += 1
+            continue
+
+        if brace_depth == 1 and paren_depth == 0 and bracket_depth == 0 and angle_depth == 0:
+            if ch in {",", ";", "\n"}:
+                flush_segment(i)
+                segment_start = i + 1
+
+        i += 1
+
+    if brace_depth >= 1:
+        flush_segment(len(body))
+
     return _unique_sorted(keys)
+
+
+def _extract_vue_property_key(segment: str) -> str | None:
+    """Extract a top-level Vue prop/emit key from a single object/type segment."""
+    if not segment:
+        return None
+
+    text = segment.lstrip()
+    if text.startswith("{"):
+        text = text[1:].lstrip()
+    if not text:
+        return None
+    if text.startswith("readonly "):
+        text = text[len("readonly "):].lstrip()
+    if text.startswith("type "):
+        text = text[len("type "):].lstrip()
+
+    if text[0] in {"'", '"'}:
+        quote = text[0]
+        end = 1
+        escaped = False
+        while end < len(text):
+            ch = text[end]
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                break
+            end += 1
+        key = text[1:end]
+        rest = text[end + 1 :].lstrip()
+        if rest.startswith("?"):
+            rest = rest[1:].lstrip()
+        if rest.startswith(":") and key and key not in {"type", "readonly"}:
+            return key
+        return None
+
+    match = re.match(r"([A-Za-z_][\w-]*)\s*(\?)?\s*:", text)
+    if match:
+        key = match.group(1)
+        if key not in {"type", "readonly"}:
+            return key
+    return None
 
 
 def _build_vue_component_summary(
