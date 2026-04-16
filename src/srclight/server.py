@@ -1155,7 +1155,7 @@ def _shape_search_result(result: dict[str, object]) -> dict[str, object]:
     shaped = {
         key: value
         for key, value in result.items()
-        if key not in {"source", "sources", "rrf_score"}
+        if key != "rrf_score"
     }
     shaped["rank_source"] = _rank_source(result)
     reasons = _match_reasons(result)
@@ -1215,7 +1215,6 @@ def _community_fallback_payload(
     project: str | None = None,
 ) -> dict[str, object]:
     """Build a miss payload that escalates from nearest symbol to file candidates."""
-    nearest_symbol = None
     nearest_matches = db.suggest_symbol_name_matches(symbol_name, limit=1)
     if nearest_matches:
         nearest_name = nearest_matches[0]["name"]
@@ -1240,6 +1239,19 @@ def _community_fallback_payload(
                     "call": _tool_call("get_symbol", nearest_sym.name, project=project),
                 }
                 return payload
+            payload = {
+                "symbol": symbol_name,
+                "community": None,
+                "fallback_stage": "nearest_symbol",
+                "nearest_symbol": nearest_symbol,
+                "next_step": {
+                    "tool": "get_symbol",
+                    "call": _tool_call("get_symbol", nearest_sym.name, project=project),
+                },
+            }
+            if project is not None:
+                payload["project"] = project
+            return payload
 
     file_candidates = db.suggest_file_candidates(symbol_name, limit=5)
     payload: dict[str, object] = {
@@ -1248,8 +1260,6 @@ def _community_fallback_payload(
     }
     if project is not None:
         payload["project"] = project
-    if nearest_symbol is not None:
-        payload["nearest_symbol"] = nearest_symbol
 
     if file_candidates:
         if project is not None:

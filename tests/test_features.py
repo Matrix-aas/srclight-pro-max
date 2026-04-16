@@ -499,6 +499,7 @@ class TestSearchRanking:
         assert payload["results"]
         assert payload["results"][0]["kind"] == "microservice_handler"
         assert "rrf_score" not in payload["results"][0]
+        assert payload["results"][0]["sources"] == ["fts", "embedding"]
         assert payload["results"][0]["rank_source"] in {"keyword", "semantic", "hybrid"}
         assert payload["results"][0]["match_reasons"]
 
@@ -559,6 +560,29 @@ def test_fallback_hint_suggests_tokenized_identifier_search(monkeypatch, db):
         'Try search_symbols("auth routes") for tokenized identifier search'
         in payload["suggestions"]
     )
+
+
+def test_search_symbols_preserves_source_while_adding_rank_hints(monkeypatch, db):
+    _insert_search_symbol(
+        db,
+        path="server/src/services/auth-routes-service.ts",
+        kind="class",
+        name="AuthRoutesService",
+        signature="class AuthRoutesService",
+        content="auth routes service helpers",
+        doc_comment="Service object for auth routes coordination.",
+    )
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.search_symbols("auth routes"))
+
+    assert payload
+    assert payload[0]["source"] in {"name", "name_like", "tokenized_like", "metadata_like", "content", "docs"}
+    assert payload[0]["rank_source"] == "keyword"
+    assert payload[0]["match_reasons"]
 
 
 def test_get_communities_summary_first_by_default(monkeypatch, db):
@@ -651,6 +675,57 @@ def test_get_community_missing_symbol_returns_file_level_fallback(monkeypatch, d
     assert payload["file_candidates"]
     assert payload["file_candidates"][0]["path"] == "src/ui/LayoutEngine.ts"
     assert payload["next_step"]["tool"] == "symbols_in_file"
+
+
+def test_get_community_missing_symbol_prefers_nearest_symbol_stage(monkeypatch, db):
+    _insert_search_symbol(
+        db,
+        path="src/ui/layout-engine.ts",
+        kind="class",
+        name="LayoutEngineService",
+        signature="class LayoutEngineService",
+        content="layout engine service helpers",
+        doc_comment="Coordinates layout engine helpers.",
+    )
+    db.commit()
+
+    monkeypatch.setattr(server, "_is_workspace_mode", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    payload = json.loads(server.get_community("LayoutEngine"))
+
+    assert payload["community"] is None
+    assert payload["fallback_stage"] == "nearest_symbol"
+    assert payload["nearest_symbol"]["name"] == "LayoutEngineService"
+    assert payload["next_step"]["tool"] == "get_symbol"
+    assert 'get_symbol("LayoutEngineService")' == payload["next_step"]["call"]
+
+
+def test_suggest_file_candidates_prefers_exact_filename_before_limit(db):
+    for index in range(30):
+        _insert_search_symbol(
+            db,
+            path=f"src/layout/LayoutEngineHelper{index}.ts",
+            kind="function",
+            name=f"helper{index}",
+            signature=f"function helper{index}()",
+            content="layout engine helper utilities",
+        )
+    _insert_search_symbol(
+        db,
+        path="src/ui/LayoutEngine.ts",
+        kind="function",
+        name="measureNode",
+        signature="function measureNode()",
+        content="measure layout engine nodes",
+    )
+    db.commit()
+
+    candidates = db.suggest_file_candidates("LayoutEngine", limit=1)
+
+    assert candidates
+    assert candidates[0]["path"] == "src/ui/LayoutEngine.ts"
+    assert candidates[0]["match_reason"] == "exact filename match"
 
 
 # --- 2. Call graph edges ---

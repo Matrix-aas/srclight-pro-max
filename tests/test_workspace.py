@@ -1079,6 +1079,7 @@ def test_workspace_hybrid_search_hides_rrf_score_and_exposes_rank_hints(
 
     assert payload["results"]
     assert "rrf_score" not in payload["results"][0]
+    assert payload["results"][0]["source"] in {"name", "name_like", "tokenized_like", "metadata_like", "content", "docs"}
     assert payload["results"][0]["rank_source"] in {"keyword", "semantic", "hybrid"}
     assert payload["results"][0]["match_reasons"]
 

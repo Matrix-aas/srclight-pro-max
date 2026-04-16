@@ -904,6 +904,12 @@ class Database:
         if not compact_query and not normalized_query and not query_tokens:
             return []
 
+        exact_filename_patterns: list[str] = []
+        for text in dict.fromkeys(filter(None, [raw_query, tokenized_query_hint(raw_query)])):
+            filename = "".join(re.findall(r"[A-Za-z0-9]+", text))
+            if filename:
+                exact_filename_patterns.extend([f"%/{filename}.%", f"{filename}.%"])
+
         compact_expr = (
             "lower(replace(replace(replace(replace(replace(f.path, '/', ''), '_', ''), '-', ''), '.', ''), ' ', ''))"
         )
@@ -922,8 +928,22 @@ class Database:
                 JOIN symbols s ON s.file_id = f.id
                 WHERE {" OR ".join(clauses)}
                 GROUP BY f.id, f.path
+                ORDER BY
+                    CASE
+                        WHEN {" OR ".join("f.path LIKE ? COLLATE NOCASE" for _ in exact_filename_patterns) if exact_filename_patterns else "0"} THEN 0
+                        WHEN {compact_expr} LIKE ? THEN 1
+                        ELSE 2
+                    END,
+                    length(f.path),
+                    f.path,
+                    symbol_count DESC
                 LIMIT ?""",
-            [*params, max(limit * 8, 24)],
+            [
+                *params,
+                *exact_filename_patterns,
+                f"%{compact_query}%" if compact_query else "%",
+                max(limit * 8, 24),
+            ],
         ).fetchall()
 
         candidates: list[dict[str, Any]] = []
