@@ -40,7 +40,7 @@ IndexEvent = dict[str, object]
 IndexEventCallback = Callable[[IndexEvent], None]
 
 # Bump when extraction/query behavior changes such that unchanged files must be re-indexed.
-INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-15-wave2-async-v3"
+INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-jsdoc-cleanup-v1"
 
 
 # Default ignore patterns
@@ -226,6 +226,52 @@ def _extract_doc_comment(source_bytes: bytes, node: Node) -> str | None:
                 expr = first_stmt.named_children[0] if first_stmt.named_child_count > 0 else None
                 if expr and expr.type == "string":
                     return expr.text.decode("utf-8", errors="replace").strip().strip('"""').strip("'''").strip()
+
+    return None
+
+
+def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
+    """Keep real JS/TS doc comments while rejecting separator and TODO noise."""
+    if not comment:
+        return False
+
+    cleaned_lines: list[str] = []
+    for raw_line in comment.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^/\*\*?", "", line)
+        line = re.sub(r"\*/$", "", line)
+        line = re.sub(r"^//+", "", line)
+        line = re.sub(r"^\*+", "", line)
+        line = line.strip()
+        if line:
+            cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return False
+
+    for line in cleaned_lines:
+        if re.fullmatch(r"[-=/*_# ]+", line):
+            continue
+        if re.match(r"^(?:todo|fixme|xxx|hack|note)\b", line, flags=re.IGNORECASE):
+            continue
+        if re.search(r"[A-Za-z0-9]", line):
+            return True
+
+    return False
+
+
+def _extract_js_ts_doc_comment(source_bytes: bytes, node: Node) -> str | None:
+    """Extract meaningful doc comments for JS/TS/Vue symbols."""
+    current: Node | None = node
+    for _ in range(3):
+        if current is None:
+            break
+        doc = _extract_doc_comment(source_bytes, current)
+        if _is_meaningful_js_ts_doc_comment(doc):
+            return doc
+        current = current.parent
 
     return None
 
@@ -3839,7 +3885,7 @@ class Indexer:
 
             for def_node, kind, symbol_name in raw_symbols:
                 content_text = def_node.text.decode("utf-8", errors="replace")
-                doc = _extract_doc_comment(script_bytes, def_node)
+                doc = _extract_js_ts_doc_comment(script_bytes, def_node)
                 signature_lang = "typescript" if parse_lang == "tsx" else parse_lang
                 sig = _extract_signature(script_bytes, def_node, signature_lang)
                 metadata = None
@@ -4243,7 +4289,7 @@ class Indexer:
 
         for def_node, kind, symbol_name in raw_symbols:
             content_text = def_node.text.decode("utf-8", errors="replace")
-            doc = _extract_doc_comment(source, def_node)
+            doc = _extract_js_ts_doc_comment(source, def_node)
             sig = _extract_signature(source, def_node, lang)
             metadata = None
 

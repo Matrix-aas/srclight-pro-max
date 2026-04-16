@@ -193,7 +193,7 @@ def test_indexer_build_change_forces_full_reindex(db, sample_project, monkeypatc
 
 def test_indexer_build_id_marks_wave2_async_extractor_version():
     """Wave 2 async extractor changes should produce a distinct build id suffix."""
-    assert INDEXER_BUILD_ID.endswith("wave2-async-v3")
+    assert INDEXER_BUILD_ID.endswith("jsdoc-cleanup-v1")
 
 
 def test_local_microservice_decorator_wrappers_reuse_file_scope_scan(monkeypatch):
@@ -748,6 +748,29 @@ const update = useUpdateMeMutation()
 </script>
 ''')
 
+    (src / "DocCommentCleanup.vue").write_text('''\
+<template><div /></template>
+
+<script setup lang="ts">
+/**
+ * Real Vue docs should remain attached.
+ */
+export function meaningfulDoc() {
+  return true;
+}
+
+// =====
+export function separatorDoc() {
+  return false;
+}
+
+// FIXME: temporary Vue helper
+export function todoDoc() {
+  return true;
+}
+</script>
+''')
+
     return src
 
 
@@ -794,8 +817,8 @@ def test_index_vue_script_setup_ts_offsets_lines(db, vue_project):
     indexer = Indexer(db, config)
     stats = indexer.index(vue_project)
 
-    assert stats.files_scanned == 20
-    assert stats.files_indexed == 20
+    assert stats.files_scanned == 21
+    assert stats.files_indexed == 21
     assert stats.symbols_extracted > 0
     assert stats.errors == 0
 
@@ -809,6 +832,19 @@ def test_index_vue_script_setup_ts_offsets_lines(db, vue_project):
     assert "greet" in names
     assert names["greet"].kind == "function"
     assert names["greet"].start_line == 10
+
+
+def test_index_vue_script_doc_comments_filter_noise(db, vue_project):
+    """Vue script docs should keep meaningful comments and drop separator noise."""
+    config = IndexConfig(root=vue_project)
+    indexer = Indexer(db, config)
+    indexer.index(vue_project)
+
+    syms = {sym.name: sym for sym in db.symbols_in_file("DocCommentCleanup.vue")}
+
+    assert "Real Vue docs should remain attached." in (syms["meaningfulDoc"].doc_comment or "")
+    assert syms["separatorDoc"].doc_comment is None
+    assert syms["todoDoc"].doc_comment is None
 
 
 def test_index_vue_plain_script_js(db, vue_project):
@@ -1432,6 +1468,27 @@ export const healthRoutes = new Elysia().get('/api/health', () => ({ ok: true })
 """
     )
 
+    (src / "server/src/routes/doc-comments.ts").write_text(
+        """\
+/**
+ * Real docs should remain attached.
+ */
+export function meaningfulDoc() {
+  return true;
+}
+
+// -----
+export function separatorDoc() {
+  return false;
+}
+
+// TODO: remove this placeholder after cleanup
+export function todoDoc() {
+  return true;
+}
+"""
+    )
+
     (src / "server/src/middleware.ts").write_text(
         """\
 import { Elysia } from 'elysia';
@@ -1734,8 +1791,8 @@ def test_index_typescript_backend_framework_exports(db, typescript_backend_proje
     indexer = Indexer(db, config)
     stats = indexer.index(typescript_backend_project)
 
-    assert stats.files_scanned == 15
-    assert stats.files_indexed == 15
+    assert stats.files_scanned == 16
+    assert stats.files_indexed == 16
     assert stats.errors == 0
 
     auth_symbols = {sym.name: sym for sym in db.symbols_in_file("server/src/routes/auth.ts")}
@@ -1747,6 +1804,13 @@ def test_index_typescript_backend_framework_exports(db, typescript_backend_proje
     assert auth_symbols["authRoutes"].metadata is not None
     assert auth_symbols["authRoutes"].metadata["framework"] == "elysia"
     assert auth_symbols["authRoutes"].metadata["prefix"] == "/api/auth"
+
+    doc_symbols = {
+        sym.name: sym for sym in db.symbols_in_file("server/src/routes/doc-comments.ts")
+    }
+    assert "Real docs should remain attached." in (doc_symbols["meaningfulDoc"].doc_comment or "")
+    assert doc_symbols["separatorDoc"].doc_comment is None
+    assert doc_symbols["todoDoc"].doc_comment is None
 
     health_symbols = {sym.name: sym for sym in db.symbols_in_file("server/src/routes/health.ts")}
     assert "healthRoutes" in health_symbols
