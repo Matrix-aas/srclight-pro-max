@@ -1158,3 +1158,16 @@ def test_context_for_task_uses_hybrid_seed_fallback_for_natural_language(monkeyp
     assert payload["seeds"]
     assert payload["seeds"][0]["qualified_name"] == "AuthService.refreshSession"
     assert payload["seeds"][0]["reason"] == "matched hybrid search"
+
+
+def test_context_for_task_identifier_candidates_skip_generic_task_verbs():
+    candidates = task_context._identifier_candidates(
+        "Add OAuth provider for VK login and fix Safari BGM resume"
+    )
+
+    assert "Add" not in candidates
+    assert "fix" not in [item.lower() for item in candidates]
+    assert "OAuth" in candidates
+    assert "VK" in candidates
+    assert "BGM" in candidates
+    assert "Safari" in candidates

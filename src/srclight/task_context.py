@@ -42,10 +42,23 @@ _BUDGETS: dict[str, dict[str, int]] = {
 
 _TYPE_KINDS = {"interface", "type_alias", "class", "struct", "enum"}
 _HYBRID_MIN_SIMILARITY = 0.3
-
-
-def _task_tokens(task: str) -> list[str]:
-    return [token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9_$]+", task)]
+_GENERIC_TASK_VERBS = {
+    "add",
+    "build",
+    "change",
+    "create",
+    "delete",
+    "edit",
+    "extend",
+    "fix",
+    "implement",
+    "improve",
+    "make",
+    "refactor",
+    "remove",
+    "support",
+    "update",
+}
 
 
 def _identifier_candidates(task: str) -> list[str]:
@@ -55,6 +68,8 @@ def _identifier_candidates(task: str) -> list[str]:
     def _add(value: str) -> None:
         normalized = value.strip()
         if not normalized:
+            return
+        if normalized.lower() in _GENERIC_TASK_VERBS:
             return
         key = normalized.lower()
         if key in seen:
