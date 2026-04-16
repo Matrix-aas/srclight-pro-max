@@ -93,6 +93,7 @@ def test_initialize_migrates_file_summary_columns(tmp_path):
         }
         assert "summary" in columns
         assert "metadata" in columns
+        assert "embedding_context_hash" in columns
     finally:
         db.close()
 
@@ -257,6 +258,78 @@ def test_update_file_summary_preserves_untouched_field_on_partial_update(db):
     assert updated_again is not None
     assert updated_again.summary == "Updated summary only."
     assert updated_again.metadata == {"framework": "vue", "tags": ["card"]}
+
+
+def test_get_symbols_needing_embeddings_limits_materialization_to_stale_rows(db):
+    """Freshness filtering should happen in SQL, not by scanning every row in Python."""
+    path = "client/src/components/ProfileCard.vue"
+    file_id = db.upsert_file(FileRecord(
+        path=path,
+        content_hash="profile-card",
+        mtime=1000.0,
+        language="vue",
+        size=240,
+        line_count=20,
+        summary="Renders the account profile card shell.",
+        metadata={"framework": "vue", "resource": "component", "props": ["msg"]},
+    ))
+
+    symbol_ids = []
+    for i in range(30):
+        symbol_ids.append(
+            db.insert_symbol(
+                SymbolRecord(
+                    file_id=file_id,
+                    kind="component",
+                    name=f"Symbol{i}",
+                    qualified_name=f"ProfileCard.Symbol{i}",
+                    start_line=i + 1,
+                    end_line=i + 2,
+                    content=f"<div>{i}</div>",
+                    body_hash=f"h{i}",
+                ),
+                path,
+            )
+        )
+    db.commit()
+
+    needing = db.get_symbols_needing_embeddings("mock:test-model")
+    assert len(needing) == 30
+
+    for row in needing:
+        db.upsert_embedding(
+            row["id"],
+            "mock:test-model",
+            4,
+            b"\x00" * 16,
+            row["embedding_body_hash"],
+        )
+    db.commit()
+
+    db.update_file_summary(
+        path,
+        summary="Renders the updated account profile card shell.",
+        metadata={"framework": "vue", "resource": "component", "props": ["msg"]},
+    )
+    db.commit()
+
+    calls = 0
+    original = db._row_to_symbol
+
+    def wrapped(row):
+        nonlocal calls
+        calls += 1
+        return original(row)
+
+    db._row_to_symbol = wrapped  # type: ignore[assignment]
+    try:
+        stale = db.get_symbols_needing_embeddings("mock:test-model", limit=1)
+    finally:
+        db._row_to_symbol = original  # type: ignore[assignment]
+
+    assert len(stale) == 1
+    assert stale[0]["id"] in symbol_ids
+    assert calls == 1
 
 
 def test_upsert_file_preserves_existing_summary_metadata_when_incoming_values_are_none(db):

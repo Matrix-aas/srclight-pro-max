@@ -249,25 +249,19 @@ def _escape_like_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _embedding_freshness_hash(symbol: dict[str, Any]) -> str:
-    """Hash the embedding inputs that should invalidate a stored vector."""
-    file_summary = symbol.get("file_summary")
-    file_summary_metadata = symbol.get("file_summary_metadata")
-    if not file_summary and not file_summary_metadata:
-        return str(symbol.get("body_hash") or "")
+def _file_embedding_context_hash(summary: str | None, metadata: dict | None) -> str | None:
+    """Hash file summary context used by embeddings."""
+    if summary is None and metadata is None:
+        return None
 
-    payload = {
-        "body_hash": symbol.get("body_hash"),
-        "file_summary": file_summary,
-        "file_summary_metadata": file_summary_metadata,
-    }
+    payload = {"summary": summary, "metadata": metadata}
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
 
 _UNSET = object()
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -290,6 +284,7 @@ CREATE TABLE IF NOT EXISTS files (
     line_count INTEGER,
     summary TEXT,
     metadata TEXT,
+    embedding_context_hash TEXT,
     indexed_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
@@ -541,6 +536,11 @@ class Database:
             self.conn.execute("ALTER TABLE files ADD COLUMN metadata TEXT")
         except Exception:
             pass  # column already exists
+        try:
+            self.conn.execute("ALTER TABLE files ADD COLUMN embedding_context_hash TEXT")
+        except Exception:
+            pass  # column already exists
+        self._refresh_all_file_embedding_context_hashes()
         # Migrate v4 -> v5: add community/flow tables
         try:
             self.conn.execute("SELECT 1 FROM communities LIMIT 1")
@@ -582,8 +582,8 @@ class Database:
         assert self.conn is not None
         metadata_json = json.dumps(rec.metadata) if rec.metadata is not None else None
         self.conn.execute(
-            """INSERT INTO files (path, content_hash, mtime, language, size, line_count, summary, metadata)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO files (path, content_hash, mtime, language, size, line_count, summary, metadata, embedding_context_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(path) DO UPDATE SET
                    content_hash=excluded.content_hash,
                    mtime=excluded.mtime,
@@ -592,6 +592,7 @@ class Database:
                    line_count=excluded.line_count,
                    summary=COALESCE(excluded.summary, files.summary),
                    metadata=COALESCE(excluded.metadata, files.metadata),
+                   embedding_context_hash=COALESCE(excluded.embedding_context_hash, files.embedding_context_hash),
                    indexed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now')""",
             (
                 rec.path,
@@ -602,12 +603,14 @@ class Database:
                 rec.line_count,
                 rec.summary,
                 metadata_json,
+                _file_embedding_context_hash(rec.summary, rec.metadata),
             ),
         )
         # lastrowid is unreliable for ON CONFLICT DO UPDATE — fetch the actual ID
         row = self.conn.execute(
             "SELECT id FROM files WHERE path = ?", (rec.path,)
         ).fetchone()
+        self._refresh_file_embedding_context_hash(row["id"])
         return row["id"]
 
     def get_file(self, path: str) -> FileRecord | None:
@@ -722,6 +725,9 @@ class Database:
             f"UPDATE files SET {', '.join(updates)} WHERE path = ?",
             params,
         )
+        row = self.conn.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
+        if row is not None:
+            self._refresh_file_embedding_context_hash(row["id"])
 
     def get_file_summary(self, path: str) -> dict[str, Any] | None:
         """Return lightweight summary metadata and top-level symbols for a file."""
@@ -756,6 +762,48 @@ class Database:
                 for row in rows
             ],
         }
+
+    def _refresh_file_embedding_context_hash(self, file_id: int) -> None:
+        """Persist the current embedding context hash for a file."""
+        assert self.conn is not None
+        row = self.conn.execute(
+            "SELECT summary, metadata FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        if row is None:
+            return
+
+        metadata = row["metadata"]
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = None
+
+        context_hash = _file_embedding_context_hash(row["summary"], metadata)
+        self.conn.execute(
+            "UPDATE files SET embedding_context_hash = ? WHERE id = ?",
+            (context_hash, file_id),
+        )
+
+    def _refresh_all_file_embedding_context_hashes(self) -> None:
+        """Backfill file embedding context hashes after migrations."""
+        assert self.conn is not None
+        rows = self.conn.execute(
+            "SELECT id, summary, metadata FROM files WHERE summary IS NOT NULL OR metadata IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = None
+            context_hash = _file_embedding_context_hash(row["summary"], metadata)
+            self.conn.execute(
+                "UPDATE files SET embedding_context_hash = ? WHERE id = ?",
+                (context_hash, row["id"]),
+            )
 
     def orientation_files(self, limit: int = 100) -> list[dict[str, Any]]:
         """Return high-signal indexed files for repo orientation."""
@@ -2073,26 +2121,30 @@ class Database:
         )
 
     def get_symbols_needing_embeddings(self, model: str, limit: int = 100000) -> list[dict]:
-        """Get symbols that need embeddings (no embedding or body_hash changed)."""
+        """Get symbols that need embeddings, filtered in SQL."""
         assert self.conn is not None
+        freshness_expr = (
+            "CASE WHEN COALESCE(f.embedding_context_hash, '') = '' THEN s.body_hash "
+            "ELSE s.body_hash || ':' || f.embedding_context_hash END"
+        )
         rows = self.conn.execute(
-            """SELECT s.*, f.path as file_path, f.summary as file_summary,
-                      f.metadata as file_summary_metadata, e.body_hash as embedded_body_hash
+            f"""SELECT s.*, f.path as file_path, f.summary as file_summary,
+                      f.metadata as file_summary_metadata,
+                      {freshness_expr} as embedding_body_hash,
+                      e.body_hash as embedded_body_hash
                FROM symbols s
                JOIN files f ON s.file_id = f.id
                LEFT JOIN symbol_embeddings e ON s.id = e.symbol_id AND e.model = ?
-               ORDER BY s.id""",
-            (model,),
-        )
+               WHERE e.symbol_id IS NULL OR e.body_hash != {freshness_expr}
+               ORDER BY s.id
+               LIMIT ?""",
+            (model, limit),
+        ).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
             symbol = asdict(self._row_to_symbol(row))
-            freshness_hash = _embedding_freshness_hash(symbol)
-            if row["embedded_body_hash"] is None or row["embedded_body_hash"] != freshness_hash:
-                symbol["embedding_body_hash"] = freshness_hash
-                results.append(symbol)
-                if len(results) >= limit:
-                    break
+            symbol["embedding_body_hash"] = row["embedding_body_hash"]
+            results.append(symbol)
         return results
 
     def vector_search(self, query_embedding: bytes, dimensions: int,
