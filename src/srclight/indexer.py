@@ -40,7 +40,7 @@ IndexEvent = dict[str, object]
 IndexEventCallback = Callable[[IndexEvent], None]
 
 # Bump when extraction/query behavior changes such that unchanged files must be re-indexed.
-INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-jsdoc-cleanup-v2"
+INDEXER_BUILD_ID = f"{__version__}+extractor-2026-04-16-jsdoc-cleanup-v3"
 
 
 # Default ignore patterns
@@ -256,7 +256,7 @@ def _is_meaningful_js_ts_doc_comment(comment: str | None) -> bool:
             continue
         if re.match(r"^(?:todo|fixme)\b", line, flags=re.IGNORECASE):
             continue
-        if re.search(r"[A-Za-z0-9]", line):
+        if re.search(r"\w", line, flags=re.UNICODE):
             return True
 
     return False

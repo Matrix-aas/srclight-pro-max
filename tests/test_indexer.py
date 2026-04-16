@@ -193,7 +193,7 @@ def test_indexer_build_change_forces_full_reindex(db, sample_project, monkeypatc
 
 def test_indexer_build_id_marks_wave2_async_extractor_version():
     """Wave 2 async extractor changes should produce a distinct build id suffix."""
-    assert INDEXER_BUILD_ID.endswith("jsdoc-cleanup-v2")
+    assert INDEXER_BUILD_ID.endswith("jsdoc-cleanup-v3")
 
 
 def test_index_csharp_doc_comments_do_not_leak_to_methods(db, tmp_path):
@@ -275,6 +275,31 @@ export function wrappedValue() {
     assert "Wrapper-level export docs should remain attached." in (
         syms["wrappedValue"].doc_comment or ""
     )
+
+
+def test_index_typescript_non_latin_doc_comments_are_preserved(db, tmp_path):
+    """Non-Latin JS/TS doc comments should survive indexing."""
+    project = tmp_path / "ts-non-latin-docs"
+    project.mkdir()
+
+    (project / "example.ts").write_text(
+        '''\
+/**
+ * Привет мир
+ */
+export function greet() {
+  return 1;
+}
+'''
+    )
+
+    config = IndexConfig(root=project)
+    indexer = Indexer(db, config)
+    indexer.index(project)
+
+    syms = {sym.name: sym for sym in db.symbols_in_file("example.ts")}
+
+    assert "Привет мир" in (syms["greet"].doc_comment or "")
 
 
 def test_local_microservice_decorator_wrappers_reuse_file_scope_scan(monkeypatch):
